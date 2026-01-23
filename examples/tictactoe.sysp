@@ -1,0 +1,174 @@
+;;; Tic Tac Toe in sysp — proof of concept
+;;; Compiles to C, uses raylib for graphics
+
+(include "raylib.h")
+
+;; Foreign structs from raylib (don't emit typedefs, just register fields)
+(foreign-struct Color [r :u8, g :u8, b :u8, a :u8])
+(foreign-struct Vector2 [x :f32, y :f32])
+
+;; Game enums
+(enum Square [EMPTY 0] [X_PIECE 1] [O_PIECE 2])
+(enum Player [PLAYER_X 0] [PLAYER_O 1])
+(enum GameState [PLAYING 0] [WON 1] [DRAW 2])
+
+;; Constants
+(const WINDOW_SIZE :int 600)
+(const CELL_SIZE :int 200)
+(const LINE_THICK :int 4)
+(const LEFT_CLICK :int 0)
+
+;; Raylib externs
+(extern InitWindow [width :int, height :int, title :str] :void)
+(extern CloseWindow [] :void)
+(extern WindowShouldClose [] :int)
+(extern SetTargetFPS [fps :int] :void)
+(extern BeginDrawing [] :void)
+(extern EndDrawing [] :void)
+(extern ClearBackground [color :Color] :void)
+(extern DrawLine [x1 :int, y1 :int, x2 :int, y2 :int, color :Color] :void)
+(extern DrawLineEx [start :Vector2, end :Vector2, thick :f32, color :Color] :void)
+(extern DrawCircle [cx :int, cy :int, radius :f32, color :Color] :void)
+(extern DrawCircleLines [cx :int, cy :int, radius :f32, color :Color] :void)
+(extern DrawRectangle [x :int, y :int, w :int, h :int, color :Color] :void)
+(extern DrawText [text :str, x :int, y :int, size :int, color :Color] :void)
+(extern GetMousePosition [] :Vector2)
+(extern IsMouseButtonPressed [button :int] :int)
+
+;; Check if a player has won. Returns the winning Square or EMPTY.
+(defn check-winner [board :ptr-int] :int
+  ;; Check rows
+  (for [i 0 3]
+    (let idx (* i 3))
+    (when (and (!= (array-ref board idx) EMPTY)
+              (== (array-ref board idx) (array-ref board (+ idx 1)))
+              (== (array-ref board idx) (array-ref board (+ idx 2))))
+      (return (array-ref board idx))))
+  ;; Check columns
+  (for [j 0 3]
+    (when (and (!= (array-ref board j) EMPTY)
+              (== (array-ref board j) (array-ref board (+ j 3)))
+              (== (array-ref board j) (array-ref board (+ j 6))))
+      (return (array-ref board j))))
+  ;; Check diagonals
+  (when (and (!= (array-ref board 0) EMPTY)
+            (== (array-ref board 0) (array-ref board 4))
+            (== (array-ref board 0) (array-ref board 8)))
+    (return (array-ref board 0)))
+  (when (and (!= (array-ref board 2) EMPTY)
+            (== (array-ref board 2) (array-ref board 4))
+            (== (array-ref board 2) (array-ref board 6)))
+    (return (array-ref board 2)))
+  EMPTY)
+
+;; Check if board is full
+(defn board-full [board :ptr-int] :int
+  (for [i 0 9]
+    (when (== (array-ref board i) EMPTY)
+      (return 0)))
+  1)
+
+;; Draw an X in a cell
+(defn draw-x [col :int, row :int, color :Color] :void
+  (let pad 30)
+  (let x1 (+ (* col CELL_SIZE) pad))
+  (let y1 (+ (* row CELL_SIZE) pad))
+  (let x2 (- (* (+ col 1) CELL_SIZE) pad))
+  (let y2 (- (* (+ row 1) CELL_SIZE) pad))
+  (let start1 (Vector2 (cast :f32 x1) (cast :f32 y1)))
+  (let end1 (Vector2 (cast :f32 x2) (cast :f32 y2)))
+  (let start2 (Vector2 (cast :f32 x2) (cast :f32 y1)))
+  (let end2 (Vector2 (cast :f32 x1) (cast :f32 y2)))
+  (DrawLineEx start1 end1 3.0 color)
+  (DrawLineEx start2 end2 3.0 color))
+
+;; Draw an O in a cell
+(defn draw-o [col :int, row :int, color :Color] :void
+  (let cx (+ (* col CELL_SIZE) (/ CELL_SIZE 2)))
+  (let cy (+ (* row CELL_SIZE) (/ CELL_SIZE 2)))
+  (let radius (cast :f32 (- (/ CELL_SIZE 2) 30)))
+  (DrawCircleLines cx cy radius color))
+
+;; Draw the grid lines
+(defn draw-grid [color :Color] :void
+  ;; Vertical lines
+  (DrawLine CELL_SIZE 0 CELL_SIZE WINDOW_SIZE color)
+  (DrawLine (* CELL_SIZE 2) 0 (* CELL_SIZE 2) WINDOW_SIZE color)
+  ;; Horizontal lines
+  (DrawLine 0 CELL_SIZE WINDOW_SIZE CELL_SIZE color)
+  (DrawLine 0 (* CELL_SIZE 2) WINDOW_SIZE (* CELL_SIZE 2) color))
+
+;; Main
+(defn main [] :int
+  (InitWindow WINDOW_SIZE WINDOW_SIZE "sysp — Tic Tac Toe")
+  (SetTargetFPS 60)
+
+  (let board (make-array :int 9))
+  (let-mut turn :int PLAYER_X)
+  (let-mut state :int PLAYING)
+  (let-mut winner :int EMPTY)
+
+  (let white (Color 255 255 255 255))
+  (let dark-bg (Color 30 30 30 255))
+  (let red (Color 230 70 70 255))
+  (let blue (Color 70 130 230 255))
+  (let gray (Color 100 100 100 200))
+
+  (while (not (WindowShouldClose))
+    (BeginDrawing)
+    (ClearBackground dark-bg)
+
+    ;; Handle input
+    (when (== state PLAYING)
+      (when (IsMouseButtonPressed LEFT_CLICK)
+        (let mouse (GetMousePosition))
+        (let col (cast :int (/ (get mouse x) (cast :f32 CELL_SIZE))))
+        (let row (cast :int (/ (get mouse y) (cast :f32 CELL_SIZE))))
+        (when (and (>= col 0) (< col 3) (>= row 0) (< row 3))
+          (let idx (+ (* row 3) col))
+          (when (== (array-ref board idx) EMPTY)
+            (array-set! board idx (if (== turn PLAYER_X) X_PIECE O_PIECE))
+            ;; Check for winner
+            (set! winner (check-winner board))
+            (if (!= winner EMPTY)
+              (set! state WON)
+            else
+              (if (board-full board)
+                (set! state DRAW)
+              else
+                (set! turn (if (== turn PLAYER_X) PLAYER_O PLAYER_X))))))))
+
+    ;; Draw grid
+    (draw-grid white)
+
+    ;; Draw pieces
+    (for [i 0 9]
+      (let col (mod i 3))
+      (let row (/ i 3))
+      (cond
+        [(== (array-ref board i) X_PIECE) (draw-x col row red)]
+        [(== (array-ref board i) O_PIECE) (draw-o col row blue)]))
+
+    ;; Draw end screen overlay
+    (when (!= state PLAYING)
+      (DrawRectangle 0 0 WINDOW_SIZE WINDOW_SIZE gray)
+      (cond
+        [(== winner X_PIECE)
+         (DrawText "X Wins!" 180 250 60 red)]
+        [(== winner O_PIECE)
+         (DrawText "O Wins!" 180 250 60 blue)]
+        [else
+         (DrawText "Draw!" 210 250 60 white)])
+      (DrawText "Click to play again" 150 350 30 white)
+      ;; Reset on click
+      (when (IsMouseButtonPressed LEFT_CLICK)
+        (for [i 0 9]
+          (array-set! board i EMPTY))
+        (set! turn PLAYER_X)
+        (set! state PLAYING)
+        (set! winner EMPTY)))
+
+    (EndDrawing))
+
+  (CloseWindow)
+  0)
