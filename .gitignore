@@ -1,3 +1,6 @@
 examples/hello
 examples/tictactoe
+examples/test-features
 examples/*.c
+test-cons
+test-cons.c

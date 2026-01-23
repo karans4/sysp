@@ -8,7 +8,7 @@
 ;;; === Types ===
 
 (defstruct sysp-type
-  (kind nil) ; :int :float :bool :void :str :char :struct :vector :tuple :fn :ptr :unknown
+  (kind nil) ; :int :float :bool :void :str :char :struct :vector :tuple :fn :ptr :symbol :value :cons :unknown
   (name nil)
   (params nil)) ; type params (element types for vector/tuple, arg+ret for fn, pointee for ptr)
 
@@ -20,6 +20,9 @@
 (defun make-char-type () (make-sysp-type :kind :char))
 (defun make-u8-type () (make-sysp-type :kind :u8))
 (defun make-f32-type () (make-sysp-type :kind :f32))
+(defun make-symbol-type () (make-sysp-type :kind :symbol))
+(defun make-value-type () (make-sysp-type :kind :value))
+(defun make-cons-type () (make-sysp-type :kind :cons))
 
 (defun make-ptr-type (pointee)
   (make-sysp-type :kind :ptr :params (list pointee)))
@@ -88,6 +91,33 @@
 (defvar *macros* (make-hash-table :test 'equal))  ; name -> expander function
 (defvar *current-fn-name* nil)  ; for recur: name of function being compiled
 (defvar *current-fn-params* nil) ; for recur: param names of current function
+(defvar *symbol-table* (make-hash-table :test 'equal))  ; name -> integer ID
+(defvar *symbol-counter* 0)
+(defvar *sysp-gensym-counter* #x80000000)  ; gensyms start high to avoid collision
+(defvar *uses-value-type* nil)  ; emit Value/Cons preamble if true
+
+(defun intern-symbol (name)
+  "Get or assign an integer ID for a named symbol"
+  (or (gethash name *symbol-table*)
+      (setf (gethash name *symbol-table*) (incf *symbol-counter*))))
+
+(defun mangle-symbol-name (name)
+  "Convert a symbol name to a valid C identifier for #defines"
+  (with-output-to-string (s)
+    (loop for ch across (string-upcase name) do
+      (cond
+        ((alphanumericp ch) (write-char ch s))
+        ((char= ch #\-) (write-char #\_ s))
+        ((char= ch #\+) (write-string "PLUS" s))
+        ((char= ch #\-) (write-string "MINUS" s))
+        ((char= ch #\*) (write-string "STAR" s))
+        ((char= ch #\/) (write-string "SLASH" s))
+        ((char= ch #\=) (write-string "EQ" s))
+        ((char= ch #\<) (write-string "LT" s))
+        ((char= ch #\>) (write-string "GT" s))
+        ((char= ch #\!) (write-string "BANG" s))
+        ((char= ch #\?) (write-string "P" s))
+        (t (format s "_~2,'0X" (char-code ch)))))))
 
 (defun lookup-enum-variant (name)
   "If name is an enum variant, return (enum-name . value). Else nil."
@@ -210,6 +240,9 @@
       ((string= name "char") (make-char-type))
       ((string= name "u8") (make-u8-type))
       ((string= name "f32") (make-f32-type))
+      ((string= name "symbol") (make-symbol-type))
+      ((string= name "value") (make-value-type))
+      ((string= name "cons") (make-cons-type))
       ;; Pointer shorthand: :ptr-int, :ptr-float, etc.
       ((and (> (length name) 4) (string= (subseq name 0 4) "ptr-"))
        (make-ptr-type (parse-type-annotation
@@ -240,6 +273,9 @@
     (:vector (vector-type-c-name tp))
     (:tuple (tuple-type-c-name tp))
     (:fn (fn-type-c-name tp))
+    (:symbol "Symbol")
+    (:value "Value")
+    (:cons "Value")  ; cons cells are Values (tagged)
     (otherwise "int")))
 
 (defun mangle-type-name (tp)
@@ -259,6 +295,9 @@
     (:vector (vector-type-c-name tp))
     (:tuple (tuple-type-c-name tp))
     (:fn (fn-type-c-name tp))
+    (:symbol "sym")
+    (:value "val")
+    (:cons "val")
     (otherwise "unknown")))
 
 (defun vector-type-c-name (tp)
@@ -415,6 +454,16 @@
       ;; Type ops
       ((sym= head "cast") (compile-cast form env))
       ((sym= head "sizeof") (compile-sizeof form env))
+      ;; Cons / Value ops
+      ((sym= head "cons") (compile-cons form env))
+      ((sym= head "car") (compile-car form env))
+      ((sym= head "cdr") (compile-cdr form env))
+      ((sym= head "nil?") (compile-nilp form env))
+      ((sym= head "list") (compile-list-expr form env))
+      ((sym= head "quote") (compile-quote form env))
+      ((sym= head "sym") (compile-sym-literal form env))
+      ((sym= head "sym-eq?") (compile-sym-eq form env))
+      ((sym= head "gensym") (compile-gensym-expr form env))
       ;; Otherwise: function/constructor call
       (t (compile-call form env)))))
 
@@ -720,6 +769,116 @@
         (values (format nil "sizeof(~a)" (sanitize-name (string arg)))
                 (make-int-type)))))
 
+;;; === Value Type (cons cells, symbols, quote) ===
+
+(defun wrap-as-value (code tp)
+  "Wrap a compiled C expression as a Value based on its type"
+  (setf *uses-value-type* t)
+  (case (sysp-type-kind tp)
+    (:int (format nil "val_int(~a)" code))
+    (:float (format nil "val_float(~a)" code))
+    (:f32 (format nil "val_float((double)~a)" code))
+    (:str (format nil "val_str(~a)" code))
+    (:symbol (format nil "val_sym(~a)" code))
+    (:value code)  ; already a Value
+    (:cons code)   ; cons is already a Value
+    (:bool (format nil "val_int(~a)" code))
+    (otherwise (format nil "val_int(~a)" code))))
+
+(defun compile-cons (form env)
+  "(cons x y)"
+  (setf *uses-value-type* t)
+  (multiple-value-bind (car-code car-type) (compile-expr (second form) env)
+    (multiple-value-bind (cdr-code cdr-type) (compile-expr (third form) env)
+      (let ((car-val (wrap-as-value car-code car-type))
+            (cdr-val (wrap-as-value cdr-code cdr-type)))
+        (values (format nil "val_cons(make_cons(~a, ~a))" car-val cdr-val)
+                (make-value-type))))))
+
+(defun compile-car (form env)
+  "(car x)"
+  (setf *uses-value-type* t)
+  (multiple-value-bind (code tp) (compile-expr (second form) env)
+    (declare (ignore tp))
+    (values (format nil "sysp_car(~a)" code) (make-value-type))))
+
+(defun compile-cdr (form env)
+  "(cdr x)"
+  (setf *uses-value-type* t)
+  (multiple-value-bind (code tp) (compile-expr (second form) env)
+    (declare (ignore tp))
+    (values (format nil "sysp_cdr(~a)" code) (make-value-type))))
+
+(defun compile-nilp (form env)
+  "(nil? x)"
+  (setf *uses-value-type* t)
+  (multiple-value-bind (code tp) (compile-expr (second form) env)
+    (declare (ignore tp))
+    (values (format nil "sysp_nilp(~a)" code) (make-bool-type))))
+
+(defun compile-list-expr (form env)
+  "(list x y z ...) -> nested cons"
+  (setf *uses-value-type* t)
+  (if (null (rest form))
+      (values "val_nil()" (make-value-type))
+      (let ((elems (rest form)))
+        (labels ((build (items)
+                   (if (null items)
+                       "val_nil()"
+                       (multiple-value-bind (code tp) (compile-expr (first items) env)
+                         (let ((val (wrap-as-value code tp)))
+                           (format nil "val_cons(make_cons(~a, ~a))"
+                                   val (build (rest items))))))))
+          (values (build elems) (make-value-type))))))
+
+(defun compile-quote (form env)
+  "(quote datum) — compile quoted literal to runtime Value"
+  (declare (ignore env))
+  (setf *uses-value-type* t)
+  (values (compile-quoted-datum (second form)) (make-value-type)))
+
+(defun compile-quoted-datum (datum)
+  "Recursively compile a quoted datum to C code building Value cells"
+  (cond
+    ((null datum) "val_nil()")
+    ((integerp datum) (format nil "val_int(~d)" datum))
+    ((floatp datum) (format nil "val_float(~f)" datum))
+    ((stringp datum) (format nil "val_str(~s)" datum))
+    ((symbolp datum)
+     (let ((name (string datum)))
+       (cond
+         ((string-equal name "nil") "val_nil()")
+         (t (let ((id (intern-symbol name)))
+              (format nil "val_sym(~d)" id))))))
+    ((listp datum)
+     (format nil "val_cons(make_cons(~a, ~a))"
+             (compile-quoted-datum (first datum))
+             (compile-quoted-datum (rest datum))))
+    (t (format nil "val_int(0)"))))
+
+(defun compile-sym-literal (form env)
+  "(sym name) — get symbol ID for a name"
+  (declare (ignore env))
+  (setf *uses-value-type* t)
+  (let* ((name (string (second form)))
+         (id (intern-symbol name)))
+    (values (format nil "~d" id) (make-symbol-type))))
+
+(defun compile-sym-eq (form env)
+  "(sym-eq? a b) — compare two Values as symbols"
+  (setf *uses-value-type* t)
+  (multiple-value-bind (a-code at) (compile-expr (second form) env)
+    (declare (ignore at))
+    (multiple-value-bind (b-code bt) (compile-expr (third form) env)
+      (declare (ignore bt))
+      (values (format nil "sysp_sym_eq(~a, ~a)" a-code b-code) (make-bool-type)))))
+
+(defun compile-gensym-expr (form env)
+  "(gensym) — generate a unique symbol at runtime"
+  (declare (ignore form env))
+  (setf *uses-value-type* t)
+  (values "val_sym(_sysp_gensym++)" (make-value-type)))
+
 (defun compile-call (form env)
   (let* ((fn-name (string (first form)))
          (args (rest form)))
@@ -824,13 +983,16 @@
     (:char (values "%c" val-code))
     (:u8 (values "%u" val-code))
     (:bool (values "%s" (format nil "(~a ? \"true\" : \"false\")" val-code)))
+    ((:value :cons) (values :value-print val-code))
     (otherwise (values "%d" val-code))))
 
 (defun compile-print-stmt (form env)
   "(print expr) — print without newline"
   (multiple-value-bind (val-code val-type) (compile-expr (second form) env)
     (multiple-value-bind (fmt arg) (format-print-arg val-code val-type)
-      (list (format nil "  printf(\"~a\", ~a);" fmt arg)))))
+      (if (eq fmt :value-print)
+          (list (format nil "  sysp_print_value(~a);" arg))
+          (list (format nil "  printf(\"~a\", ~a);" fmt arg))))))
 
 (defun compile-println-stmt (form env)
   "(println expr) or (println) — print with newline"
@@ -838,7 +1000,9 @@
       (list "  printf(\"\\n\");")
       (multiple-value-bind (val-code val-type) (compile-expr (second form) env)
         (multiple-value-bind (fmt arg) (format-print-arg val-code val-type)
-          (list (format nil "  printf(\"~a\\n\", ~a);" fmt arg))))))
+          (if (eq fmt :value-print)
+              (list (format nil "  sysp_print_value(~a); printf(\"\\n\");" arg))
+              (list (format nil "  printf(\"~a\\n\", ~a);" fmt arg)))))))
 
 (defun compile-if-stmt (form env)
   "(if cond then-body...) or (if cond then-body... else else-body...)"
@@ -1210,13 +1374,62 @@
                ((sym= (first expanded) "const") (compile-const expanded))
                (t (warn "Unknown top-level form: ~a" (first expanded)))))))))))
 
+(defun emit-value-preamble (out)
+  "Emit the Value/Cons/Symbol type system preamble"
+  (format out "/* === Value Type System === */~%")
+  (format out "typedef uint32_t Symbol;~%")
+  (format out "typedef struct Cons Cons;~%")
+  (format out "typedef enum { VAL_NIL, VAL_INT, VAL_FLOAT, VAL_STR, VAL_SYM, VAL_CONS } ValueTag;~%")
+  (format out "typedef struct { ValueTag tag; union { int as_int; double as_float; const char* as_str; Symbol as_sym; Cons* as_cons; }; } Value;~%")
+  (format out "struct Cons { Value car; Value cdr; int refcount; };~%")
+  (format out "static Value val_nil(void) { return (Value){.tag = VAL_NIL}; }~%")
+  (format out "static Value val_int(int x) { Value v = {.tag = VAL_INT}; v.as_int = x; return v; }~%")
+  (format out "static Value val_float(double x) { Value v = {.tag = VAL_FLOAT}; v.as_float = x; return v; }~%")
+  (format out "static Value val_str(const char* x) { Value v = {.tag = VAL_STR}; v.as_str = x; return v; }~%")
+  (format out "static Value val_sym(Symbol x) { Value v = {.tag = VAL_SYM}; v.as_sym = x; return v; }~%")
+  (format out "static Value val_cons(Cons* x) { Value v = {.tag = VAL_CONS}; v.as_cons = x; return v; }~%")
+  (format out "static Cons* make_cons(Value car, Value cdr) { Cons* c = malloc(sizeof(Cons)); c->car = car; c->cdr = cdr; c->refcount = 1; return c; }~%")
+  (format out "static Value sysp_car(Value v) { return v.as_cons->car; }~%")
+  (format out "static Value sysp_cdr(Value v) { return v.as_cons->cdr; }~%")
+  (format out "static int sysp_nilp(Value v) { return v.tag == VAL_NIL; }~%")
+  (format out "static int sysp_sym_eq(Value a, Value b) { return a.tag == VAL_SYM && b.tag == VAL_SYM && a.as_sym == b.as_sym; }~%")
+  (format out "static uint32_t _sysp_gensym = 0x80000000;~%")
+  ;; Emit symbol name table for printing (before print_value which uses it)
+  (let ((max-id *symbol-counter*))
+    (format out "static const char* _sym_names[~d] = {\"\"" (1+ max-id))
+    (loop for i from 1 to max-id do
+      (let ((name nil))
+        (maphash (lambda (n id) (when (= id i) (setf name n))) *symbol-table*)
+        (format out ", \"~a\"" (or name ""))))
+    (format out "};~%"))
+  (format out "static void sysp_print_value(Value v) {~%")
+  (format out "  switch(v.tag) {~%")
+  (format out "    case VAL_NIL: printf(\"nil\"); break;~%")
+  (format out "    case VAL_INT: printf(\"%d\", v.as_int); break;~%")
+  (format out "    case VAL_FLOAT: printf(\"%f\", v.as_float); break;~%")
+  (format out "    case VAL_STR: printf(\"%s\", v.as_str); break;~%")
+  (format out "    case VAL_SYM: if(v.as_sym < sizeof(_sym_names)/sizeof(_sym_names[0])) printf(\"%s\", _sym_names[v.as_sym]); else printf(\"g%u\", v.as_sym); break;~%")
+  (format out "    case VAL_CONS: printf(\"(\"); sysp_print_value(v.as_cons->car); Value tail = v.as_cons->cdr; while(tail.tag == VAL_CONS) { printf(\" \"); sysp_print_value(tail.as_cons->car); tail = tail.as_cons->cdr; } if(tail.tag != VAL_NIL) { printf(\" . \"); sysp_print_value(tail); } printf(\")\"); break;~%")
+  (format out "  }~%}~%")
+  ;; Emit symbol table as defines
+  (maphash (lambda (name id)
+             (format out "#define SYM_~a ~d~%"
+                     (mangle-symbol-name name) id))
+           *symbol-table*)
+  (format out "~%"))
+
 (defun emit-c (out-path)
   (with-open-file (out out-path :direction :output :if-exists :supersede)
     (format out "#include <stdio.h>~%")
     (format out "#include <stdlib.h>~%")
+    (when *uses-value-type*
+      (format out "#include <stdint.h>~%"))
     (dolist (inc *includes*)
       (format out "#include <~a>~%" inc))
     (format out "~%")
+    ;; Value type preamble (if needed)
+    (when *uses-value-type*
+      (emit-value-preamble out))
     ;; struct definitions & constants
     (dolist (s (nreverse *struct-defs*))
       (write-string s out)
@@ -1246,7 +1459,11 @@
   (setf *forward-decls* nil)
   (setf *global-env* (make-env))
   (setf *includes* nil)
-  (setf *string-literals* nil))
+  (setf *string-literals* nil)
+  (setf *symbol-table* (make-hash-table :test 'equal))
+  (setf *symbol-counter* 0)
+  (setf *sysp-gensym-counter* #x80000000)
+  (setf *uses-value-type* nil))
 
 (defun compile-file-to-c (in-path out-path)
   (reset-state)

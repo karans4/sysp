@@ -1,0 +1,42 @@
+;; Test cons cells and quote
+
+(defn main [] :int
+  ;; Basic cons
+  (let xs (cons 1 (cons 2 (cons 3 '()))))
+  (print "xs = ")
+  (println xs)
+
+  ;; car / cdr
+  (print "car xs = ")
+  (println (car xs))
+  (print "cdr xs = ")
+  (println (cdr xs))
+  (print "cadr xs = ")
+  (println (car (cdr xs)))
+
+  ;; nil?
+  (when (nil? '())
+    (println "nil? '() = true"))
+  (unless (nil? xs)
+    (println "nil? xs = false"))
+
+  ;; list shorthand
+  (let ys (list 4 5 6))
+  (print "ys = ")
+  (println ys)
+
+  ;; quote a symbol list (code as data)
+  (let code '(+ 1 2))
+  (print "code = ")
+  (println code)
+
+  ;; sym-eq?
+  (when (sym-eq? (car code) (car '(+)))
+    (println "car of '(+ 1 2) is '+"))
+
+  ;; nested quote
+  (let nested '(if (> x 0) (println x)))
+  (print "nested = ")
+  (println nested)
+
+  0)
