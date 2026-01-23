@@ -79,8 +79,8 @@
   (let end1 (Vector2 (cast :f32 x2) (cast :f32 y2)))
   (let start2 (Vector2 (cast :f32 x2) (cast :f32 y1)))
   (let end2 (Vector2 (cast :f32 x1) (cast :f32 y2)))
-  (DrawLineEx start1 end1 3.0 color)
-  (DrawLineEx start2 end2 3.0 color))
+  (DrawLineEx start1 end1 (cast :f32 LINE_THICK) color)
+  (DrawLineEx start2 end2 (cast :f32 LINE_THICK) color))
 
 ;; Draw an O in a cell
 (defn draw-o [col :int, row :int, color :Color] :void
@@ -91,12 +91,21 @@
 
 ;; Draw the grid lines
 (defn draw-grid [color :Color] :void
+  (let thick (cast :f32 LINE_THICK))
   ;; Vertical lines
-  (DrawLine CELL_SIZE 0 CELL_SIZE WINDOW_SIZE color)
-  (DrawLine (* CELL_SIZE 2) 0 (* CELL_SIZE 2) WINDOW_SIZE color)
+  (let v1s (Vector2 (cast :f32 CELL_SIZE) 0.0))
+  (let v1e (Vector2 (cast :f32 CELL_SIZE) (cast :f32 WINDOW_SIZE)))
+  (DrawLineEx v1s v1e thick color)
+  (let v2s (Vector2 (cast :f32 (* CELL_SIZE 2)) 0.0))
+  (let v2e (Vector2 (cast :f32 (* CELL_SIZE 2)) (cast :f32 WINDOW_SIZE)))
+  (DrawLineEx v2s v2e thick color)
   ;; Horizontal lines
-  (DrawLine 0 CELL_SIZE WINDOW_SIZE CELL_SIZE color)
-  (DrawLine 0 (* CELL_SIZE 2) WINDOW_SIZE (* CELL_SIZE 2) color))
+  (let h1s (Vector2 0.0 (cast :f32 CELL_SIZE)))
+  (let h1e (Vector2 (cast :f32 WINDOW_SIZE) (cast :f32 CELL_SIZE)))
+  (DrawLineEx h1s h1e thick color)
+  (let h2s (Vector2 0.0 (cast :f32 (* CELL_SIZE 2))))
+  (let h2e (Vector2 (cast :f32 WINDOW_SIZE) (cast :f32 (* CELL_SIZE 2))))
+  (DrawLineEx h2s h2e thick color))
 
 ;; Main
 (defn main [] :int
@@ -148,6 +157,13 @@
       (cond
         [(== (array-ref board i) X_PIECE) (draw-x col row red)]
         [(== (array-ref board i) O_PIECE) (draw-o col row blue)]))
+
+    ;; Draw turn indicator
+    (when (== state PLAYING)
+      (if (== turn PLAYER_X)
+        (DrawText "X's turn" 10 570 20 red)
+      else
+        (DrawText "O's turn" 10 570 20 blue)))
 
     ;; Draw end screen overlay
     (when (!= state PLAYING)
