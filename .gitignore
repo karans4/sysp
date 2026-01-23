@@ -10,3 +10,5 @@ test-macros2
 test-macros2.c
 test-qq
 test-qq.c
+test-refcount
+test-refcount.c
