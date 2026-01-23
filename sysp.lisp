@@ -62,7 +62,8 @@
 
 (defstruct env
   (bindings nil)  ; alist of (name . type)
-  (parent nil))
+  (parent nil)
+  (releases nil)) ; list of C variable names needing val_release at scope exit
 
 (defun env-lookup (env name)
   (if (null env) nil
@@ -73,6 +74,19 @@
 (defun env-bind (env name type)
   (push (cons name type) (env-bindings env))
   env)
+
+(defun value-type-p (tp)
+  "Does this type need refcount management?"
+  (member (sysp-type-kind tp) '(:value :cons)))
+
+(defun env-add-release (env c-name)
+  "Record a variable name for release at scope exit"
+  (push c-name (env-releases env)))
+
+(defun emit-releases (env)
+  "Generate release statements for all Value locals in this scope"
+  (mapcar (lambda (name) (format nil "  val_release(~a);" name))
+          (env-releases env)))
 
 ;;; === Global State ===
 
@@ -809,6 +823,13 @@
     (:bool (format nil "val_int(~a)" code))
     (otherwise (format nil "val_int(~a)" code))))
 
+(defun cons-arg-needs-retain-p (arg-form env)
+  "Does this cons argument need val_retain? Yes if it's a local variable of Value type."
+  (and (symbolp arg-form)
+       (not (sym= arg-form "nil"))
+       (let ((tp (env-lookup env (string arg-form))))
+         (and tp (value-type-p tp)))))
+
 (defun compile-cons (form env)
   "(cons x y)"
   (setf *uses-value-type* t)
@@ -816,6 +837,11 @@
     (multiple-value-bind (cdr-code cdr-type) (compile-expr (third form) env)
       (let ((car-val (wrap-as-value car-code car-type))
             (cdr-val (wrap-as-value cdr-code cdr-type)))
+        ;; If args are local variables, retain them (cons shares ownership)
+        (when (cons-arg-needs-retain-p (second form) env)
+          (setf car-val (format nil "val_retain(~a)" car-val)))
+        (when (cons-arg-needs-retain-p (third form) env)
+          (setf cdr-val (format nil "val_retain(~a)" cdr-val)))
         (values (format nil "val_cons(make_cons(~a, ~a))" car-val cdr-val)
                 (make-value-type))))))
 
@@ -1030,17 +1056,30 @@
                        (setf rest (cdr rest)))))
          (init-form (first rest)))
     (multiple-value-bind (init-code init-type) (compile-expr init-form env)
-      (let ((final-type (or type-ann init-type)))
+      (let* ((final-type (or type-ann init-type))
+             (c-name (sanitize-name name))
+             ;; Copying a Value variable needs retain (variable ref = shared ownership)
+             ;; Fresh allocations (cons, list, quote, car, cdr) already have correct refcount
+             (needs-retain (and *uses-value-type*
+                               (value-type-p final-type)
+                               (symbolp init-form)
+                               (not (sym= init-form "nil"))
+                               (env-lookup env (string init-form)))))
         (env-bind env name final-type)
+        ;; Track Value-typed locals for release at scope exit
+        (when (and *uses-value-type* (value-type-p final-type))
+          (env-add-release env c-name))
         (if (eq (sysp-type-kind final-type) :array)
-            ;; Array declaration: int name[size] = {0};
             (list (format nil "  ~a ~a[~a] = ~a;"
                           (type-to-c (first (sysp-type-params final-type)))
-                          (sanitize-name name)
+                          c-name
                           (second (sysp-type-params final-type))
                           init-code))
-            (list (format nil "  ~a ~a = ~a;"
-                          (type-to-c final-type) (sanitize-name name) init-code)))))))
+            (if needs-retain
+                (list (format nil "  ~a ~a = val_retain(~a);"
+                              (type-to-c final-type) c-name init-code))
+                (list (format nil "  ~a ~a = ~a;"
+                              (type-to-c final-type) c-name init-code))))))))
 
 (defun format-print-arg (val-code val-type)
   "Return format string and arg for a typed value"
@@ -1199,6 +1238,10 @@
         (result (list "  {")))
     (dolist (s (compile-body (rest form) body-env))
       (push (format nil "  ~a" s) result))
+    ;; Release Value locals at scope exit
+    (when *uses-value-type*
+      (dolist (r (emit-releases body-env))
+        (push (format nil "  ~a" r) result)))
     (push "  }" result)
     (nreverse result)))
 
@@ -1317,14 +1360,30 @@
                        "main"
                        (sanitize-name name))))
       ;; Handle void return or expression return
-      (multiple-value-bind (last-code lt) (compile-expr last-form env)
-        (declare (ignore lt))
-        (let ((return-stmt (if (eq (sysp-type-kind ret-type) :void)
-                               (progn
-                                 ;; For void, compile last form as statement too
-                                 (setf stmts (compile-body body-forms env))
-                                 nil)
-                               (format nil "  return ~a;~%" last-code))))
+      (let (return-stmt)
+        (if (eq (sysp-type-kind ret-type) :void)
+            ;; Void: last form is just another statement, no return
+            (progn
+              (setf stmts (append stmts (compile-stmt last-form env)))
+              (let ((releases (when *uses-value-type* (emit-releases env))))
+                (when releases
+                  (setf return-stmt (format nil "~{~a~%~}" releases)))))
+            ;; Non-void: last form is return value
+            (multiple-value-bind (last-code lt) (compile-expr last-form env)
+              (declare (ignore lt))
+              (let* ((releases (when *uses-value-type* (emit-releases env)))
+                     (ret-var (and (symbolp last-form)
+                                   (member (sanitize-name (string last-form))
+                                           (env-releases env) :test #'equal))))
+                (setf return-stmt
+                      (if (and ret-var *uses-value-type* releases)
+                          (format nil "  val_retain(~a);~%~{~a~%~}  return ~a;~%"
+                                  (sanitize-name (string last-form))
+                                  releases
+                                  last-code)
+                          (if (and *uses-value-type* releases)
+                              (format nil "~{~a~%~}  return ~a;~%" releases last-code)
+                              (format nil "  return ~a;~%" last-code)))))))
           (let ((body-stmts (if uses-recur
                                   (cons "  _recur_top: ;" (or stmts nil))
                                   (or stmts nil))))
@@ -1340,7 +1399,7 @@
             (push (format nil "~a ~a(~a);"
                           (type-to-c ret-type) c-name
                           (if params param-str "void"))
-                  *forward-decls*))))))))
+                  *forward-decls*)))))))
 
 (defun compile-extern (form)
   "(extern name [params] :ret-type) — declare external C function"
@@ -1693,11 +1752,14 @@
   (format out "static Value val_sym(Symbol x) { Value v = {.tag = VAL_SYM}; v.as_sym = x; return v; }~%")
   (format out "static Value val_cons(Cons* x) { Value v = {.tag = VAL_CONS}; v.as_cons = x; return v; }~%")
   (format out "static Cons* make_cons(Value car, Value cdr) { Cons* c = malloc(sizeof(Cons)); c->car = car; c->cdr = cdr; c->refcount = 1; return c; }~%")
-  (format out "static Value sysp_car(Value v) { return v.as_cons->car; }~%")
-  (format out "static Value sysp_cdr(Value v) { return v.as_cons->cdr; }~%")
+  ;; Refcounting (before car/cdr which use val_retain)
+  (format out "static Value val_retain(Value v) { if(v.tag == VAL_CONS && v.as_cons) v.as_cons->refcount++; return v; }~%")
+  (format out "static void val_release(Value v) { if(v.tag == VAL_CONS && v.as_cons && --v.as_cons->refcount == 0) { val_release(v.as_cons->car); val_release(v.as_cons->cdr); free(v.as_cons); } }~%")
+  (format out "static Value sysp_car(Value v) { return val_retain(v.as_cons->car); }~%")
+  (format out "static Value sysp_cdr(Value v) { return val_retain(v.as_cons->cdr); }~%")
   (format out "static int sysp_nilp(Value v) { return v.tag == VAL_NIL; }~%")
   (format out "static int sysp_sym_eq(Value a, Value b) { return a.tag == VAL_SYM && b.tag == VAL_SYM && a.as_sym == b.as_sym; }~%")
-  (format out "static Value sysp_append(Value lst, Value tail) { if(lst.tag == VAL_NIL) return tail; return val_cons(make_cons(sysp_car(lst), sysp_append(sysp_cdr(lst), tail))); }~%")
+  (format out "static Value sysp_append(Value lst, Value tail) { if(lst.tag == VAL_NIL) return val_retain(tail); return val_cons(make_cons(sysp_car(lst), sysp_append(sysp_cdr(lst), tail))); }~%")
   (format out "static uint32_t _sysp_gensym = 0x80000000;~%")
   ;; Emit symbol name table for printing (before print_value which uses it)
   (let ((max-id *symbol-counter*))

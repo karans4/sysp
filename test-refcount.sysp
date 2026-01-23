@@ -1,0 +1,49 @@
+;; Test refcounting for cons cells
+
+(defn test-basic [] :void
+  ;; Simple allocation and release
+  (let xs (cons 1 (cons 2 (cons 3 '()))))
+  (println "basic: created list")
+  (println xs)
+  ;; xs released at end of scope
+  )
+
+(defn test-car-cdr [] :void
+  ;; car/cdr retain their results
+  (let xs (list 10 20 30))
+  (let head (car xs))
+  (let tail (cdr xs))
+  (print "head = ")
+  (println head)
+  (print "tail = ")
+  (println tail)
+  ;; head, tail, xs all released
+  )
+
+(defn test-copy [] :void
+  ;; Copying a Value retains it
+  (let xs (list 1 2 3))
+  (let ys xs)  ;; should retain — both xs and ys own a reference
+  (print "xs = ")
+  (println xs)
+  (print "ys = ")
+  (println ys)
+  ;; both released, refcount goes 2 -> 1 -> 0 -> free
+  )
+
+(defn test-nested [] :void
+  ;; Nested cons cells — releasing outer should cascade
+  (let inner (list 4 5))
+  (let outer (cons 3 inner))
+  (println outer)
+  ;; inner released (refcount 2->1, still alive in outer)
+  ;; outer released (refcount 1->0, frees outer cell, releases cdr=inner, inner 1->0, freed)
+  )
+
+(defn main [] :int
+  (test-basic)
+  (test-car-cdr)
+  (test-copy)
+  (test-nested)
+  (println "all refcount tests passed (no crashes)")
+  0)
