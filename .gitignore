@@ -1,0 +1,4 @@
+*.o
+*.fasl
+examples/*.c
+examples/hello
