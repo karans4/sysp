@@ -140,6 +140,22 @@
         (read-delimited-list #\] stream t))
       nil rt)
     (set-syntax-from-char #\] #\) rt)
+    ;; Backquote → (quasiquote ...)
+    (set-macro-character #\`
+      (lambda (stream char)
+        (declare (ignore char))
+        (list (intern "quasiquote" :sysp) (let ((*readtable* rt)) (read stream t nil t))))
+      nil rt)
+    ;; Tilde → (unquote ...) or (splice ...) if followed by @
+    (set-macro-character #\~
+      (lambda (stream char)
+        (declare (ignore char))
+        (let ((next (peek-char nil stream t nil t)))
+          (if (char= next #\@)
+              (progn (read-char stream t nil t)  ; consume @
+                     (list (intern "splice" :sysp) (let ((*readtable* rt)) (read stream t nil t))))
+              (list (intern "unquote" :sysp) (let ((*readtable* rt)) (read stream t nil t))))))
+      nil rt)
     rt))
 
 (defvar *sysp-readtable* (make-sysp-readtable))
@@ -461,6 +477,7 @@
       ((sym= head "nil?") (compile-nilp form env))
       ((sym= head "list") (compile-list-expr form env))
       ((sym= head "quote") (compile-quote form env))
+      ((sym= head "quasiquote") (compile-quasiquote form env))
       ((sym= head "sym") (compile-sym-literal form env))
       ((sym= head "sym-eq?") (compile-sym-eq form env))
       ((sym= head "gensym") (compile-gensym-expr form env))
@@ -855,6 +872,50 @@
              (compile-quoted-datum (first datum))
              (compile-quoted-datum (rest datum))))
     (t (format nil "val_int(0)"))))
+
+(defun compile-quasiquote (form env)
+  "(quasiquote datum) — like quote but with ~unquote and ~@splice"
+  (setf *uses-value-type* t)
+  (values (compile-qq (second form) env) (make-value-type)))
+
+(defun compile-qq (datum env)
+  "Recursively compile a quasiquoted datum"
+  (cond
+    ;; (unquote x) → evaluate x, wrap as Value
+    ((and (listp datum) (symbolp (first datum))
+          (string-equal (symbol-name (first datum)) "unquote"))
+     (multiple-value-bind (code tp) (compile-expr (second datum) env)
+       (wrap-as-value code tp)))
+    ;; A list — build cons cells, handling splice
+    ((listp datum)
+     (compile-qq-list datum env))
+    ;; Atom — same as quote
+    (t (compile-quoted-datum datum))))
+
+(defun compile-qq-list (items env)
+  "Compile a quasiquoted list, handling splice"
+  (if (null items)
+      "val_nil()"
+      (let ((first-item (first items))
+            (rest-code (compile-qq-list (rest items) env)))
+        (cond
+          ;; (splice x) → append x to rest
+          ((and (listp first-item) (symbolp (first first-item))
+                (string-equal (symbol-name (first first-item)) "splice"))
+           (multiple-value-bind (code tp) (compile-expr (second first-item) env)
+             (let ((val (if (member (sysp-type-kind tp) '(:value :cons))
+                            code
+                            (wrap-as-value code tp))))
+               (format nil "sysp_append(~a, ~a)" val rest-code))))
+          ;; (unquote x) → evaluate and cons
+          ((and (listp first-item) (symbolp (first first-item))
+                (string-equal (symbol-name (first first-item)) "unquote"))
+           (multiple-value-bind (code tp) (compile-expr (second first-item) env)
+             (let ((val (wrap-as-value code tp)))
+               (format nil "val_cons(make_cons(~a, ~a))" val rest-code))))
+          ;; Regular element — quote it and cons
+          (t (format nil "val_cons(make_cons(~a, ~a))"
+                     (compile-qq first-item env) rest-code))))))
 
 (defun compile-sym-literal (form env)
   "(sym name) — get symbol ID for a name"
@@ -1393,6 +1454,7 @@
   (format out "static Value sysp_cdr(Value v) { return v.as_cons->cdr; }~%")
   (format out "static int sysp_nilp(Value v) { return v.tag == VAL_NIL; }~%")
   (format out "static int sysp_sym_eq(Value a, Value b) { return a.tag == VAL_SYM && b.tag == VAL_SYM && a.as_sym == b.as_sym; }~%")
+  (format out "static Value sysp_append(Value lst, Value tail) { if(lst.tag == VAL_NIL) return tail; return val_cons(make_cons(sysp_car(lst), sysp_append(sysp_cdr(lst), tail))); }~%")
   (format out "static uint32_t _sysp_gensym = 0x80000000;~%")
   ;; Emit symbol name table for printing (before print_value which uses it)
   (let ((max-id *symbol-counter*))

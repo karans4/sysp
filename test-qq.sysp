@@ -1,0 +1,39 @@
+;; Test quasiquote
+
+(defn main [] :int
+  ;; Simple quasiquote with no unquotes (same as quote)
+  (let q1 `(a b c))
+  (print "q1 = ")
+  (println q1)
+
+  ;; Unquote a variable
+  (let x 42)
+  (let q2 `(answer is ~x))
+  (print "q2 = ")
+  (println q2)
+
+  ;; Unquote an expression
+  (let q3 `(sum is ~(+ 1 2)))
+  (print "q3 = ")
+  (println q3)
+
+  ;; Splice
+  (let rest (list 4 5 6))
+  (let q4 `(1 2 3 ~@rest))
+  (print "q4 = ")
+  (println q4)
+
+  ;; Mixed unquote and splice
+  (let op '+)
+  (let args (list 10 20))
+  (let q5 `(~op ~@args))
+  (print "q5 = ")
+  (println q5)
+
+  ;; Nested structure
+  (let body '(println x))
+  (let q6 `(if (> x 0) ~body))
+  (print "q6 = ")
+  (println q6)
+
+  0)
