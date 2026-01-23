@@ -1,4 +1,3 @@
-*.o
-*.fasl
-examples/*.c
 examples/hello
+examples/tictactoe
+examples/*.c
