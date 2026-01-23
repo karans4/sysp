@@ -29,7 +29,7 @@
 (extern DrawLine [x1 :int, y1 :int, x2 :int, y2 :int, color :Color] :void)
 (extern DrawLineEx [start :Vector2, end :Vector2, thick :f32, color :Color] :void)
 (extern DrawCircle [cx :int, cy :int, radius :f32, color :Color] :void)
-(extern DrawCircleLines [cx :int, cy :int, radius :f32, color :Color] :void)
+(extern DrawRing [center :Vector2, innerRadius :f32, outerRadius :f32, startAngle :f32, endAngle :f32, segments :int, color :Color] :void)
 (extern DrawRectangle [x :int, y :int, w :int, h :int, color :Color] :void)
 (extern DrawText [text :str, x :int, y :int, size :int, color :Color] :void)
 (extern GetMousePosition [] :Vector2)
@@ -82,12 +82,14 @@
   (DrawLineEx start1 end1 (cast :f32 LINE_THICK) color)
   (DrawLineEx start2 end2 (cast :f32 LINE_THICK) color))
 
-;; Draw an O in a cell
+;; Draw an O in a cell (ring with LINE_THICK thickness to match X)
 (defn draw-o [col :int, row :int, color :Color] :void
-  (let cx (+ (* col CELL_SIZE) (/ CELL_SIZE 2)))
-  (let cy (+ (* row CELL_SIZE) (/ CELL_SIZE 2)))
+  (let cx (cast :f32 (+ (* col CELL_SIZE) (/ CELL_SIZE 2))))
+  (let cy (cast :f32 (+ (* row CELL_SIZE) (/ CELL_SIZE 2))))
+  (let center (Vector2 cx cy))
   (let radius (cast :f32 (- (/ CELL_SIZE 2) 30)))
-  (DrawCircleLines cx cy radius color))
+  (let half-thick (cast :f32 (/ LINE_THICK 2)))
+  (DrawRing center (- radius half-thick) (+ radius half-thick) 0.0 360.0 36 color))
 
 ;; Draw the grid lines
 (defn draw-grid [color :Color] :void
