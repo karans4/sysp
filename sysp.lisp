@@ -95,6 +95,8 @@
 (defvar *symbol-counter* 0)
 (defvar *sysp-gensym-counter* #x80000000)  ; gensyms start high to avoid collision
 (defvar *uses-value-type* nil)  ; emit Value/Cons preamble if true
+(defvar *macro-fns* (make-hash-table :test 'equal))  ; name -> (params body) for compile-time eval
+(defvar *interp-gensym-counter* 0)
 
 (defun intern-symbol (name)
   "Get or assign an integer ID for a named symbol"
@@ -523,17 +525,22 @@
     (values (format nil "(~~~a)" val) (make-int-type))))
 
 (defun compile-if-expr (form env)
-  "(if cond then else) -> ternary"
+  "(if cond then else) or (if cond then else else-expr) -> ternary"
   (multiple-value-bind (cond-code ct) (compile-expr (second form) env)
     (declare (ignore ct))
     (multiple-value-bind (then-code then-type) (compile-expr (third form) env)
-      (if (fourth form)
-          (multiple-value-bind (else-code et) (compile-expr (fourth form) env)
-            (declare (ignore et))
-            (values (format nil "(~a ? ~a : ~a)" cond-code then-code else-code)
-                    then-type))
-          (values (format nil "(~a ? ~a : 0)" cond-code then-code)
-                  then-type)))))
+      ;; Check for else keyword (statement-style) vs positional (expression-style)
+      (let ((else-form (if (and (fourth form) (symbolp (fourth form))
+                                (sym= (fourth form) "else"))
+                           (fifth form)    ; skip 'else' keyword
+                           (fourth form)))) ; positional
+        (if else-form
+            (multiple-value-bind (else-code et) (compile-expr else-form env)
+              (declare (ignore et))
+              (values (format nil "(~a ? ~a : ~a)" cond-code then-code else-code)
+                      then-type))
+            (values (format nil "(~a ? ~a : 0)" cond-code then-code)
+                    then-type))))))
 
 (defun compile-do-expr (form env)
   "(do expr...) -> GNU statement expression, value is last"
@@ -1274,12 +1281,18 @@
                            (prog1 (parse-type-annotation (first rest-forms))
                              (setf rest-forms (cdr rest-forms)))))
          (body-forms rest-forms)
+         ;; Also register for compile-time use by macros
+         (raw-body (let ((rb (cdddr form)))
+                     (if (keywordp (first rb)) (cdr rb) rb)))
          (env (make-env :parent *global-env*)))
     ;; Register function in global env
     (let* ((arg-types (mapcar #'second params))
            (ret-type (or ret-annotation (make-int-type)))
            (fn-type (make-fn-type arg-types ret-type)))
       (env-bind *global-env* name fn-type))
+    ;; Register for compile-time macro use (skip main)
+    (unless (string-equal name "main")
+      (setf (gethash name *macro-fns*) (list params-raw raw-body)))
     ;; Bind params
     (dolist (p params)
       (env-bind env (first p) (second p)))
@@ -1387,40 +1400,270 @@
                       (type-to-c final-type) (sanitize-name name) init-code)
               *struct-defs*)))))  ; reuse struct-defs for ordering (before functions)
 
+;;; === Compile-Time Interpreter ===
+;;; Evaluates sysp code at compile time for macro expansion.
+;;; Works on CL values: cons=cons, symbols=symbols, nil=nil.
+
+(defvar *macro-env* nil)  ; alist of (name . value) for compile-time eval
+
+(defun interp-env-lookup (env name)
+  (let ((found (assoc name env :test #'equal)))
+    (if found (cdr found) nil)))
+
+(defun interp-env-bind (env name val)
+  (acons name val env))
+
+(defun eval-sysp (form env)
+  "Evaluate a sysp form at compile time. Returns a CL value."
+  (cond
+    ((null form) nil)
+    ((integerp form) form)
+    ((floatp form) form)
+    ((stringp form) form)
+    ((symbolp form)
+     (let ((name (string form)))
+       (cond
+         ((string-equal name "true") t)
+         ((string-equal name "false") nil)
+         ((string-equal name "nil") nil)
+         (t (let ((found (assoc name env :test #'equal)))
+              (if found
+                  (cdr found)
+                  ;; Maybe it's a known macro-time function
+                  (intern name :sysp)))))))
+    ((listp form)
+     (eval-sysp-list form env))
+    (t form)))
+
+(defun eval-sysp-list (form env)
+  (let ((head (first form)))
+    (cond
+      ;; Special forms
+      ((sym= head "quote") (second form))
+      ((sym= head "quasiquote") (eval-quasiquote (second form) env))
+      ((sym= head "if") (eval-if form env))
+      ((sym= head "when") (eval-when-form form env))
+      ((sym= head "unless") (eval-unless-form form env))
+      ((sym= head "cond") (eval-cond form env))
+      ((sym= head "do") (eval-do form env))
+      ((sym= head "let") (eval-let form env))
+      ((sym= head "let-mut") (eval-let form env))
+      ((sym= head "set!") (eval-set form env))
+      ((sym= head "lambda") (eval-lambda form env))
+      ;; Arithmetic
+      ((sym= head "+") (apply #'+ (mapcar (lambda (x) (eval-sysp x env)) (rest form))))
+      ((sym= head "-") (if (= (length form) 2)
+                           (- (eval-sysp (second form) env))
+                           (apply #'- (mapcar (lambda (x) (eval-sysp x env)) (rest form)))))
+      ((sym= head "*") (apply #'* (mapcar (lambda (x) (eval-sysp x env)) (rest form))))
+      ((sym= head "/") (apply #'truncate (mapcar (lambda (x) (eval-sysp x env)) (rest form))))
+      ((sym= head "%") (mod (eval-sysp (second form) env) (eval-sysp (third form) env)))
+      ;; Comparison
+      ((sym= head "==") (if (equal (eval-sysp (second form) env) (eval-sysp (third form) env)) t nil))
+      ((sym= head "!=") (if (not (equal (eval-sysp (second form) env) (eval-sysp (third form) env))) t nil))
+      ((sym= head "<") (if (< (eval-sysp (second form) env) (eval-sysp (third form) env)) t nil))
+      ((sym= head ">") (if (> (eval-sysp (second form) env) (eval-sysp (third form) env)) t nil))
+      ((sym= head "<=") (if (<= (eval-sysp (second form) env) (eval-sysp (third form) env)) t nil))
+      ((sym= head ">=") (if (>= (eval-sysp (second form) env) (eval-sysp (third form) env)) t nil))
+      ;; Logical
+      ((sym= head "and") (every (lambda (x) (eval-sysp x env)) (rest form)))
+      ((sym= head "or") (some (lambda (x) (eval-sysp x env)) (rest form)))
+      ((sym= head "not") (not (eval-sysp (second form) env)))
+      ;; List ops
+      ((sym= head "cons") (cons (eval-sysp (second form) env) (eval-sysp (third form) env)))
+      ((sym= head "car") (car (eval-sysp (second form) env)))
+      ((sym= head "cdr") (cdr (eval-sysp (second form) env)))
+      ((sym= head "nil?") (null (eval-sysp (second form) env)))
+      ((sym= head "list") (mapcar (lambda (x) (eval-sysp x env)) (rest form)))
+      ((sym= head "sym-eq?")
+       (let ((a (eval-sysp (second form) env))
+             (b (eval-sysp (third form) env)))
+         (and (symbolp a) (symbolp b) (string= (string a) (string b)))))
+      ((sym= head "gensym")
+       (intern (format nil "_g~d" (incf *interp-gensym-counter*)) :sysp))
+      ;; Print (for debugging macros at compile time)
+      ((sym= head "println")
+       (when (rest form)
+         (format t "~a~%" (eval-sysp (second form) env)))
+       nil)
+      ;; Function call
+      (t (eval-call form env)))))
+
+(defun eval-if (form env)
+  (let* ((rest (cddr form))
+         (else-pos (position-if (lambda (x) (and (symbolp x) (sym= x "else"))) rest)))
+    (if else-pos
+        ;; Statement-style: (if cond then-body... else else-body...)
+        (if (eval-sysp (second form) env)
+            (eval-body (subseq rest 0 else-pos) env)
+            (eval-body (subseq rest (1+ else-pos)) env))
+        ;; Expression-style: (if cond then) or (if cond then else)
+        (if (eval-sysp (second form) env)
+            (eval-sysp (third form) env)
+            (when (fourth form)
+              (eval-sysp (fourth form) env))))))
+
+(defun eval-when-form (form env)
+  (when (eval-sysp (second form) env)
+    (eval-body (cddr form) env)))
+
+(defun eval-unless-form (form env)
+  (unless (eval-sysp (second form) env)
+    (eval-body (cddr form) env)))
+
+(defun eval-cond (form env)
+  (dolist (clause (rest form))
+    (let ((test (first clause))
+          (body (rest clause)))
+      (when (or (and (symbolp test) (sym= test "else"))
+                (eval-sysp test env))
+        (return (eval-body body env))))))
+
+(defun eval-do (form env)
+  (eval-body (rest form) env))
+
+(defun eval-body (forms env)
+  "Evaluate forms in sequence, return last value"
+  (let ((result nil)
+        (current-env env))
+    (dolist (f forms result)
+      (if (and (listp f) (or (sym= (first f) "let") (sym= (first f) "let-mut")))
+          ;; let extends env for subsequent forms
+          (let ((name (string (second f)))
+                (val (eval-sysp (third f) current-env)))
+            (setf current-env (acons name val current-env))
+            (setf result val))
+          (setf result (eval-sysp f current-env))))))
+
+(defun eval-let (form env)
+  (let* ((name (string (second form)))
+         (val (eval-sysp (third form) env)))
+    (acons name val env)  ; return is only used for side effect in eval-body
+    val))
+
+(defun eval-set (form env)
+  (let* ((name (string (second form)))
+         (val (eval-sysp (third form) env))
+         (cell (assoc name env :test #'equal)))
+    (when cell (setf (cdr cell) val))
+    val))
+
+(defun eval-lambda (form env)
+  "Create a closure: (params body... captured-env)"
+  (let ((params (second form))
+        (body (cddr form)))
+    (list :closure params body env)))
+
+(defun extract-param-names (params-raw)
+  "Extract just the parameter names from a raw param list, skipping type annotations"
+  (let ((names nil)
+        (lst (if (listp params-raw) params-raw nil)))
+    (loop while lst do
+      (let ((item (pop lst)))
+        (if (keywordp item)
+            (pop lst)  ; skip :type annotations (though they don't have a following value here)
+            (unless (keywordp item)
+              (push (string item) names)
+              ;; Skip following keyword if it's a type annotation
+              (when (and lst (keywordp (first lst)))
+                (pop lst))))))
+    (nreverse names)))
+
+(defun eval-call (form env)
+  (let* ((fn-name (string (first form)))
+         (args (mapcar (lambda (x) (eval-sysp x env)) (rest form)))
+         ;; Check compile-time function table
+         (fn-def (gethash fn-name *macro-fns*)))
+    (cond
+      (fn-def
+       ;; Call a compile-time defined function
+       (let* ((params-raw (first fn-def))
+              (body (second fn-def))
+              (param-names (extract-param-names params-raw))
+              (call-env (loop for name in param-names
+                              for a in args
+                              collect (cons name a))))
+         (eval-body body call-env)))
+      ;; Check if it's a closure in the env
+      (t (let ((fn-val (cdr (assoc fn-name env :test #'equal))))
+           (if (and (listp fn-val) (eq (first fn-val) :closure))
+               (let* ((params (second fn-val))
+                      (body (third fn-val))
+                      (closure-env (fourth fn-val))
+                      (call-env (append
+                                 (loop for p in (if (listp params) params (list params))
+                                       for a in args
+                                       collect (cons (string p) a))
+                                 closure-env)))
+                 (eval-body body call-env))
+               (error "Unknown function in macro expansion: ~a" fn-name)))))))
+
+(defun eval-quasiquote (datum env)
+  "Process quasiquote at compile time — returns CL list structure"
+  (cond
+    ((null datum) nil)
+    ((not (listp datum)) datum)
+    ;; (unquote x) at top level
+    ((and (symbolp (first datum))
+          (string-equal (symbol-name (first datum)) "unquote"))
+     (eval-sysp (second datum) env))
+    ;; List — process elements
+    (t (eval-qq-list datum env))))
+
+(defun eval-qq-list (items env)
+  (if (null items)
+      nil
+      (let ((first-item (first items)))
+        (cond
+          ;; (splice x) — append evaluated list
+          ((and (listp first-item) (symbolp (first first-item))
+                (string-equal (symbol-name (first first-item)) "splice"))
+           (append (eval-sysp (second first-item) env)
+                   (eval-qq-list (rest items) env)))
+          ;; (unquote x) — evaluate and cons
+          ((and (listp first-item) (symbolp (first first-item))
+                (string-equal (symbol-name (first first-item)) "unquote"))
+           (cons (eval-sysp (second first-item) env)
+                 (eval-qq-list (rest items) env)))
+          ;; Nested list — recurse
+          ((listp first-item)
+           (cons (eval-quasiquote first-item env)
+                 (eval-qq-list (rest items) env)))
+          ;; Atom — keep as-is
+          (t (cons first-item (eval-qq-list (rest items) env)))))))
+
 ;;; === Main Compiler Driver ===
 
 (defun compile-defmacro (form)
-  "(defmacro name [params] body) — register a template macro"
-  ;; For bootstrap: macro body is a CL lambda that transforms the form
-  ;; User-facing: template-based expansion using positional args
+  "(defmacro name [params] body...) — register macro with compile-time evaluator"
   (let* ((name (string (second form)))
          (params (third form))
-         (template (fourth form)))
-    ;; Simple template macros: replace $1, $2, etc. with args
-    ;; For now, just register the template for pattern substitution
+         (body (cdddr form)))
+    ;; Register as a macro that evaluates its body at compile time
     (setf (gethash name *macros*)
           (lambda (call-form)
-            (let ((args (rest call-form))
-                  (result (copy-tree template)))
-              (subst-template result params args))))))
+            (let* ((args (rest call-form))
+                   ;; Bind params to unevaluated source forms
+                   (env (loop for p in (if (listp params) params nil)
+                              for a in args
+                              collect (cons (string p) a))))
+              (eval-body body env))))))
 
-(defun subst-template (template params args)
-  "Substitute parameter names with argument values in template"
-  (cond
-    ((null template) nil)
-    ((symbolp template)
-     (let ((pos (position template params)))
-       (if pos (nth pos args) template)))
-    ((listp template)
-     (mapcar (lambda (x) (subst-template x params args)) template))
-    (t template)))
+(defun compile-defn-ct (form)
+  "(defn-ct name [params] body...) — compile-time only function (for macro helpers)"
+  (let* ((name (string (second form)))
+         (params-raw (third form))
+         (rest-forms (cdddr form))
+         (raw-body (if (keywordp (first rest-forms)) (cdr rest-forms) rest-forms)))
+    (setf (gethash name *macro-fns*) (list params-raw raw-body))))
 
 (defun compile-toplevel (forms)
   (dolist (form forms)
     (when (listp form)
-      ;; Handle defmacro first (registers without emitting)
+      ;; Handle defmacro and defn-ct first (no C emission)
       (cond
         ((sym= (first form) "defmacro") (compile-defmacro form))
+        ((sym= (first form) "defn-ct") (compile-defn-ct form))
         (t
          ;; Expand macros, then compile
          (let ((expanded (macroexpand-all form)))
@@ -1525,7 +1768,9 @@
   (setf *symbol-table* (make-hash-table :test 'equal))
   (setf *symbol-counter* 0)
   (setf *sysp-gensym-counter* #x80000000)
-  (setf *uses-value-type* nil))
+  (setf *uses-value-type* nil)
+  (setf *macro-fns* (make-hash-table :test 'equal))
+  (setf *interp-gensym-counter* 0))
 
 (defun compile-file-to-c (in-path out-path)
   (reset-state)

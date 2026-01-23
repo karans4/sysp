@@ -1,0 +1,56 @@
+;; Test the new macro system with compile-time evaluation
+
+;; A macro that uses quasiquote and gensym for hygiene
+(defmacro swap! [a b]
+  (let g (gensym))
+  `(do
+    (let ~g ~a)
+    (set! ~a ~b)
+    (set! ~b ~g)))
+
+;; A macro that builds code conditionally
+(defmacro assert-eq [a b]
+  `(unless (== ~a ~b)
+    (println "ASSERTION FAILED")))
+
+;; A macro that inspects its argument structure
+(defmacro when-zero [expr body]
+  `(when (== ~expr 0)
+    ~body))
+
+;; A macro using compile-time conditional (sym-eq? to compare source forms)
+(defmacro maybe-negate [flag x]
+  (if (sym-eq? flag 'true)
+    `(- ~x)
+    x))
+
+(defn main [] :int
+  ;; Test swap! with gensym (hygiene)
+  (let-mut x 10)
+  (let-mut y 20)
+  (swap! x y)
+  (print "after swap: x=")
+  (print x)
+  (print " y=")
+  (println y)
+
+  ;; Test assert-eq
+  (assert-eq x 20)
+  (assert-eq y 10)
+  (println "assertions passed")
+
+  ;; Test when-zero
+  (let-mut z 0)
+  (when-zero z
+    (println "z is zero"))
+
+  ;; Test maybe-negate (compile-time conditional)
+  (let neg (maybe-negate true 42))
+  (print "negated: ")
+  (println neg)
+
+  (let pos (maybe-negate false 42))
+  (print "not negated: ")
+  (println pos)
+
+  0)

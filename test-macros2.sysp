@@ -1,0 +1,51 @@
+;; Advanced macro tests — recursive expansion, helper functions
+
+;; Helper: build a chain of additions at compile time (compile-time only)
+(defn-ct expand-sum [items]
+  (if (nil? (cdr items))
+    (car items)
+  else
+    `(+ ~(car items) ~(expand-sum (cdr items)))))
+
+;; sum macro: (sum a b c) → (+ a (+ b c))
+(defmacro sum [args]
+  (expand-sum args))
+
+;; debug-msg: wraps an expr with a label and prints it
+(defmacro debug-msg [tag expr]
+  `(do
+    (print ~tag)
+    (print " = ")
+    (println ~expr)
+    0))
+
+;; A macro that generates nested if/else dispatch from pairs (compile-time only)
+(defn-ct build-dispatch [var pairs default]
+  (if (nil? pairs)
+    default
+  else
+    (do
+      (let test (car (car pairs)))
+      (let body (car (cdr (car pairs))))
+      `(if (== ~var ~test) ~body
+        else ~(build-dispatch var (cdr pairs) default)))))
+
+(defmacro dispatch [var cases default]
+  (build-dispatch var cases default))
+
+(defn main [] :int
+  ;; Test sum — should produce nested additions
+  (let result (sum [1 2 3 4 5]))
+  (print "sum 1..5 = ")
+  (println result)
+
+  ;; Test debug-msg
+  (debug-msg "val" (+ 10 20))
+
+  ;; Test dispatch — generate nested if/else
+  (let-mut x 2)
+  (let msg (dispatch x [[1 "one"] [2 "two"] [3 "three"]] "other"))
+  (print "dispatch 2 = ")
+  (println msg)
+
+  0)
