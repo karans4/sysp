@@ -85,6 +85,9 @@
 (defvar *global-env* (make-env))
 (defvar *string-literals* nil)  ; collected string constants
 (defvar *includes* nil)         ; extra #includes
+(defvar *macros* (make-hash-table :test 'equal))  ; name -> expander function
+(defvar *current-fn-name* nil)  ; for recur: name of function being compiled
+(defvar *current-fn-params* nil) ; for recur: param names of current function
 
 (defun lookup-enum-variant (name)
   "If name is an enum variant, return (enum-name . value). Else nil."
@@ -120,6 +123,79 @@
               until (eq form eof)
               do (push form forms))
         (nreverse forms)))))
+
+;;; === Macro System ===
+
+(defun macroexpand-1-sysp (form)
+  "Expand one macro call. Returns (values expanded-form expanded-p)"
+  (if (and (listp form) (symbolp (first form)))
+      (let ((expander (gethash (string (first form)) *macros*)))
+        (if expander
+            (values (funcall expander form) t)
+            (values form nil)))
+      (values form nil)))
+
+(defun macroexpand-all (form)
+  "Recursively expand all macros in form"
+  (if (not (listp form))
+      form
+      ;; First try to expand the form itself
+      (multiple-value-bind (expanded was-expanded) (macroexpand-1-sysp form)
+        (if was-expanded
+            (macroexpand-all expanded)  ; re-expand in case macro produces another macro call
+            ;; Not a macro — recurse into subforms
+            (mapcar #'macroexpand-all form)))))
+
+(defun install-builtin-macros ()
+  "Install the standard macros: ->, ->>, when-let, dotimes, etc."
+  ;; Threading macro: (-> x (f a) (g b)) => (g (f x a) b)
+  (setf (gethash "->" *macros*)
+        (lambda (form)
+          (let ((val (second form))
+                (forms (cddr form)))
+            (reduce (lambda (acc f)
+                      (if (listp f)
+                          (list* (first f) acc (rest f))
+                          (list f acc)))
+                    forms :initial-value val))))
+  ;; Thread-last: (->> x (f a) (g b)) => (g a (f b x))  wait no:
+  ;; (->> x (f a) (g b)) => (g b (f a x))
+  (setf (gethash "->>" *macros*)
+        (lambda (form)
+          (let ((val (second form))
+                (forms (cddr form)))
+            (reduce (lambda (acc f)
+                      (if (listp f)
+                          (append f (list acc))
+                          (list f acc)))
+                    forms :initial-value val))))
+  ;; when-let: (when-let name expr body...) => (let name expr) (when name body...)
+  ;; Actually emits a do block
+  (setf (gethash "when-let" *macros*)
+        (lambda (form)
+          (let ((name (second form))
+                (init (third form))
+                (body (cdddr form)))
+            (list* 'do
+                   (list 'let name init)
+                   (list* 'when name body)
+                   nil))))
+  ;; dotimes: (dotimes [i n] body...) => (for [i 0 n] body...)
+  (setf (gethash "dotimes" *macros*)
+        (lambda (form)
+          (let ((spec (second form))
+                (body (cddr form)))
+            (list* 'for (list (first spec) 0 (second spec)) body))))
+  ;; inc!: (inc! x) => (set! x (+ x 1))
+  (setf (gethash "inc!" *macros*)
+        (lambda (form)
+          (list 'set! (second form) (list '+ (second form) 1))))
+  ;; dec!: (dec! x) => (set! x (- x 1))
+  (setf (gethash "dec!" *macros*)
+        (lambda (form)
+          (list 'set! (second form) (list '- (second form) 1)))))
+
+(install-builtin-macros)
 
 ;;; === Type Annotation Parsing ===
 
@@ -259,7 +335,12 @@
                                 (make-enum-type (car enum-info)))
                         (values (sanitize-name name)
                                 (make-sysp-type :kind :unknown))))))))))
-    ((listp form) (compile-list form env))
+    ((listp form)
+     ;; Try macro expansion first
+     (multiple-value-bind (expanded was-expanded) (macroexpand-1-sysp form)
+       (if was-expanded
+           (compile-expr (macroexpand-all expanded) env)
+           (compile-list form env))))
     (t (values (format nil "~a" form) (make-sysp-type :kind :unknown)))))
 
 (defun sanitize-name (name)
@@ -671,6 +752,11 @@
 
 (defun compile-stmt (form env)
   "Compile a single form as a statement, return list of C statement strings"
+  ;; Try macro expansion first
+  (when (and (listp form) (symbolp (first form)))
+    (multiple-value-bind (expanded was-expanded) (macroexpand-1-sysp form)
+      (when was-expanded
+        (return-from compile-stmt (compile-stmt (macroexpand-all expanded) env)))))
   (cond
     ((and (listp form) (sym= (first form) "let"))
      (compile-let-stmt form env))
@@ -698,6 +784,8 @@
      (list "  break;"))
     ((and (listp form) (sym= (first form) "continue"))
      (list "  continue;"))
+    ((and (listp form) (sym= (first form) "recur"))
+     (compile-recur-stmt form env))
     ((and (listp form) (sym= (first form) "cond"))
      (compile-cond-stmt form env))
     ((and (listp form) (sym= (first form) "block"))
@@ -908,6 +996,41 @@
                   name)
           *struct-defs*)))
 
+(defun form-uses-recur-p (forms)
+  "Check if any form in the tree contains a (recur ...) call"
+  (cond
+    ((null forms) nil)
+    ((symbolp forms) (sym= forms "recur"))
+    ((listp forms)
+     (or (and (symbolp (first forms)) (sym= (first forms) "recur"))
+         (some #'form-uses-recur-p forms)))
+    (t nil)))
+
+(defun compile-recur-stmt (form env)
+  "(recur args...) — assign params and goto top"
+  (let* ((args (rest form))
+         (compiled-args (mapcar (lambda (a) (first (multiple-value-list (compile-expr a env)))) args))
+         (param-names (mapcar #'first *current-fn-params*))
+         (stmts nil))
+    ;; Use temp vars to avoid order-dependent assignment
+    (loop for i from 0
+          for arg-code in compiled-args
+          for pname in param-names
+          do (push (format nil "  __recur_~d = ~a;" i arg-code) stmts))
+    ;; Declare temps and assign back
+    (let ((temps nil) (assigns nil))
+      (loop for i from 0
+            for pname in param-names
+            for ptype in (mapcar #'second *current-fn-params*)
+            do (push (format nil "  ~a __recur_~d = ~a;"
+                            (type-to-c ptype) i
+                            (nth i compiled-args)) temps)
+               (push (format nil "  ~a = __recur_~d;"
+                            (sanitize-name pname) i) assigns))
+      (append (nreverse temps)
+              (nreverse assigns)
+              (list "  goto _recur_top;")))))
+
 (defun compile-foreign-struct (form)
   "(foreign-struct Name [field :type, ...]) — register struct from C header, no typedef emitted"
   (let* ((name (string (second form)))
@@ -935,10 +1058,14 @@
     ;; Bind params
     (dolist (p params)
       (env-bind env (first p) (second p)))
+    ;; Set recur context
+    (let ((*current-fn-name* name)
+          (*current-fn-params* params))
     ;; Compile body: all but last are statements, last is return value
     (let* ((all-but-last (butlast body-forms))
            (last-form (car (last body-forms)))
            (stmts (when all-but-last (compile-body all-but-last env)))
+           (uses-recur (form-uses-recur-p body-forms))
            (ret-type (or ret-annotation (make-int-type)))
            (param-str (format nil "~{~a~^, ~}"
                              (mapcar (lambda (p)
@@ -960,19 +1087,22 @@
                                  (setf stmts (compile-body body-forms env))
                                  nil)
                                (format nil "  return ~a;~%" last-code))))
-          (push (format nil "~a ~a(~a) {~%~{~a~%~}~@[~a~]}~%"
-                        (type-to-c ret-type)
-                        c-name
-                        (if params param-str "void")
-                        (or stmts nil)
-                        return-stmt)
-                *functions*)
+          (let ((body-stmts (if uses-recur
+                                  (cons "  _recur_top: ;" (or stmts nil))
+                                  (or stmts nil))))
+            (push (format nil "~a ~a(~a) {~%~{~a~%~}~@[~a~]}~%"
+                          (type-to-c ret-type)
+                          c-name
+                          (if params param-str "void")
+                          body-stmts
+                          return-stmt)
+                  *functions*))
           ;; Forward declaration (skip for main)
           (unless (string= c-name "main")
             (push (format nil "~a ~a(~a);"
                           (type-to-c ret-type) c-name
                           (if params param-str "void"))
-                  *forward-decls*)))))))
+                  *forward-decls*))))))))
 
 (defun compile-extern (form)
   "(extern name [params] :ret-type) — declare external C function"
@@ -1034,18 +1164,51 @@
 
 ;;; === Main Compiler Driver ===
 
+(defun compile-defmacro (form)
+  "(defmacro name [params] body) — register a template macro"
+  ;; For bootstrap: macro body is a CL lambda that transforms the form
+  ;; User-facing: template-based expansion using positional args
+  (let* ((name (string (second form)))
+         (params (third form))
+         (template (fourth form)))
+    ;; Simple template macros: replace $1, $2, etc. with args
+    ;; For now, just register the template for pattern substitution
+    (setf (gethash name *macros*)
+          (lambda (call-form)
+            (let ((args (rest call-form))
+                  (result (copy-tree template)))
+              (subst-template result params args))))))
+
+(defun subst-template (template params args)
+  "Substitute parameter names with argument values in template"
+  (cond
+    ((null template) nil)
+    ((symbolp template)
+     (let ((pos (position template params)))
+       (if pos (nth pos args) template)))
+    ((listp template)
+     (mapcar (lambda (x) (subst-template x params args)) template))
+    (t template)))
+
 (defun compile-toplevel (forms)
   (dolist (form forms)
     (when (listp form)
+      ;; Handle defmacro first (registers without emitting)
       (cond
-        ((sym= (first form) "struct") (compile-struct form))
-        ((sym= (first form) "foreign-struct") (compile-foreign-struct form))
-        ((sym= (first form) "enum") (compile-enum form))
-        ((sym= (first form) "defn") (compile-defn form))
-        ((sym= (first form) "extern") (compile-extern form))
-        ((sym= (first form) "include") (compile-include form))
-        ((sym= (first form) "const") (compile-const form))
-        (t (warn "Unknown top-level form: ~a" (first form)))))))
+        ((sym= (first form) "defmacro") (compile-defmacro form))
+        (t
+         ;; Expand macros, then compile
+         (let ((expanded (macroexpand-all form)))
+           (when (listp expanded)
+             (cond
+               ((sym= (first expanded) "struct") (compile-struct expanded))
+               ((sym= (first expanded) "foreign-struct") (compile-foreign-struct expanded))
+               ((sym= (first expanded) "enum") (compile-enum expanded))
+               ((sym= (first expanded) "defn") (compile-defn expanded))
+               ((sym= (first expanded) "extern") (compile-extern expanded))
+               ((sym= (first expanded) "include") (compile-include expanded))
+               ((sym= (first expanded) "const") (compile-const expanded))
+               (t (warn "Unknown top-level form: ~a" (first expanded)))))))))))
 
 (defun emit-c (out-path)
   (with-open-file (out out-path :direction :output :if-exists :supersede)

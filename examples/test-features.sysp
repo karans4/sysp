@@ -1,0 +1,36 @@
+;;; Test: recur, macros, enums
+
+;; Test threading macro
+;; (-> 5 (+ 3) (* 2)) => (* (+ 5 3) 2) => 16
+(defn test-threading [] :int
+  (-> 5 (+ 3) (* 2)))
+
+;; Test recur (factorial via tail recursion)
+(defn factorial [n :int, acc :int] :int
+  (if (== n 0)
+    (return acc)
+  else
+    (recur (- n 1) (* acc n)))
+  0)
+
+;; Test dotimes macro
+(defn test-dotimes [] :void
+  (let-mut sum :int 0)
+  (dotimes [i 5]
+    (set! sum (+ sum i)))
+  (println sum))
+
+;; Test inc!/dec!
+(defn test-inc [] :void
+  (let-mut x :int 10)
+  (inc! x)
+  (inc! x)
+  (dec! x)
+  (println x))  ;; should print 11
+
+(defn main [] :int
+  (println (test-threading))   ;; 16
+  (println (factorial 5 1))    ;; 120
+  (test-dotimes)               ;; 10 (0+1+2+3+4)
+  (test-inc)                   ;; 11
+  0)
