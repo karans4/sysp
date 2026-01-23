@@ -1,0 +1,23 @@
+(struct Point [x :int, y :int])
+
+(defn sysp_main [] :int
+  ;; 1. Struct Construction & Access
+  (let p (Point 10 20))
+  (print (get p x)) ;; Should print 10
+
+  ;; 2. Generic Vector (Infers :int)
+  (let v (vector 1 2 3 4 5))
+  (print (vector-ref v 2)) ;; Should print 3
+
+  ;; 3. Immutable Tuple (Infers Tuple_int_float)
+  (let t (tuple 42 3.14))
+  (print (tuple-ref t 0)) ;; Should print 42
+
+  ;; 4. Lambda Function
+  (let adder (lambda [x :int] :int (+ x 10)))
+  (print (adder 5)) ;; Should print 15
+
+  ;; 5. Vector of Lambdas (Higher Order Vector)
+  (let v_funcs (vector adder adder))
+
+  0)
