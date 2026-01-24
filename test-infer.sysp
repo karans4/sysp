@@ -1,0 +1,29 @@
+;;; Test: HM type inference (constraint generation)
+;;; Functions without type annotations should have types inferred
+
+;; Test 1: Infer int params from arithmetic usage
+(defn add [a, b] :int
+  (+ a b))
+
+;; Test 2: Infer return type from body
+(defn square [x :int]
+  (* x x))
+
+;; Test 3: Infer both params and return type
+(defn double [n]
+  (+ n n))
+
+;; Test 4: Infer float from literal usage
+(defn half [x :float] :float
+  (/ x 2.0))
+
+;; Test 5: Multiple calls constrain types
+(defn apply-twice [x]
+  (add (add x x) (add x x)))
+
+(defn main [] :int
+  (println (add 3 4))           ;; 7
+  (println (square 5))          ;; 25
+  (println (double 10))         ;; 20
+  (println (apply-twice 2))     ;; 8
+  0)

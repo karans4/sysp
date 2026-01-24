@@ -181,6 +181,364 @@
 (defun reset-inference ()
   (setf *tvar-counter* 0))
 
+;;; === Constraint Generation (Phase 2: AST → Type Constraints) ===
+
+;; Type environment for inference: alist of (name . type-or-scheme)
+(defvar *infer-env* nil)
+
+(defun infer-env-lookup (name)
+  (let ((entry (assoc name *infer-env* :test #'equal)))
+    (when entry
+      (let ((tp (cdr entry)))
+        (if (and (consp tp) (eq (car tp) :scheme))
+            (instantiate tp)
+            tp)))))
+
+(defun infer-env-bind (name type)
+  (push (cons name type) *infer-env*))
+
+;; Resolve a type variable to its final concrete type, defaulting unbound tvars to :int
+(defun resolve-or-default (tp)
+  (let ((resolved (resolve-type tp)))
+    (if (tvar-p resolved)
+        (make-int-type)  ; unbound tvar defaults to int (gradual typing)
+        (if (sysp-type-params resolved)
+            (make-sysp-type :kind (sysp-type-kind resolved)
+                           :name (sysp-type-name resolved)
+                           :params (mapcar #'resolve-or-default
+                                           (sysp-type-params resolved)))
+            resolved))))
+
+;; Infer the type of an expression, generating constraints via unification.
+;; Returns the inferred type (may contain tvars until resolution).
+(defun infer-expr (form)
+  "Walk an expression form and return its inferred type."
+  (cond
+    ((null form) (make-int-type))
+    ((integerp form) (make-int-type))
+    ((floatp form) (make-float-type))
+    ((stringp form) (make-str-type))
+    ((symbolp form)
+     (let ((name (string form)))
+       (cond
+         ((string-equal name "true") (make-bool-type))
+         ((string-equal name "false") (make-bool-type))
+         ((string-equal name "null") (make-ptr-type (make-void-type)))
+         (t (or (infer-env-lookup name) (make-tvar))))))
+    ((listp form) (infer-list form))
+    (t (make-int-type))))
+
+(defun infer-list (form)
+  "Infer the type of a list expression."
+  (let ((head (first form)))
+    (cond
+      ;; Arithmetic: operands must unify, result = operand type
+      ((member (string head) '("+" "-" "*" "/" "%" "mod") :test #'string-equal)
+       (if (and (= (length form) 2) (string-equal (string head) "-"))
+           ;; Unary minus
+           (infer-expr (second form))
+           ;; Binary op: infer both sides, try to unify, return result
+           (let ((lt (infer-expr (second form)))
+                 (rt (infer-expr (third form))))
+             (unify lt rt)
+             lt)))
+
+      ;; Comparison: operands unify, result is bool
+      ((member (string head) '("<" ">" "<=" ">=" "==" "!=") :test #'string-equal)
+       (let ((lt (infer-expr (second form)))
+             (rt (infer-expr (third form))))
+         (unify lt rt)
+         (make-bool-type)))
+
+      ;; Logical: result is bool
+      ((member (string head) '("and" "or" "not") :test #'string-equal)
+       (make-bool-type))
+
+      ;; Bitwise: operands are int, result is int
+      ((member (string head) '("bit-and" "bit-or" "bit-xor" "bit-not" "shl" "shr")
+               :test #'string-equal)
+       (make-int-type))
+
+      ;; if expression: unify both branches
+      ((sym= head "if")
+       (infer-expr (second form))  ; condition
+       (let ((then-type (infer-expr (third form))))
+         (when (>= (length form) 5)  ; has else branch
+           (let ((else-type (infer-expr (fifth form))))
+             (unify then-type else-type)))
+         then-type))
+
+      ;; do block: type of last expression
+      ((sym= head "do")
+       (let ((result (make-int-type)))
+         (dolist (subform (cdr form))
+           (setf result (infer-expr subform)))
+         result))
+
+      ;; vector: all elements unify, result is vector of element type
+      ((sym= head "vector")
+       (let ((elem-type (make-tvar)))
+         (dolist (e (cdr form))
+           (unify elem-type (infer-expr e)))
+         (make-vector-type elem-type)))
+
+      ;; vector-ref: result is element type
+      ((sym= head "vector-ref")
+       (let* ((vec-type (infer-expr (second form)))
+              (elem-tvar (make-tvar))
+              (expected-vec (make-vector-type elem-tvar)))
+         (unify vec-type expected-vec)
+         elem-tvar))
+
+      ;; tuple: result is tuple of element types
+      ((sym= head "tuple")
+       (make-tuple-type (mapcar #'infer-expr (cdr form))))
+
+      ;; tuple-ref: we can't statically know which element without evaluating index
+      ((sym= head "tuple-ref")
+       (make-tvar))
+
+      ;; lambda: parse param types, infer body
+      ((sym= head "lambda")
+       (let* ((params-raw (second form))
+              (rest (cddr form))
+              (ret-ann (when (keywordp (first rest))
+                         (prog1 (parse-type-annotation (first rest))
+                           (setf rest (cdr rest)))))
+              (body rest)
+              (param-types nil)
+              (old-env *infer-env*))
+         ;; Parse params with tvars for unannotated
+         (let ((lst (if (listp params-raw) (copy-list params-raw) nil)))
+           (loop while lst do
+             (let* ((name (string (pop lst)))
+                    (type (if (and lst (keywordp (first lst)))
+                              (parse-type-annotation (pop lst))
+                              (make-tvar))))
+               (push type param-types)
+               (infer-env-bind name type))))
+         (setf param-types (nreverse param-types))
+         ;; Infer body type
+         (let ((body-type (make-int-type)))
+           (dolist (f body)
+             (setf body-type (infer-expr f)))
+           (let ((ret-type (or ret-ann body-type)))
+             ;; Restore env
+             (setf *infer-env* old-env)
+             (make-fn-type param-types ret-type)))))
+
+      ;; cons: result is Value
+      ((member (string head) '("cons" "car" "cdr" "list" "quote" "quasiquote")
+               :test #'string-equal)
+       (make-value-type))
+
+      ;; nil?: result is bool
+      ((sym= head "nil?")
+       (make-bool-type))
+
+      ;; sym, sym-eq?, gensym
+      ((sym= head "sym") (make-value-type))
+      ((sym= head "sym-eq?") (make-bool-type))
+      ((sym= head "gensym") (make-value-type))
+
+      ;; get: struct field access — need struct info
+      ((sym= head "get")
+       (make-tvar))  ; can't resolve without struct definition context
+
+      ;; set!: returns the assigned type
+      ((sym= head "set!")
+       (infer-expr (third form)))
+
+      ;; addr-of, deref, cast, sizeof
+      ((sym= head "addr-of")
+       (make-ptr-type (infer-expr (second form))))
+      ((sym= head "deref")
+       (let ((ptr-type (infer-expr (second form)))
+             (elem-tvar (make-tvar)))
+         (unify ptr-type (make-ptr-type elem-tvar))
+         elem-tvar))
+      ((sym= head "cast")
+       (parse-type-annotation (second form)))
+      ((sym= head "sizeof")
+       (make-int-type))
+
+      ;; vector-len, vector-set!, vector-push!, array-ref, array-set!, make-array
+      ((sym= head "vector-len") (make-int-type))
+      ((sym= head "vector-set!") (make-void-type))
+      ((sym= head "vector-push!") (make-void-type))
+      ((sym= head "array-ref") (make-tvar))
+      ((sym= head "array-set!") (make-void-type))
+      ((sym= head "make-array") (make-tvar))
+
+      ;; Function call: look up function type, unify args, return ret type
+      (t (let* ((fn-name (string head))
+                (fn-type (infer-env-lookup fn-name)))
+           (if (and fn-type (eq (sysp-type-kind fn-type) :fn))
+               ;; Known function: unify arguments
+               (let ((arg-types (fn-type-args fn-type))
+                     (ret-type (fn-type-ret fn-type)))
+                 (loop for arg in (cdr form)
+                       for expected in arg-types
+                       do (let ((actual (infer-expr arg)))
+                            (unify expected actual)))
+                 ret-type)
+               ;; Unknown function or constructor: infer args, return tvar
+               (progn
+                 (dolist (arg (cdr form))
+                   (infer-expr arg))
+                 (make-tvar))))))))
+
+;; Infer types for a function body's statements (let bindings add to env)
+(defun infer-stmt (form)
+  "Walk a statement form, updating *infer-env* with let bindings."
+  (when (listp form)
+    (let ((head (first form)))
+      (cond
+        ;; let / let-mut: bind variable with inferred or annotated type
+        ((or (sym= head "let") (sym= head "let-mut"))
+         (let* ((name (string (second form)))
+                (rest (cddr form))
+                (type-ann (when (keywordp (first rest))
+                            (prog1 (parse-type-annotation (first rest))
+                              (setf rest (cdr rest)))))
+                (init-form (first rest))
+                (init-type (when init-form (infer-expr init-form)))
+                (final-type (or type-ann init-type (make-tvar))))
+           (when (and type-ann init-type)
+             (unify type-ann init-type))
+           (infer-env-bind name final-type)))
+
+        ;; if/when/unless/while/for: recurse into sub-statements
+        ((sym= head "if")
+         (infer-expr (second form))
+         (dolist (f (cddr form))
+           (if (and (symbolp f) (string-equal (string f) "else"))
+               nil
+               (infer-stmt f))))
+        ((or (sym= head "when") (sym= head "unless"))
+         (infer-expr (second form))
+         (dolist (f (cddr form))
+           (infer-stmt f)))
+        ((sym= head "while")
+         (infer-expr (second form))
+         (dolist (f (cddr form))
+           (infer-stmt f)))
+        ((sym= head "for")
+         (dolist (f (cdddr form))
+           (infer-stmt f)))
+        ((sym= head "cond")
+         (dolist (clause (cdr form))
+           (when (listp clause)
+             (infer-expr (first clause))
+             (dolist (f (cdr clause))
+               (infer-stmt f)))))
+
+        ;; set!: unify target with value
+        ((sym= head "set!")
+         (let ((target-type (infer-env-lookup (string (second form))))
+               (val-type (infer-expr (third form))))
+           (when target-type
+             (unify target-type val-type))))
+
+        ;; return: infer the returned expression
+        ((sym= head "return")
+         (when (second form)
+           (infer-expr (second form))))
+
+        ;; print/println: just infer the expression
+        ((or (sym= head "print") (sym= head "println"))
+         (infer-expr (second form)))
+
+        ;; recur: infer arguments
+        ((sym= head "recur")
+         (dolist (arg (cdr form))
+           (infer-expr arg)))
+
+        ;; do block as statement
+        ((sym= head "do")
+         (dolist (f (cdr form))
+           (infer-stmt f)))
+
+        ;; Otherwise: treat as expression statement
+        (t (infer-expr form))))))
+
+;; Top-level inference for a function definition
+(defun infer-defn (form)
+  "Run type inference on a defn form. Updates *infer-env* with the function's type.
+   Returns the inferred function type (with resolved tvars)."
+  (let* ((name (string (second form)))
+         (params-raw (third form))
+         (rest-forms (cdddr form))
+         (ret-annotation (when (keywordp (first rest-forms))
+                           (prog1 (parse-type-annotation (first rest-forms))
+                             (setf rest-forms (cdr rest-forms)))))
+         (body-forms rest-forms)
+         (old-env *infer-env*)
+         (param-types nil))
+    ;; Parse params: annotated get concrete types, unannotated get tvars
+    (let ((lst (if (listp params-raw) (copy-list params-raw) nil)))
+      (loop while lst do
+        (let* ((pname (string (pop lst)))
+               (type (if (and lst (keywordp (first lst)))
+                         (parse-type-annotation (pop lst))
+                         (make-tvar))))
+          (push type param-types)
+          (infer-env-bind pname type))))
+    (setf param-types (nreverse param-types))
+    ;; Infer body
+    (let ((body-type (make-int-type)))
+      (dolist (f (butlast body-forms))
+        (infer-stmt f))
+      (when (car (last body-forms))
+        (setf body-type (infer-expr (car (last body-forms)))))
+      (let* ((ret-type (or ret-annotation body-type))
+             (resolved-params (mapcar #'resolve-or-default param-types))
+             (resolved-ret (resolve-or-default ret-type))
+             (fn-type (make-fn-type resolved-params resolved-ret)))
+        ;; Restore env but keep function binding
+        (setf *infer-env* old-env)
+        (infer-env-bind name fn-type)
+        fn-type))))
+
+;; Run inference on all top-level forms (pre-pass before compilation)
+(defun infer-toplevel (forms)
+  "Run type inference on all top-level forms. Populates *infer-env*."
+  (setf *infer-env* nil)
+  (reset-inference)
+  (dolist (form forms)
+    (when (listp form)
+      (cond
+        ((sym= (first form) "defn")
+         (infer-defn form))
+        ((sym= (first form) "struct")
+         ;; Register struct constructor as a function type
+         (let* ((name (string (second form)))
+                (fields-raw (third form))
+                (field-types nil))
+           (let ((lst (if (listp fields-raw) (copy-list fields-raw) nil)))
+             (loop while lst do
+               (pop lst)  ; field name
+               (when (and lst (keywordp (first lst)))
+                 (push (parse-type-annotation (pop lst)) field-types))))
+           (setf field-types (nreverse field-types))
+           (infer-env-bind name (make-fn-type field-types (make-struct-type name)))))
+        ((sym= (first form) "extern")
+         ;; Register extern function type
+         (let* ((name (string (second form)))
+                (params-raw (third form))
+                (rest (cdddr form))
+                (ret-type (if (keywordp (first rest))
+                              (parse-type-annotation (first rest))
+                              (make-void-type)))
+                (param-types nil))
+           (let ((lst (if (listp params-raw) (copy-list params-raw) nil)))
+             (loop while lst do
+               (pop lst)  ; param name
+               (when (and lst (keywordp (first lst)))
+                 (push (parse-type-annotation (pop lst)) param-types))))
+           (setf param-types (nreverse param-types))
+           (infer-env-bind name (make-fn-type param-types ret-type))))))))
+
 ;;; === Environment ===
 
 (defstruct env
@@ -1381,6 +1739,24 @@
         (push (list name type) params)))
     (nreverse params)))
 
+(defun parse-params-with-inference (param-list inferred-arg-types)
+  "Like parse-params but uses inferred types for unannotated parameters."
+  (let ((params nil)
+        (lst (if (listp param-list) (copy-list param-list) nil))
+        (inf-idx 0))
+    (loop while lst do
+      (let* ((name (string (pop lst)))
+             (type (if (and lst (keywordp (first lst)))
+                       (parse-type-annotation (pop lst))
+                       ;; Use inferred type if available, else default to int
+                       (if (and inferred-arg-types
+                                (< inf-idx (length inferred-arg-types)))
+                           (nth inf-idx inferred-arg-types)
+                           (make-int-type)))))
+        (incf inf-idx)
+        (push (list name type) params)))
+    (nreverse params)))
+
 (defun compile-struct (form)
   "(struct Name [field :type, ...])"
   (let* ((name (string (second form)))
@@ -1442,7 +1818,15 @@
   (let* ((name (string (second form)))
          (params-raw (third form))
          (rest-forms (cdddr form))
-         (params (parse-params params-raw))
+         ;; Look up inferred function type (from pre-pass)
+         (inferred-fn-type (infer-env-lookup name))
+         (inferred-arg-types (when (and inferred-fn-type
+                                        (eq (sysp-type-kind inferred-fn-type) :fn))
+                               (fn-type-args inferred-fn-type)))
+         (inferred-ret-type (when (and inferred-fn-type
+                                       (eq (sysp-type-kind inferred-fn-type) :fn))
+                              (fn-type-ret inferred-fn-type)))
+         (params (parse-params-with-inference params-raw inferred-arg-types))
          (ret-annotation (when (keywordp (first rest-forms))
                            (prog1 (parse-type-annotation (first rest-forms))
                              (setf rest-forms (cdr rest-forms)))))
@@ -1451,9 +1835,9 @@
          (raw-body (let ((rb (cdddr form)))
                      (if (keywordp (first rb)) (cdr rb) rb)))
          (env (make-env :parent *global-env*)))
-    ;; Register function in global env
+    ;; Register function in global env (use inferred ret type if no annotation)
     (let* ((arg-types (mapcar #'second params))
-           (ret-type (or ret-annotation (make-int-type)))
+           (ret-type (or ret-annotation inferred-ret-type (make-int-type)))
            (fn-type (make-fn-type arg-types ret-type)))
       (env-bind *global-env* name fn-type))
     ;; Register for compile-time macro use (skip main)
@@ -1470,7 +1854,7 @@
            (last-form (car (last body-forms)))
            (stmts (when all-but-last (compile-body all-but-last env)))
            (uses-recur (form-uses-recur-p body-forms))
-           (ret-type (or ret-annotation (make-int-type)))
+           (ret-type (or ret-annotation inferred-ret-type (make-int-type)))
            (param-str (format nil "~{~a~^, ~}"
                              (mapcar (lambda (p)
                                        (format nil "~a ~a"
@@ -1960,6 +2344,9 @@
 (defun compile-file-to-c (in-path out-path)
   (reset-state)
   (let ((forms (read-sysp-file in-path)))
+    ;; Phase 1: Type inference (constraint generation + solving)
+    (infer-toplevel forms)
+    ;; Phase 2: Compilation (uses inferred types from *infer-env*)
     (compile-toplevel forms)
     (emit-c out-path)
     (format t "Compiled ~a -> ~a~%" in-path out-path)))
