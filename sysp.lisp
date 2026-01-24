@@ -58,6 +58,129 @@
        (every #'type-equal-p
               (sysp-type-params a) (sysp-type-params b))))
 
+;;; === Type Inference (Hindley-Milner) ===
+
+;; Type variable counter
+(defvar *tvar-counter* 0)
+
+;; Create a fresh type variable
+(defun make-tvar ()
+  (let ((id (incf *tvar-counter*)))
+    (make-sysp-type :kind :tvar :name id :params nil)))
+;; params slot used as binding: nil = free, (type) = bound
+
+(defun tvar-id (tv) (sysp-type-name tv))
+(defun tvar-bound (tv) (car (sysp-type-params tv)))
+(defun tvar-bind! (tv type)
+  (setf (sysp-type-params tv) (list type)))
+
+(defun tvar-p (tp) (eq (sysp-type-kind tp) :tvar))
+
+;; Follow type variable chains to find the concrete type (or unbound tvar)
+(defun resolve-type (tp)
+  (if (and (tvar-p tp) (tvar-bound tp))
+      (let ((resolved (resolve-type (tvar-bound tp))))
+        ;; Path compression: point directly to final target
+        (tvar-bind! tp resolved)
+        resolved)
+      tp))
+
+;; Occurs check: does tvar `tv` appear anywhere in `tp`?
+(defun occurs-in-p (tv tp)
+  (let ((tp (resolve-type tp)))
+    (cond
+      ((tvar-p tp) (= (tvar-id tv) (tvar-id tp)))
+      ((sysp-type-params tp)
+       (some (lambda (p) (occurs-in-p tv p)) (sysp-type-params tp)))
+      (t nil))))
+
+;; Unify two types. Returns t on success, nil on failure.
+;; On failure, does NOT modify any bindings (unification is atomic per call).
+;; For gradual typing: caller can fall back to :value on failure.
+(defun unify (t1 t2)
+  (let ((t1 (resolve-type t1))
+        (t2 (resolve-type t2)))
+    (cond
+      ;; Same object or structurally equal
+      ((eq t1 t2) t)
+      ((type-equal-p t1 t2) t)
+
+      ;; Type variable on left: bind it
+      ((tvar-p t1)
+       (if (occurs-in-p t1 t2)
+           nil ; infinite type — fail
+           (progn (tvar-bind! t1 t2) t)))
+
+      ;; Type variable on right: bind it
+      ((tvar-p t2)
+       (if (occurs-in-p t2 t1)
+           nil
+           (progn (tvar-bind! t2 t1) t)))
+
+      ;; :value unifies with anything (it's the Any type)
+      ((eq (sysp-type-kind t1) :value) t)
+      ((eq (sysp-type-kind t2) :value) t)
+
+      ;; Same kind with params: unify pairwise
+      ((and (eq (sysp-type-kind t1) (sysp-type-kind t2))
+            (equal (sysp-type-name t1) (sysp-type-name t2))
+            (= (length (sysp-type-params t1))
+               (length (sysp-type-params t2))))
+       (every #'unify (sysp-type-params t1) (sysp-type-params t2)))
+
+      ;; Incompatible types
+      (t nil))))
+
+;; Generalize: replace free tvars (not in env) with fresh quantified vars
+;; Returns a type scheme: (:scheme (tvar-ids...) type)
+(defun free-tvars (tp &optional (seen nil))
+  "Collect all unbound type variable IDs in a type."
+  (let ((tp (resolve-type tp)))
+    (cond
+      ((tvar-p tp)
+       (if (member (tvar-id tp) seen) nil (list (tvar-id tp))))
+      ((sysp-type-params tp)
+       (reduce #'append
+               (mapcar (lambda (p) (free-tvars p seen))
+                       (sysp-type-params tp))
+               :initial-value nil))
+      (t nil))))
+
+(defun generalize (tp env-tvars)
+  "Generalize a type by quantifying tvars not in env-tvars."
+  (let ((free (remove-duplicates
+               (set-difference (free-tvars tp) env-tvars))))
+    (if free
+        (list :scheme free tp)
+        tp)))
+
+(defun instantiate (scheme)
+  "Instantiate a type scheme with fresh tvars."
+  (if (and (consp scheme) (eq (car scheme) :scheme))
+      (let* ((quantified (second scheme))
+             (body (third scheme))
+             (subst (mapcar (lambda (id) (cons id (make-tvar))) quantified)))
+        (apply-subst body subst))
+      scheme)) ; not a scheme, return as-is
+
+(defun apply-subst (tp subst)
+  "Replace tvar IDs in subst with their fresh tvars."
+  (let ((tp (resolve-type tp)))
+    (cond
+      ((tvar-p tp)
+       (let ((entry (assoc (tvar-id tp) subst)))
+         (if entry (cdr entry) tp)))
+      ((sysp-type-params tp)
+       (make-sysp-type :kind (sysp-type-kind tp)
+                       :name (sysp-type-name tp)
+                       :params (mapcar (lambda (p) (apply-subst p subst))
+                                       (sysp-type-params tp))))
+      (t tp))))
+
+;; Reset inference state (call before each compilation unit)
+(defun reset-inference ()
+  (setf *tvar-counter* 0))
+
 ;;; === Environment ===
 
 (defstruct env
