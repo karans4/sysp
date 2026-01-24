@@ -119,18 +119,15 @@
   (let-mut state :int PLAYING)
   (let-mut winner :int EMPTY)
 
-  (let white (Color 255 255 255 255))
-  (let dark-bg (Color 30 30 30 255))
-  (let red (Color 230 70 70 255))
-  (let blue (Color 70 130 230 255))
-  (let gray (Color 100 100 100 200))
+  (let white (Color 245 245 245 255))       ; RAYWHITE
+  (let dark-bg (Color 0 0 0 255))           ; BLACK
+  (let red (Color 230 41 55 255))           ; RED
+  (let blue (Color 0 121 241 255))          ; BLUE
+  (let gray (Color 130 130 130 200))        ; GRAY (with alpha for overlay)
 
   (while (not (WindowShouldClose))
-    (BeginDrawing)
-    (ClearBackground dark-bg)
-
-    ;; Handle input
-    (when (== state PLAYING)
+    ;; Handle input (before drawing, one branch per frame)
+    (if (== state PLAYING)
       (when (IsMouseButtonPressed LEFT_CLICK)
         (let mouse (GetMousePosition))
         (let col (cast :int (/ (get mouse x) (cast :f32 CELL_SIZE))))
@@ -139,7 +136,6 @@
           (let idx (+ (* row 3) col))
           (when (== (array-ref board idx) EMPTY)
             (array-set! board idx (if (== turn PLAYER_X) X_PIECE O_PIECE))
-            ;; Check for winner
             (set! winner (check-winner board))
             (if (!= winner EMPTY)
               (set! state WON)
@@ -147,12 +143,21 @@
               (if (board-full board)
                 (set! state DRAW)
               else
-                (set! turn (if (== turn PLAYER_X) PLAYER_O PLAYER_X))))))))
+                (set! turn (if (== turn PLAYER_X) PLAYER_O PLAYER_X)))))))
+    else
+      ;; Game over: reset on click
+      (when (IsMouseButtonPressed LEFT_CLICK)
+        (for [i 0 9]
+          (array-set! board i EMPTY))
+        (set! turn PLAYER_X)
+        (set! state PLAYING)
+        (set! winner EMPTY)))
 
-    ;; Draw grid
+    ;; Draw
+    (BeginDrawing)
+    (ClearBackground dark-bg)
     (draw-grid white)
 
-    ;; Draw pieces
     (for [i 0 9]
       (let col (mod i 3))
       (let row (/ i 3))
@@ -160,14 +165,12 @@
         [(== (array-ref board i) X_PIECE) (draw-x col row red)]
         [(== (array-ref board i) O_PIECE) (draw-o col row blue)]))
 
-    ;; Draw turn indicator
     (when (== state PLAYING)
       (if (== turn PLAYER_X)
         (DrawText "X's turn" 10 570 20 red)
       else
         (DrawText "O's turn" 10 570 20 blue)))
 
-    ;; Draw end screen overlay
     (when (!= state PLAYING)
       (DrawRectangle 0 0 WINDOW_SIZE WINDOW_SIZE gray)
       (cond
@@ -177,14 +180,7 @@
          (DrawText "O Wins!" 180 250 60 blue)]
         [else
          (DrawText "Draw!" 210 250 60 white)])
-      (DrawText "Click to play again" 150 350 30 white)
-      ;; Reset on click
-      (when (IsMouseButtonPressed LEFT_CLICK)
-        (for [i 0 9]
-          (array-set! board i EMPTY))
-        (set! turn PLAYER_X)
-        (set! state PLAYING)
-        (set! winner EMPTY)))
+      (DrawText "Click to play again" 150 350 30 white))
 
     (EndDrawing))
 
