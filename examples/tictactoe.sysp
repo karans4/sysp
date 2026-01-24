@@ -17,8 +17,10 @@
 (const CELL_SIZE :int 200)
 (const LINE_THICK :int 4)
 (const LEFT_CLICK :int 0)
+(const FLAG_MSAA :int 32)
 
 ;; Raylib externs
+(extern SetConfigFlags [flags :int] :void)
 (extern InitWindow [width :int, height :int, title :str] :void)
 (extern CloseWindow [] :void)
 (extern WindowShouldClose [] :int)
@@ -111,6 +113,7 @@
 
 ;; Main
 (defn main [] :int
+  (SetConfigFlags FLAG_MSAA)
   (InitWindow WINDOW_SIZE WINDOW_SIZE "sysp — Tic Tac Toe")
   (SetTargetFPS 60)
 
