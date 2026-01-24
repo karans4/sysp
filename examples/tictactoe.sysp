@@ -13,11 +13,11 @@
 (enum GameState [PLAYING 0] [WON 1] [DRAW 2])
 
 ;; Constants
-(const WINDOW_SIZE :int 600)
-(const CELL_SIZE :int 200)
-(const LINE_THICK :int 4)
-(const LEFT_CLICK :int 0)
-(const FLAG_MSAA :int 32)
+(let WINDOW_SIZE :int 600)
+(let CELL_SIZE :int 200)
+(let LINE_THICK :int 4)
+(let LEFT_CLICK :int 0)
+(let FLAG_MSAA :int 32)
 
 ;; Raylib externs
 (extern SetConfigFlags [flags :int] :void)

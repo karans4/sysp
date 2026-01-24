@@ -544,7 +544,8 @@
 (defstruct env
   (bindings nil)  ; alist of (name . type)
   (parent nil)
-  (releases nil)) ; list of C variable names needing val_release at scope exit
+  (releases nil)  ; list of C variable names needing val_release at scope exit
+  (mutables nil)) ; list of mutable variable names (from let-mut)
 
 (defun env-lookup (env name)
   (if (null env) nil
@@ -563,6 +564,16 @@
 (defun env-add-release (env c-name)
   "Record a variable name for release at scope exit"
   (push c-name (env-releases env)))
+
+(defun env-mark-mutable (env name)
+  "Mark a variable as mutable (from let-mut)"
+  (push name (env-mutables env)))
+
+(defun env-mutable-p (env name)
+  "Check if a variable is mutable (walks parent chain)"
+  (if (null env) nil
+      (or (member name (env-mutables env) :test #'equal)
+          (env-mutable-p (env-parent env) name))))
 
 (defun emit-releases (env)
   "Generate release statements for all Value locals in this scope"
@@ -1254,6 +1265,8 @@
                      val-type)))))
       ;; simple variable
       (t (let ((name (string target)))
+           (when (and (env-lookup env name) (not (env-mutable-p env name)))
+             (error "Cannot set! immutable variable '~a' (use let-mut for mutable bindings)" name))
            (multiple-value-bind (val-code val-type) (compile-expr (third form) env)
              (values (format nil "(~a = ~a)" (sanitize-name name) val-code)
                      val-type)))))))
@@ -1529,8 +1542,10 @@
          (list (format nil "  ~a;" code))))))
 
 (defun compile-let-stmt (form env)
-  "(let name expr) or (let name :type expr) or (let name (make-array :type size))"
-  (let* ((name (string (second form)))
+  "(let name expr) or (let name :type expr) or (let name (make-array :type size))
+   (let-mut name expr) for mutable bindings"
+  (let* ((is-mut (sym= (first form) "let-mut"))
+         (name (string (second form)))
          (rest (cddr form))
          (type-ann (when (keywordp (first rest))
                      (prog1 (parse-type-annotation (first rest))
@@ -1547,6 +1562,7 @@
                                (not (sym= init-form "nil"))
                                (env-lookup env (string init-form)))))
         (env-bind env name final-type)
+        (when is-mut (env-mark-mutable env name))
         ;; Track Value-typed locals for release at scope exit
         (when (and *uses-value-type* (value-type-p final-type))
           (env-add-release env c-name))
@@ -1951,8 +1967,8 @@
                   name)
           *struct-defs*)))
 
-(defun compile-const (form)
-  "(const name :type expr) — top-level constant"
+(defun compile-toplevel-let (form mutable)
+  "(let name :type expr) or (let-mut name :type expr) at top level"
   (let* ((name (string (second form)))
          (rest (cddr form))
          (type-ann (when (keywordp (first rest))
@@ -1962,7 +1978,9 @@
     (multiple-value-bind (init-code init-type) (compile-expr init-form (make-env))
       (let ((final-type (or type-ann init-type)))
         (env-bind *global-env* name final-type)
-        (push (format nil "static const ~a ~a = ~a;~%"
+        (when mutable (env-mark-mutable *global-env* name))
+        (push (format nil "static ~a~a ~a = ~a;~%"
+                      (if mutable "" "const ")
                       (type-to-c final-type) (sanitize-name name) init-code)
               *struct-defs*)))))  ; reuse struct-defs for ordering (before functions)
 
@@ -2241,7 +2259,9 @@
                ((sym= (first expanded) "defn") (compile-defn expanded))
                ((sym= (first expanded) "extern") (compile-extern expanded))
                ((sym= (first expanded) "include") (compile-include expanded))
-               ((sym= (first expanded) "const") (compile-const expanded))
+               ((sym= (first expanded) "let") (compile-toplevel-let expanded nil))
+               ((sym= (first expanded) "let-mut") (compile-toplevel-let expanded t))
+               ((sym= (first expanded) "const") (compile-toplevel-let expanded nil)) ; legacy alias
                (t (warn "Unknown top-level form: ~a" (first expanded)))))))))))
 
 (defun emit-value-preamble (out)
