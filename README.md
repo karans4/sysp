@@ -8,19 +8,19 @@ sysp draws inspiration from [Carp](https://github.com/carp-lang/Carp), Zig, and 
 
 ## Why
 
-Most Lisps are interpreted or compile to bytecode. sysp compiles directly to C — you get Lisp's macro system and expressiveness with C's performance and zero-runtime-cost abstractions. The type system infers precise types where possible and falls back to a boxed `Value` type (tagged union) where it can't, giving you gradual typing without annotations everywhere.
+Most Lisps are interpreted or compile to bytecode. sysp compiles directly to C - you get Lisp's macro system and expressiveness with C's performance and zero-runtime-cost abstractions. The type system infers precise types where possible and falls back to a boxed `Value` type (tagged union) where it can't, giving you gradual typing without annotations everywhere.
 
 ## Features
 
 - **S-expression syntax** with `[]` array literals
-- **Compile-time macros** — `defmacro` over s-expressions, quasiquote with `~` and `~@`
-- **Compile-time evaluation** — `defn-ct` for real homoiconic metaprogramming with `gensym`
-- **Tail-call optimization** — `recur` compiles to `goto`
+- **Compile-time macros** - `defmacro` over s-expressions, quasiquote with `~` and `~@`
+- **Compile-time evaluation** - `defn-ct` for real homoiconic metaprogramming with `gensym`
+- **Tail-call optimization** - `recur` compiles to `goto`
 - **Cons cells** with automatic refcounting (`val_retain`/`val_release`)
 - **Symbols** as interned integers with compile-time symbol table
 - **Structs, enums, tuples, vectors** with generated C type definitions
-- **Foreign function interface** — `extern` declarations, pointer types, casts
-- **Type inference** — Hindley-Milner unification engine (WIP: constraint generation, monomorphization)
+- **Foreign function interface** - `extern` declarations, pointer types, casts
+- **Type inference** - Hindley-Milner unification engine (WIP: constraint generation, monomorphization)
 
 ## Example
 
@@ -70,11 +70,11 @@ cc tictactoe.c -lraylib -lm -o tictactoe
 
 The compiler is a single Common Lisp file (`sysp.lisp`, ~1900 lines):
 
-1. **Read** — custom readtable for `[]` arrays and backquote syntax
-2. **Macro-expand** — recursive expansion of `defmacro` + built-in macros (`->`, `->>`, `when-let`, `dotimes`, etc.)
-3. **Infer** *(WIP)* — Hindley-Milner type inference with unification, generalize/instantiate for let-polymorphism
-4. **Compile** — AST → C code generation with type tracking
-5. **Emit** — headers, type declarations, forward decls, function bodies
+1. **Read** - custom readtable for `[]` arrays and backquote syntax
+2. **Macro-expand** - recursive expansion of `defmacro` + built-in macros (`->`, `->>`, `when-let`, `dotimes`, etc.)
+3. **Infer** *(WIP)* - Hindley-Milner type inference with unification, generalize/instantiate for let-polymorphism
+4. **Compile** - AST → C code generation with type tracking
+5. **Emit** - headers, type declarations, forward decls, function bodies
 
 ## Type System (in progress)
 
@@ -83,7 +83,7 @@ The goal is gradual typing with aggressive monomorphization:
 - Unresolved types box into `Value` (tagged union: int, float, string, symbol, cons)
 - Resolved types generate specialized C: `Vector_int`, `Fn_int_int`, `Cons_int_symbol`
 - The inference engine supports type variables, structural unification, occurs check, and let-polymorphism
-- `Value` acts as the "any" type — unifies with everything, zero annotation burden
+- `Value` acts as the "any" type - unifies with everything, zero annotation burden
 
 ## Roadmap
 
