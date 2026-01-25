@@ -2,6 +2,10 @@
 
 A systems Lisp that compiles to C. Homoiconic macros, manual memory management with refcounted cons cells, and Hindley-Milner type inference (in progress) with monomorphization to specialized C types.
 
+## Prior Art
+
+sysp draws inspiration from [Carp](https://github.com/carp-lang/Carp), Zig, and other systems Lisps.
+
 ## Why
 
 Most Lisps are interpreted or compile to bytecode. sysp compiles directly to C — you get Lisp's macro system and expressiveness with C's performance and zero-runtime-cost abstractions. The type system infers precise types where possible and falls back to a boxed `Value` type (tagged union) where it can't, giving you gradual typing without annotations everywhere.
@@ -92,6 +96,8 @@ The goal is gradual typing with aggressive monomorphization:
 - [ ] Pattern matching / destructuring
 - [ ] Tagged unions (sum types)
 - [ ] Borrow checker (linear types)
+- [ ] CUDA backend (GPU kernels from Lisp)
+- [ ] HPC primitives (SIMD, parallel loops)
 - [ ] Self-hosting
 
 ## License
