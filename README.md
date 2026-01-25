@@ -1,6 +1,6 @@
 # sysp
 
-A systems Lisp that compiles to C. Homoiconic macros, manual memory management with refcounted cons cells, and Hindley-Milner type inference (in progress) with monomorphization to specialized C types.
+A systems Lisp that compiles to readable C. Designed for numerical computing and GPU work, where you want to generate specialized kernels at compile time using homoiconic macros. Manual memory management, Hindley-Milner type inference with monomorphization, and direct C generation with no runtime.
 
 ## Prior Art
 
@@ -8,7 +8,7 @@ sysp draws inspiration from [Carp](https://github.com/carp-lang/Carp), Zig, and 
 
 ## Why
 
-Most Lisps are interpreted or compile to bytecode. sysp compiles directly to C - you get Lisp's macro system and expressiveness with C's performance and zero-runtime-cost abstractions. The type system infers precise types where possible and falls back to a boxed `Value` type (tagged union) where it can't, giving you gradual typing without annotations everywhere.
+Most numerical computing is either written in C/CUDA (fast but verbose) or Python/JAX (expressive but slow). sysp targets the middle: write Lisp macros that generate specialized C or CUDA code at compile time. You get homoiconic code generation for kernel specialization, gradual typing without annotation burden, and readable generated code you can inspect and debug. The type system infers precise types where possible and falls back to a boxed `Value` type (tagged union) where it can't.
 
 ## Features
 
