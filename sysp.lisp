@@ -313,7 +313,9 @@
            (loop while lst do
              (let* ((name (string (pop lst)))
                     (type (if (and lst (keywordp (first lst)))
-                              (parse-type-annotation (pop lst))
+                              (let ((result (parse-type-from-list lst)))
+                                (setf lst (cdr result))
+                                (car result))
                               (make-tvar))))
                (push type param-types)
                (infer-env-bind name type))))
@@ -480,7 +482,9 @@
       (loop while lst do
         (let* ((pname (string (pop lst)))
                (type (if (and lst (keywordp (first lst)))
-                         (parse-type-annotation (pop lst))
+                         (let ((result (parse-type-from-list lst)))
+                           (setf lst (cdr result))
+                           (car result))
                          (make-tvar))))
           (push type param-types)
           (infer-env-bind pname type))))
@@ -519,7 +523,9 @@
              (loop while lst do
                (pop lst)  ; field name
                (when (and lst (keywordp (first lst)))
-                 (push (parse-type-annotation (pop lst)) field-types))))
+                 (let ((result (parse-type-from-list lst)))
+                   (push (car result) field-types)
+                   (setf lst (cdr result))))))
            (setf field-types (nreverse field-types))
            (infer-env-bind name (make-fn-type field-types (make-struct-type name)))))
         ((sym= (first form) "extern")
@@ -535,7 +541,9 @@
              (loop while lst do
                (pop lst)  ; param name
                (when (and lst (keywordp (first lst)))
-                 (push (parse-type-annotation (pop lst)) param-types))))
+                 (let ((result (parse-type-from-list lst)))
+                   (push (car result) param-types)
+                   (setf lst (cdr result))))))
            (setf param-types (nreverse param-types))
            (infer-env-bind name (make-fn-type param-types ret-type))))))))
 
@@ -591,6 +599,8 @@
 (defvar *generated-types* (make-hash-table :test 'equal))
 (defvar *type-decls* nil)
 (defvar *forward-decls* nil)
+(defvar *top-level-vars* nil)  ; top-level let/const
+(defvar *lambda-forward-decls* nil)  ; forward declarations for lambdas
 (defvar *global-env* (make-env))
 (defvar *string-literals* nil)  ; collected string constants
 (defvar *includes* nil)         ; extra #includes
@@ -1228,6 +1238,10 @@
                                                    (sanitize-name (first p))))
                                          params)))
                (body-stmts (when all-but-last (compile-body all-but-last fn-env))))
+          (push (format nil "static ~a ~a(~a);"
+                        (type-to-c ret-type) lambda-name
+                        (if params param-str "void"))
+                *lambda-forward-decls*)
           (push (format nil "static ~a ~a(~a) {~%~{~a~%~}  return ~a;~%}~%"
                         (type-to-c ret-type) lambda-name
                         (if params param-str "void")
@@ -1744,14 +1758,32 @@
 
 ;;; === Top-Level Form Compilation ===
 
+(defun parse-type-from-list (lst)
+  "Parse a type annotation from LST, consuming tokens. Returns (type . remaining-lst).
+   Handles multi-token types like :fn (:int :int) :int."
+  (let ((sym (pop lst)))
+    (if (and (keywordp sym)
+             (string-equal (symbol-name sym) "fn")
+             lst
+             (listp (first lst)))
+        ;; Function type: :fn (arg-types...) :ret-type
+        (let* ((arg-syms (pop lst))
+               (ret-sym (pop lst))
+               (arg-types (mapcar #'parse-type-annotation arg-syms))
+               (ret-type (parse-type-annotation ret-sym)))
+          (cons (make-fn-type arg-types ret-type) lst))
+        (cons (parse-type-annotation sym) lst))))
+
 (defun parse-params (param-list)
   (let ((params nil)
         (lst (if (listp param-list) param-list nil)))
     (loop while lst do
-      (let ((name (string (pop lst)))
-            (type (if (and lst (keywordp (first lst)))
-                      (parse-type-annotation (pop lst))
-                      (make-int-type))))
+      (let* ((name (string (pop lst)))
+             (type (if (and lst (keywordp (first lst)))
+                       (let ((result (parse-type-from-list lst)))
+                         (setf lst (cdr result))
+                         (car result))
+                       (make-int-type))))
         (push (list name type) params)))
     (nreverse params)))
 
@@ -1763,7 +1795,9 @@
     (loop while lst do
       (let* ((name (string (pop lst)))
              (type (if (and lst (keywordp (first lst)))
-                       (parse-type-annotation (pop lst))
+                       (let ((result (parse-type-from-list lst)))
+                         (setf lst (cdr result))
+                         (car result))
                        ;; Use inferred type if available, else default to int
                        (if (and inferred-arg-types
                                 (< inf-idx (length inferred-arg-types)))
@@ -1982,7 +2016,7 @@
         (push (format nil "static ~a~a ~a = ~a;~%"
                       (if mutable "" "const ")
                       (type-to-c final-type) (sanitize-name name) init-code)
-              *struct-defs*)))))  ; reuse struct-defs for ordering (before functions)
+              *top-level-vars*)))))  ; emitted after functions for lambda ordering
 
 ;;; === Compile-Time Interpreter ===
 ;;; Evaluates sysp code at compile time for macro expansion.
@@ -2336,6 +2370,14 @@
     (dolist (fwd (nreverse *forward-decls*))
       (format out "~a~%" fwd))
     (when *forward-decls* (terpri out))
+    ;; lambda forward declarations
+    (dolist (fwd (nreverse *lambda-forward-decls*))
+      (format out "~a~%" fwd))
+    (when *lambda-forward-decls* (terpri out))
+    ;; top-level variable declarations (after lambda forward decls, before functions)
+    (dolist (v (nreverse *top-level-vars*))
+      (write-string v out)
+      (terpri out))
     ;; functions
     (dolist (f (nreverse *functions*))
       (write-string f out)
@@ -2351,6 +2393,8 @@
   (setf *generated-types* (make-hash-table :test 'equal))
   (setf *type-decls* nil)
   (setf *forward-decls* nil)
+  (setf *top-level-vars* nil)
+  (setf *lambda-forward-decls* nil)
   (setf *global-env* (make-env))
   (setf *includes* nil)
   (setf *string-literals* nil)
