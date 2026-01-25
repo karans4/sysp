@@ -126,7 +126,7 @@
   (let dark-bg (Color 0 0 0 255))           ; BLACK
   (let red (Color 230 41 55 255))           ; RED
   (let blue (Color 0 121 241 255))          ; BLUE
-  (let gray (Color 130 130 130 200))        ; GRAY (with alpha for overlay)
+  (let overlay (Color 0 0 0 200))            ; BLACK (with alpha for fade)
 
   (while (not (WindowShouldClose))
     ;; Handle input (before drawing, one branch per frame)
@@ -175,7 +175,7 @@
         (DrawText "O's turn" 10 570 20 blue)))
 
     (when (!= state PLAYING)
-      (DrawRectangle 0 0 WINDOW_SIZE WINDOW_SIZE gray)
+      (DrawRectangle 0 0 WINDOW_SIZE WINDOW_SIZE overlay)
       (cond
         [(== winner X_PIECE)
          (DrawText "X Wins!" 180 250 60 red)]
