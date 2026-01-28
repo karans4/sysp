@@ -63,6 +63,12 @@
 ;; Type variable counter
 (defvar *tvar-counter* 0)
 
+;; Temp variable counter for statement lifting
+(defvar *tmp-counter* 0)
+
+;; Pending statements to emit before current expression
+(defvar *pending-stmts* nil)
+
 ;; Create a fresh type variable
 (defun make-tvar ()
   (let ((id (incf *tvar-counter*)))
@@ -231,6 +237,9 @@
 (defun infer-list (form)
   "Infer the type of a list expression."
   (let ((head (first form)))
+    ;; Handle non-symbol heads (e.g., numbers in quoted lists)
+    (unless (symbolp head)
+      (return-from infer-list (make-tvar)))
     (cond
       ;; Arithmetic: operands must unify, result = operand type
       ((member (string head) '("+" "-" "*" "/" "%" "mod") :test #'string-equal)
@@ -883,10 +892,87 @@
                     (type-to-c ret-type) name arg-str)
             *type-decls*))))
 
+(defun ensure-vector-helper (name c-elem c-vec)
+  "Emit a helper function for creating vectors of a specific type"
+  (unless (gethash name *generated-types*)
+    (setf (gethash name *generated-types*) t)
+    (pushnew "stdarg.h" *includes* :test #'string=)
+    ;; Emit: Vector_T sysp_mkvec_T(int n, ...) { ... }
+    (push (format nil "static ~a ~a(int n, ...) { va_list ap; va_start(ap, n); ~a* d = malloc(sizeof(~a) * n); for(int i = 0; i < n; i++) d[i] = va_arg(ap, ~a); va_end(ap); return (~a){d, n, n}; }~%"
+                  c-vec name c-elem c-elem
+                  ;; For small types, va_arg promotes to int
+                  (if (member c-elem '("char" "unsigned char" "short" "float") :test #'string=)
+                      (if (string= c-elem "float") "double" "int")
+                      c-elem)
+                  c-vec)
+          *functions*)))
+
+(defun ensure-vector-push-helper (name c-vec c-elem)
+  "Emit a helper function for pushing to vectors of a specific type"
+  (unless (gethash name *generated-types*)
+    (setf (gethash name *generated-types*) t)
+    (pushnew "string.h" *includes* :test #'string=)
+    ;; Emit: void sysp_vecpush_T(Vector_T* v, T val) { ... }
+    (push (format nil "static void ~a(~a* v, ~a val) { if(v->len >= v->cap) { v->cap = v->cap ? v->cap * 2 : 4; v->data = realloc(v->data, sizeof(~a) * v->cap); } v->data[v->len++] = val; }~%"
+                  name c-vec c-elem c-elem)
+          *functions*)))
+
+;;; === Statement Lifting (expressions that are really statements) ===
+
+;; Generate a fresh temp variable name
+(defun fresh-tmp ()
+  (format nil "_tmp~d" (incf *tmp-counter*)))
+
+;; Detect if a form is a statement-like construct (do, if with side effects, cond)
+(defun statement-like-p (form)
+  (and (listp form)
+       (not (null form))
+       (symbolp (first form))
+       (let ((head (string (first form))))
+         (member head '("do" "if" "cond" "let" "let-mut") :test #'string-equal))))
+
+;; Compile form so its value ends up assigned to target-var.
+;; Returns (values type statements-list).
+;; Recursively handles nested statement-like forms.
+(defun compile-expr-returning (form env target)
+  (if (statement-like-p form)
+      (compile-stmt-returning form env target)
+      ;; Simple expression: isolate pending stmts, compile, assign to target
+      (let ((*pending-stmts* nil))
+        (multiple-value-bind (code type) (compile-expr form env)
+          (values type
+                  (append *pending-stmts*
+                          (list (format nil "  ~a = ~a;" target code))))))))
+
+;; Compile a statement-like form so its value is assigned to target.
+;; Returns (values type statements-list).
+(defun compile-stmt-returning (form env target)
+  (let ((head (string (first form))))
+    (cond
+      ((string-equal head "if") (compile-if-stmt-returning form env target))
+      ((string-equal head "do") (compile-do-stmt-returning form env target))
+      ((string-equal head "cond") (compile-cond-stmt-returning form env target))
+      ((or (string-equal head "let") (string-equal head "let-mut"))
+       (compile-let-stmt-returning form env target)))))
+
 ;;; === Expression Compilation ===
 
 (defun compile-expr (form env)
-  "Compile an expression, return (values c-string type)"
+  "Compile an expression, return (values c-string type).
+   Statement-like forms (if, do, cond) are lifted to temp variables
+   with their statements pushed onto *pending-stmts*."
+  (if (statement-like-p form)
+      ;; Lift statement-like form: compile as statement assigning to temp
+      (let ((tmp (fresh-tmp)))
+        (multiple-value-bind (type stmts) (compile-stmt-returning form env tmp)
+          (setf *pending-stmts* (append *pending-stmts*
+                                        (list (format nil "  ~a ~a;" (type-to-c type) tmp))
+                                        stmts))
+          (values tmp type)))
+      (compile-expr-inner form env)))
+
+(defun compile-expr-inner (form env)
+  "Compile a non-statement-like expression"
   (cond
     ((null form) (values "0" (make-int-type)))
     ((integerp form) (values (format nil "~d" form) (make-int-type)))
@@ -1091,6 +1177,95 @@
                   (values (format nil "(~a ? ~a : ~a)" test-code then-code rest-code)
                           then-type))))))))
 
+(defun compile-if-stmt-returning (form env target)
+  "(if cond then [else] else) -> if statement assigning to target"
+  (multiple-value-bind (cond-code ct) (compile-expr (second form) env)
+    (declare (ignore ct))
+    (let* ((else-form (if (and (fourth form) (symbolp (fourth form))
+                               (sym= (fourth form) "else"))
+                          (fifth form)
+                          (fourth form))))
+      (multiple-value-bind (then-type then-stmts)
+          (compile-expr-returning (third form) env target)
+        (multiple-value-bind (et else-stmts)
+            (if else-form
+                (compile-expr-returning else-form env target)
+                (values then-type (list (format nil "  ~a = 0;" target))))
+          (declare (ignore et))
+          (let ((result (list (format nil "  if (~a) {" cond-code))))
+            (dolist (s then-stmts) (setf result (append result (list (format nil "  ~a" s)))))
+            (setf result (append result (list "  } else {")))
+            (dolist (s else-stmts) (setf result (append result (list (format nil "  ~a" s)))))
+            (setf result (append result (list "  }")))
+            (values then-type result)))))))
+
+(defun compile-do-stmt-returning (form env target)
+  "(do stmt... expr) -> statements, last expr assigned to target"
+  (let* ((exprs (rest form))
+         (new-env (make-env :parent env)))
+    (if (= (length exprs) 1)
+        (compile-expr-returning (first exprs) new-env target)
+        (let* ((body-stmts (compile-body (butlast exprs) new-env))
+               (last-form (car (last exprs))))
+          (multiple-value-bind (type last-stmts)
+              (compile-expr-returning last-form new-env target)
+            (values type (append body-stmts last-stmts)))))))
+
+(defun compile-cond-stmt-returning (form env target)
+  "(cond [t1 e1] [t2 e2] [else e3]) -> if-else chain assigning to target"
+  (let ((clauses (rest form))
+        (result nil)
+        (first-clause t)
+        (result-type (make-int-type)))
+    (dolist (clause clauses)
+      (let ((test (first clause))
+            (body (second clause)))
+        (cond
+          ((and (symbolp test) (sym= test "else"))
+           (setf result (append result (list "  } else {")))
+           (multiple-value-bind (type stmts) (compile-expr-returning body env target)
+             (setf result-type type)
+             (dolist (s stmts) (setf result (append result (list (format nil "  ~a" s)))))))
+          (first-clause
+           (multiple-value-bind (test-code tt) (compile-expr test env)
+             (declare (ignore tt))
+             (setf result (append result (list (format nil "  if (~a) {" test-code))))
+             (multiple-value-bind (type stmts) (compile-expr-returning body env target)
+               (setf result-type type)
+               (dolist (s stmts) (setf result (append result (list (format nil "  ~a" s))))))
+             (setf first-clause nil)))
+          (t
+           (multiple-value-bind (test-code tt) (compile-expr test env)
+             (declare (ignore tt))
+             (setf result (append result (list (format nil "  } else if (~a) {" test-code))))
+             (multiple-value-bind (type stmts) (compile-expr-returning body env target)
+               (setf result-type type)
+               (dolist (s stmts) (setf result (append result (list (format nil "  ~a" s)))))))))))
+    (setf result (append result (list "  }")))
+    (values result-type result)))
+
+(defun compile-let-stmt-returning (form env target)
+  "(let name [type] init body...) -> let decl + body, last expr assigned to target"
+  ;; Reuse compile-let-stmt for the binding, then compile-expr-returning for the body
+  (let* ((let-stmts (compile-let-stmt form env))
+         ;; Body forms: everything after (let name [type] init)
+         (rest (cddr form))
+         (rest (if (keywordp (first rest)) (cdr rest) rest))  ; skip type annotation
+         (body-forms (cdr rest)))  ; skip init form
+    (if (null body-forms)
+        ;; No body: let itself is the value (just return the bound var)
+        (let ((var-name (sanitize-name (string (second form)))))
+          (values (env-lookup env (string (second form)))
+                  (append let-stmts
+                          (list (format nil "  ~a = ~a;" target var-name)))))
+        ;; Has body: compile body, last form returns to target
+        (let* ((init-stmts (butlast body-forms))
+               (last-form (car (last body-forms)))
+               (body-stmts (when init-stmts (compile-body init-stmts env))))
+          (multiple-value-bind (type last-stmts)
+              (compile-expr-returning last-form env target)
+            (values type (append let-stmts (or body-stmts nil) last-stmts)))))))
+
 (defun compile-get (form env)
   "(get struct field)"
   (multiple-value-bind (obj tp) (compile-expr (second form) env)
@@ -1104,20 +1279,23 @@
               (or field-type (make-int-type))))))
 
 (defun compile-vector (form env)
-  "(vector elem ...)"
+  "(vector elem ...) - C99 compound literal with malloc helper"
   (let* ((elems (rest form))
          (compiled (mapcar (lambda (e) (multiple-value-list (compile-expr e env))) elems))
-         (elem-type (second (first compiled)))
+         (elem-type (if compiled (second (first compiled)) (make-int-type)))
          (vec-type (make-vector-type elem-type))
          (c-name (type-to-c vec-type))
+         (c-elem (type-to-c elem-type))
          (n (length elems)))
-    (values (format nil "({ ~a* _tmp = malloc(sizeof(~a) * ~d); ~{_tmp[~d] = ~a; ~}~a _v = {_tmp, ~d, ~d}; _v; })"
-                    (type-to-c elem-type) (type-to-c elem-type) n
-                    (loop for i from 0
-                          for c in compiled
-                          append (list i (first c)))
-                    c-name n n)
-            vec-type)))
+    (if (= n 0)
+        ;; Empty vector: just zero-initialize
+        (values (format nil "(~a){NULL, 0, 0}" c-name) vec-type)
+        ;; Non-empty: use helper function call that returns initialized Vector
+        ;; Generate: sysp_mkvec_T(n, e0, e1, e2, ...)
+        (let ((helper-name (format nil "sysp_mkvec_~a" (mangle-type-name elem-type))))
+          (ensure-vector-helper helper-name c-elem c-name)
+          (values (format nil "~a(~d~{, ~a~})" helper-name n (mapcar #'first compiled))
+                  vec-type)))))
 
 (defun compile-vector-ref (form env)
   "(vector-ref vec idx)"
@@ -1142,17 +1320,18 @@
           (values (format nil "(~a.data[~a] = ~a)" vec idx val) elem-type))))))
 
 (defun compile-vector-push (form env)
-  "(vector-push! vec val) — push to dynamic vector"
+  "(vector-push! vec val) — push to dynamic vector (C99 compliant)"
   (multiple-value-bind (vec vt) (compile-expr (second form) env)
     (multiple-value-bind (val val-type) (compile-expr (third form) env)
       (declare (ignore val-type))
-      (let ((elem-type (if (eq (sysp-type-kind vt) :vector)
-                           (first (sysp-type-params vt))
-                           (make-int-type))))
-        (pushnew "string.h" *includes* :test #'string=)
-        (values (format nil "({ if (~a.len >= ~a.cap) { ~a.cap = ~a.cap ? ~a.cap * 2 : 4; ~a.data = realloc(~a.data, sizeof(~a) * ~a.cap); } ~a.data[~a.len++] = ~a; })"
-                        vec vec vec vec vec vec vec
-                        (type-to-c elem-type) vec vec vec val)
+      (let* ((elem-type (if (eq (sysp-type-kind vt) :vector)
+                            (first (sysp-type-params vt))
+                            (make-int-type)))
+             (c-vec (type-to-c vt))
+             (c-elem (type-to-c elem-type))
+             (helper-name (format nil "sysp_vecpush_~a" (mangle-type-name elem-type))))
+        (ensure-vector-push-helper helper-name c-vec c-elem)
+        (values (format nil "~a(&~a, ~a)" helper-name vec val)
                 (make-void-type))))))
 
 (defun compile-vector-len (form env)
@@ -1227,28 +1406,31 @@
     ;; Multi-expression body: all but last are statements, last is return value
     (let* ((all-but-last (butlast body-forms))
            (last-form (car (last body-forms))))
-      (multiple-value-bind (last-code last-type) (compile-expr last-form fn-env)
-        (let* ((ret-type (or ret-annotation last-type))
-               (arg-types (mapcar #'second params))
-               (fn-type (make-fn-type arg-types ret-type))
-               (param-str (format nil "~{~a~^, ~}"
-                                 (mapcar (lambda (p)
-                                           (format nil "~a ~a"
-                                                   (type-to-c (second p))
-                                                   (sanitize-name (first p))))
-                                         params)))
-               (body-stmts (when all-but-last (compile-body all-but-last fn-env))))
-          (push (format nil "static ~a ~a(~a);"
-                        (type-to-c ret-type) lambda-name
-                        (if params param-str "void"))
-                *lambda-forward-decls*)
-          (push (format nil "static ~a ~a(~a) {~%~{~a~%~}  return ~a;~%}~%"
-                        (type-to-c ret-type) lambda-name
-                        (if params param-str "void")
-                        (or body-stmts nil)
-                        last-code)
-                *functions*)
-          (values lambda-name fn-type))))))
+      (let ((*pending-stmts* nil))
+        (multiple-value-bind (last-code last-type) (compile-expr last-form fn-env)
+          (let* ((ret-type (or ret-annotation last-type))
+                 (arg-types (mapcar #'second params))
+                 (fn-type (make-fn-type arg-types ret-type))
+                 (param-str (format nil "~{~a~^, ~}"
+                                   (mapcar (lambda (p)
+                                             (format nil "~a ~a"
+                                                     (type-to-c (second p))
+                                                     (sanitize-name (first p))))
+                                           params)))
+                 (body-stmts (append (or (when all-but-last (compile-body all-but-last fn-env)) nil)
+                                     *pending-stmts*)))
+            (push (format nil "static ~a ~a(~a);"
+                          (type-to-c ret-type) lambda-name
+                          (if params param-str "void"))
+                  *lambda-forward-decls*)
+            (push (format nil "static ~a ~a(~a) {~%~{~a~%~}  return ~a;~%}~%"
+                          (type-to-c ret-type) lambda-name
+                          (if params param-str "void")
+                          (or body-stmts nil)
+                          last-code)
+                  *functions*)
+            (values lambda-name fn-type)))))))
+
 
 (defun compile-set-expr (form env)
   "(set! name expr) as expression"
@@ -1385,6 +1567,9 @@
                        "val_nil()"
                        (multiple-value-bind (code tp) (compile-expr (first items) env)
                          (let ((val (wrap-as-value code tp)))
+                           ;; Retain if variable (same logic as compile-cons)
+                           (when (cons-arg-needs-retain-p (first items) env)
+                             (setf val (format nil "val_retain(~a)" val)))
                            (format nil "val_cons(make_cons(~a, ~a))"
                                    val (build (rest items))))))))
           (values (build elems) (make-value-type))))))
@@ -1453,6 +1638,9 @@
                 (string-equal (symbol-name (first first-item)) "unquote"))
            (multiple-value-bind (code tp) (compile-expr (second first-item) env)
              (let ((val (wrap-as-value code tp)))
+               ;; Retain if variable (same logic as compile-cons/compile-list-expr)
+               (when (cons-arg-needs-retain-p (second first-item) env)
+                 (setf val (format nil "val_retain(~a)" val)))
                (format nil "val_cons(make_cons(~a, ~a))" val rest-code))))
           ;; Regular element — quote it and cons
           (t (format nil "val_cons(make_cons(~a, ~a))"
@@ -1551,9 +1739,14 @@
      (compile-cond-stmt form env))
     ((and (listp form) (sym= (first form) "block"))
      (compile-block-stmt form env))
-    (t (multiple-value-bind (code tp) (compile-expr form env)
-         (declare (ignore tp))
-         (list (format nil "  ~a;" code))))))
+    ((and (listp form) (sym= (first form) "do"))
+     ;; do as statement: just compile all sub-forms as statements
+     (compile-body (rest form) env))
+    (t (let ((*pending-stmts* nil))
+         (multiple-value-bind (code tp) (compile-expr form env)
+           (declare (ignore tp))
+           (append *pending-stmts*
+                   (list (format nil "  ~a;" code))))))))
 
 (defun compile-let-stmt (form env)
   "(let name expr) or (let name :type expr) or (let name (make-array :type size))
@@ -1565,32 +1758,35 @@
                      (prog1 (parse-type-annotation (first rest))
                        (setf rest (cdr rest)))))
          (init-form (first rest)))
-    (multiple-value-bind (init-code init-type) (compile-expr init-form env)
-      (let* ((final-type (or type-ann init-type))
-             (c-name (sanitize-name name))
-             ;; Copying a Value variable needs retain (variable ref = shared ownership)
-             ;; Fresh allocations (cons, list, quote, car, cdr) already have correct refcount
-             (needs-retain (and *uses-value-type*
-                               (value-type-p final-type)
-                               (symbolp init-form)
-                               (not (sym= init-form "nil"))
-                               (env-lookup env (string init-form)))))
-        (env-bind env name final-type)
-        (when is-mut (env-mark-mutable env name))
-        ;; Track Value-typed locals for release at scope exit
-        (when (and *uses-value-type* (value-type-p final-type))
-          (env-add-release env c-name))
-        (if (eq (sysp-type-kind final-type) :array)
-            (list (format nil "  ~a ~a[~a] = ~a;"
-                          (type-to-c (first (sysp-type-params final-type)))
-                          c-name
-                          (second (sysp-type-params final-type))
-                          init-code))
-            (if needs-retain
-                (list (format nil "  ~a ~a = val_retain(~a);"
-                              (type-to-c final-type) c-name init-code))
-                (list (format nil "  ~a ~a = ~a;"
-                              (type-to-c final-type) c-name init-code))))))))
+    (let ((*pending-stmts* nil))
+      (multiple-value-bind (init-code init-type) (compile-expr init-form env)
+        (let* ((lifted-stmts *pending-stmts*)
+               (final-type (or type-ann init-type))
+               (c-name (sanitize-name name))
+               ;; Copying a Value variable needs retain (variable ref = shared ownership)
+               ;; Fresh allocations (cons, list, quote, car, cdr) already have correct refcount
+               (needs-retain (and *uses-value-type*
+                                 (value-type-p final-type)
+                                 (symbolp init-form)
+                                 (not (sym= init-form "nil"))
+                                 (env-lookup env (string init-form)))))
+          (env-bind env name final-type)
+          (when is-mut (env-mark-mutable env name))
+          ;; Track Value-typed locals for release at scope exit
+          (when (and *uses-value-type* (value-type-p final-type))
+            (env-add-release env c-name))
+          (let ((decl (if (eq (sysp-type-kind final-type) :array)
+                          (list (format nil "  ~a ~a[~a] = ~a;"
+                                        (type-to-c (first (sysp-type-params final-type)))
+                                        c-name
+                                        (second (sysp-type-params final-type))
+                                        init-code))
+                          (if needs-retain
+                              (list (format nil "  ~a ~a = val_retain(~a);"
+                                            (type-to-c final-type) c-name init-code))
+                              (list (format nil "  ~a ~a = ~a;"
+                                            (type-to-c final-type) c-name init-code))))))
+            (append lifted-stmts decl)))))))
 
 (defun format-print-arg (val-code val-type)
   "Return format string and arg for a typed value"
@@ -1674,6 +1870,10 @@
           (result (list (format nil "  while (~a) {" cond-code))))
       (dolist (s (compile-body (cddr form) body-env))
         (push (format nil "  ~a" s) result))
+      ;; Release Value locals at end of each iteration
+      (when *uses-value-type*
+        (dolist (r (emit-releases body-env))
+          (push (format nil "  ~a" r) result)))
       (push "  }" result)
       (nreverse result))))
 
@@ -1697,6 +1897,10 @@
                                      c-var start-code c-var end-code c-var step-code))))
           (dolist (s (compile-body body-forms body-env))
             (push (format nil "  ~a" s) result))
+          ;; Release Value locals at end of each iteration
+          (when *uses-value-type*
+            (dolist (r (emit-releases body-env))
+              (push (format nil "  ~a" r) result)))
           (push "  }" result)
           (nreverse result))))))
 
@@ -1926,21 +2130,25 @@
                 (when releases
                   (setf return-stmt (format nil "~{~a~%~}" releases)))))
             ;; Non-void: last form is return value
-            (multiple-value-bind (last-code lt) (compile-expr last-form env)
-              (declare (ignore lt))
-              (let* ((releases (when *uses-value-type* (emit-releases env)))
-                     (ret-var (and (symbolp last-form)
-                                   (member (sanitize-name (string last-form))
-                                           (env-releases env) :test #'equal))))
-                (setf return-stmt
-                      (if (and ret-var *uses-value-type* releases)
-                          (format nil "  val_retain(~a);~%~{~a~%~}  return ~a;~%"
-                                  (sanitize-name (string last-form))
-                                  releases
-                                  last-code)
-                          (if (and *uses-value-type* releases)
-                              (format nil "~{~a~%~}  return ~a;~%" releases last-code)
-                              (format nil "  return ~a;~%" last-code)))))))
+            (let ((*pending-stmts* nil))
+              (multiple-value-bind (last-code lt) (compile-expr last-form env)
+                (declare (ignore lt))
+                ;; Any statements lifted from the return expression
+                (when *pending-stmts*
+                  (setf stmts (append stmts *pending-stmts*)))
+                (let* ((releases (when *uses-value-type* (emit-releases env)))
+                       (ret-var (and (symbolp last-form)
+                                     (member (sanitize-name (string last-form))
+                                             (env-releases env) :test #'equal))))
+                  (setf return-stmt
+                        (if (and ret-var *uses-value-type* releases)
+                            (format nil "  val_retain(~a);~%~{~a~%~}  return ~a;~%"
+                                    (sanitize-name (string last-form))
+                                    releases
+                                    last-code)
+                            (if (and *uses-value-type* releases)
+                                (format nil "~{~a~%~}  return ~a;~%" releases last-code)
+                                (format nil "  return ~a;~%" last-code))))))))
           (let ((body-stmts (if uses-recur
                                   (cons "  _recur_top: ;" (or stmts nil))
                                   (or stmts nil))))
@@ -2320,7 +2528,8 @@
   (format out "static Value sysp_cdr(Value v) { return val_retain(v.as_cons->cdr); }~%")
   (format out "static int sysp_nilp(Value v) { return v.tag == VAL_NIL; }~%")
   (format out "static int sysp_sym_eq(Value a, Value b) { return a.tag == VAL_SYM && b.tag == VAL_SYM && a.as_sym == b.as_sym; }~%")
-  (format out "static Value sysp_append(Value lst, Value tail) { if(lst.tag == VAL_NIL) return val_retain(tail); return val_cons(make_cons(sysp_car(lst), sysp_append(sysp_cdr(lst), tail))); }~%")
+  ;; sysp_append: use direct field access instead of sysp_car/sysp_cdr to avoid double-retain
+  (format out "static Value sysp_append(Value lst, Value tail) { if(lst.tag == VAL_NIL) return val_retain(tail); return val_cons(make_cons(val_retain(lst.as_cons->car), sysp_append(lst.as_cons->cdr, tail))); }~%")
   (format out "static uint32_t _sysp_gensym = 0x80000000;~%")
   ;; Emit symbol name table for printing (before print_value which uses it)
   (let ((max-id *symbol-counter*))
