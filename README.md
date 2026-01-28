@@ -103,3 +103,10 @@ The goal is gradual typing with aggressive monomorphization:
 ## License
 
 MIT
+
+## Warnings:
+
+This is a personal project and alpha software. Do expect dramatic changes between versions. Don't expect it to run on every commit. The following version [runs but has memory issues](https://github.com/karans4/sysp/tree/1521ee6dae988c2aef5e8c84f2c72ebacd6759f8).
+
+Due to the way closures and reference counting are implemented, threads (not yet implemented) will only be supported in C11 or higher. For those using C99, you will have to rely on compiler extensions. No specific compilers will be supported, but I will probably make it work in the top 3 or 4 compilers from 2006 for C99.
+
