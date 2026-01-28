@@ -1,0 +1,40 @@
+;; Loop unrolling macro demo
+;; Macro decision: unroll strided buffer copy vs generate nested loop
+
+(defn setup-buffer [buf :ptr-int size :int] :void
+  (for [i 0 size]
+    (array-set! buf i i)))
+
+(defmacro copy-stride [dst src stride unroll-flag]
+  (if (sym-eq? unroll-flag 'true)
+    ;; UNROLLED: manually unroll 8 stride-steps inline
+    `(do
+      (array-set! ~dst 0 (array-ref ~src 0))
+      (array-set! ~dst 1 (array-ref ~src ~stride))
+      (array-set! ~dst 2 (array-ref ~src (* ~stride 2)))
+      (array-set! ~dst 3 (array-ref ~src (* ~stride 3)))
+      (array-set! ~dst 4 (array-ref ~src (* ~stride 4)))
+      (array-set! ~dst 5 (array-ref ~src (* ~stride 5)))
+      (array-set! ~dst 6 (array-ref ~src (* ~stride 6)))
+      (array-set! ~dst 7 (array-ref ~src (* ~stride 7))))
+    ;; LOOP: compact for loop
+    `(for [i 0 8]
+      (array-set! ~dst i (array-ref ~src (* i ~stride))))))
+
+(defn main [] :int
+  (let src (malloc (* 100 (sizeof :int))))
+  (let dst (malloc (* 100 (sizeof :int))))
+
+  (setup-buffer src 100)
+
+  ;; Version 1: Unrolled (stride copy fully inline)
+  (println "=== Unrolled stride copy ===")
+  (copy-stride dst src 3 true)
+
+  ;; Version 2: Loop (compact stride loop)
+  (println "=== Loop stride copy ===")
+  (copy-stride dst src 3 false)
+
+  (free src)
+  (free dst)
+  0)

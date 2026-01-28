@@ -1,7 +1,13 @@
+# Build artifacts
 examples/hello
 examples/tictactoe
 examples/test-features
 examples/*.c
+
+# Test build outputs
+tests/build/
+
+# Legacy test binaries (before reorganization)
 test-cons
 test-cons.c
 test-macros
@@ -12,3 +18,16 @@ test-qq
 test-qq.c
 test-refcount
 test-refcount.c
+test-infer
+test-infer.c
+test-cons-edge
+test-cons-edge.c
+test-refcount-stress
+test-refcount-stress.c
+test-memory-leaks
+test-memory-leaks.c
+test-portability
+test-portability.c
+*.out
+*.valgrind
+push-later.sh

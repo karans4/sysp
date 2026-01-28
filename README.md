@@ -68,7 +68,7 @@ cc tictactoe.c -lraylib -lm -o tictactoe
 
 ## Architecture
 
-The compiler is a single Common Lisp file (`sysp.lisp`, ~1900 lines):
+The compiler is a single Common Lisp file (`sysp.lisp`, ~3000 lines):
 
 1. **Read** - custom readtable for `[]` arrays and backquote syntax
 2. **Macro-expand** - recursive expansion of `defmacro` + built-in macros (`->`, `->>`, `when-let`, `dotimes`, etc.)
@@ -104,9 +104,9 @@ The goal is gradual typing with aggressive monomorphization:
 
 MIT
 
-## Warnings:
+## Status
 
-This is a personal project and alpha software. Do expect dramatic changes between versions. Don't expect it to run on every commit. The following version [runs](https://github.com/karans4/sysp/tree/1521ee6dae988c2aef5e8c84f2c72ebacd6759f8).
+Alpha software. Expect breaking changes. All tests pass on master.
 
-Due to the way closures and reference counting are implemented, threads (not yet implemented) will only be supported in C11 or higher. For those using C99, you will have to rely on compiler extensions. No specific compilers will be supported, but I will probably make it work in the top 3 or 4 compilers from 2006 for C99.
+Threading is planned but not yet implemented. C99 does not have standard threads, so when threads land they will require C11 or compiler-specific extensions (pthreads, Windows threads, etc.).
 
