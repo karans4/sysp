@@ -1,0 +1,17 @@
+;;; Test: GCC optimization of local cons allocations
+;;;
+;;; Investigates whether GCC -O3 can eliminate malloc/free for cons cells
+;;; that don't escape their local scope. Result: GCC computes the answer
+;;; at compile time but cannot eliminate the allocations due to malloc's
+;;; observable side effects. sysp will need escape analysis for this.
+
+(defn local-cons-sum [] :int
+  ;; Create a cons, use it locally, release it
+  ;; Can GCC eliminate the malloc/free?
+  (let xs (cons 1 (cons 2 (cons 3 '()))))
+  (let sum (+ (car xs) (+ (car (cdr xs)) (car (cdr (cdr xs))))))
+  sum)
+
+(defn main [] :int
+  (println (local-cons-sum))  ;; should print 6
+  0)

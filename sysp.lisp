@@ -16,17 +16,50 @@
   `(defun ,(intern (format nil "MAKE-~a-TYPE" (string-upcase name))) ()
      (make-sysp-type :kind ,kind)))
 
-(deftypector int :int)
-(deftypector long :long)
-(deftypector long-long :long-long)
+;; === C99 Type Constructors ===
+
+;; Signed integers (platform-dependent widths)
+(deftypector char :char)           ; typically 8-bit
+(deftypector short :short)         ; at least 16-bit
+(deftypector int :int)             ; at least 16-bit, typically 32-bit
+(deftypector long :long)           ; at least 32-bit
+(deftypector long-long :long-long) ; at least 64-bit
+
+;; Unsigned integers
+(deftypector uchar :uchar)
+(deftypector ushort :ushort)
+(deftypector uint :uint)
+(deftypector ulong :ulong)
+(deftypector ulong-long :ulong-long)
+
+;; Fixed-width signed integers (C99 stdint.h)
+(deftypector i8 :i8)
+(deftypector i16 :i16)
+(deftypector i32 :i32)
+(deftypector i64 :i64)
+
+;; Fixed-width unsigned integers (C99 stdint.h)
+(deftypector u8 :u8)
+(deftypector u16 :u16)
+(deftypector u32 :u32)
+(deftypector u64 :u64)
+
+;; Floating point
 (deftypector float :float)
 (deftypector double :double)
+(deftypector f32 :f32)             ; alias for float
+(deftypector f64 :f64)             ; alias for double
+
+;; Size/pointer types
+(deftypector size :size)           ; size_t
+(deftypector ptrdiff :ptrdiff)     ; ptrdiff_t
+(deftypector intptr :intptr)       ; intptr_t
+(deftypector uintptr :uintptr)     ; uintptr_t
+
+;; Other
 (deftypector void :void)
 (deftypector bool :bool)
 (deftypector str :str)
-(deftypector char :char)
-(deftypector u8 :u8)
-(deftypector f32 :f32)
 (deftypector symbol :symbol)
 (deftypector value :value)
 (deftypector cons :cons)
@@ -344,7 +377,12 @@
   "Walk an expression form and return its inferred type."
   (cond
     ((null form) (make-nil-type))  ; nil is the empty list type
-    ((integerp form) (make-int-type))
+    ((integerp form)
+     ;; Infer integer type based on value range (C99 rules)
+     (cond
+       ((<= -2147483648 form 2147483647) (make-int-type))
+       ((<= form 9223372036854775807) (make-long-long-type))
+       (t (make-ulong-long-type))))
     ((floatp form) (make-float-type))
     ((stringp form) (make-str-type))
     ((symbolp form)
@@ -961,17 +999,43 @@
 (defun parse-type-annotation (sym)
   (let ((name (string-downcase (symbol-name sym))))
     (cond
+      ;; Signed integers
+      ((string= name "char") (make-char-type))
+      ((string= name "short") (make-short-type))
       ((string= name "int") (make-int-type))
       ((string= name "long") (make-long-type))
       ((string= name "long-long") (make-long-long-type))
+      ;; Unsigned integers
+      ((string= name "uchar") (make-uchar-type))
+      ((string= name "ushort") (make-ushort-type))
+      ((string= name "uint") (make-uint-type))
+      ((string= name "ulong") (make-ulong-type))
+      ((string= name "ulong-long") (make-ulong-long-type))
+      ;; Fixed-width signed (C99 stdint.h)
+      ((string= name "i8") (make-i8-type))
+      ((string= name "i16") (make-i16-type))
+      ((string= name "i32") (make-i32-type))
+      ((string= name "i64") (make-i64-type))
+      ;; Fixed-width unsigned (C99 stdint.h)
+      ((string= name "u8") (make-u8-type))
+      ((string= name "u16") (make-u16-type))
+      ((string= name "u32") (make-u32-type))
+      ((string= name "u64") (make-u64-type))
+      ;; Floating point
       ((string= name "float") (make-float-type))
       ((string= name "double") (make-double-type))
-      ((string= name "bool") (make-bool-type))
-      ((string= name "void") (make-void-type))
-      ((string= name "str") (make-str-type))
-      ((string= name "char") (make-char-type))
-      ((string= name "u8") (make-u8-type))
       ((string= name "f32") (make-f32-type))
+      ((string= name "f64") (make-f64-type))
+      ;; Size/pointer types
+      ((string= name "size") (make-size-type))
+      ((string= name "ptrdiff") (make-ptrdiff-type))
+      ((string= name "intptr") (make-intptr-type))
+      ((string= name "uintptr") (make-uintptr-type))
+      ;; Other
+      ((string= name "void") (make-void-type))
+      ((string= name "bool") (make-bool-type))
+      ((string= name "str") (make-str-type))
+      ;; Value types
       ((string= name "symbol") (make-symbol-type))
       ((string= name "value") (make-value-type))
       ((string= name "cons") (make-cons-type))
@@ -991,17 +1055,43 @@
 
 (defun type-to-c (tp)
   (case (sysp-type-kind tp)
+    ;; Signed integers
+    (:char "char")
+    (:short "short")
     (:int "int")
     (:long "long")
     (:long-long "long long")
+    ;; Unsigned integers
+    (:uchar "unsigned char")
+    (:ushort "unsigned short")
+    (:uint "unsigned int")
+    (:ulong "unsigned long")
+    (:ulong-long "unsigned long long")
+    ;; Fixed-width signed (C99 stdint.h)
+    (:i8 "int8_t")
+    (:i16 "int16_t")
+    (:i32 "int32_t")
+    (:i64 "int64_t")
+    ;; Fixed-width unsigned (C99 stdint.h)
+    (:u8 "uint8_t")
+    (:u16 "uint16_t")
+    (:u32 "uint32_t")
+    (:u64 "uint64_t")
+    ;; Floating point
     (:float "float")
     (:double "double")
+    (:f32 "float")
+    (:f64 "double")
+    ;; Size/pointer types (C99 stddef.h/stdint.h)
+    (:size "size_t")
+    (:ptrdiff "ptrdiff_t")
+    (:intptr "intptr_t")
+    (:uintptr "uintptr_t")
+    ;; Other
     (:bool "int")
     (:void "void")
     (:str "const char*")
-    (:char "char")
-    (:u8 "unsigned char")
-    (:f32 "float")
+    ;; Compound types
     (:ptr (format nil "~a*" (type-to-c (first (sysp-type-params tp)))))
     (:struct (sysp-type-name tp))
     (:enum (sysp-type-name tp))
@@ -1178,7 +1268,17 @@
   "Compile a non-statement-like expression"
   (cond
     ((null form) (values "0" (make-int-type)))
-    ((integerp form) (values (format nil "~d" form) (make-int-type)))
+    ((integerp form)
+     ;; Add suffix for large integers (C99)
+     (cond
+       ((<= -2147483648 form 2147483647)
+        (values (format nil "~d" form) (make-int-type)))
+       ((<= form 9223372036854775807)
+        ;; Fits in signed long long
+        (values (format nil "~dLL" form) (make-long-long-type)))
+       (t
+        ;; Larger than signed max - use unsigned long long
+        (values (format nil "~dULL" form) (make-ulong-long-type)))))
     ((floatp form) (values (format nil "~f" form) (make-float-type)))
     ((stringp form) (values (format nil "~s" form) (make-str-type)))
     ((symbolp form)
@@ -1349,17 +1449,97 @@
       ;; Otherwise: function/constructor call
       (t (compile-call form env)))))
 
+(defun type-rank (kind)
+  "Return numeric rank for C99 usual arithmetic conversions.
+   Higher rank = wider type. Negative for unsigned."
+  (case kind
+    ;; Floating point (highest ranks)
+    ((:double :f64) 100)
+    ((:float :f32) 90)
+    ;; Signed integers (rank = approximate bit width)
+    (:long-long 64)
+    (:i64 64)
+    (:long 32)  ; actually at least 32
+    (:i32 32)
+    (:int 16)   ; actually at least 16
+    (:i16 16)
+    (:short 16)
+    (:i8 8)
+    (:char 8)
+    ;; Unsigned integers (negative ranks to distinguish from signed)
+    (:ulong-long -64)
+    (:u64 -64)
+    (:ulong -32)
+    (:u32 -32)
+    (:uint -16)
+    (:u16 -16)
+    (:ushort -16)
+    (:u8 -8)
+    (:uchar -8)
+    ;; Size types (treat as unsigned long or long long)
+    (:size -32)
+    (:uintptr -32)
+    (:ptrdiff 32)
+    (:intptr 32)
+    ;; Default
+    (otherwise 16)))
+
+(defun sysp-arithmetic-type (t1 t2)
+  "Compute result type for binary arithmetic.
+   Unlike C, sysp preserves types: i8 + i8 = i8, not int.
+   Only promotes when mixing different types."
+  (let ((k1 (sysp-type-kind t1))
+        (k2 (sysp-type-kind t2)))
+    ;; Same type? Return it. No surprises.
+    (when (eq k1 k2)
+      (return-from sysp-arithmetic-type t1))
+    ;; Normalize aliases
+    (when (eq k1 :f32) (setf k1 :float))
+    (when (eq k2 :f32) (setf k2 :float))
+    (when (eq k1 :f64) (setf k1 :double))
+    (when (eq k2 :f64) (setf k2 :double))
+    ;; Different types - promote to the wider one
+    (flet ((rank (k)
+             (case k
+               ((:double :f64) 200)
+               ((:float :f32) 100)
+               ((:i64 :u64 :long-long :ulong-long) 64)
+               ((:long :ulong) 48)  ; platform-dependent
+               ((:i32 :u32 :int :uint) 32)
+               ((:i16 :u16 :short :ushort) 16)
+               ((:i8 :u8 :char :uchar) 8)
+               ((:size :ptrdiff :intptr :uintptr) 48)
+               (otherwise 32)))
+           (unsigned-p (k)
+             (member k '(:u8 :u16 :u32 :u64 :uchar :ushort :uint :ulong :ulong-long :size :uintptr))))
+      (let ((r1 (rank k1))
+            (r2 (rank k2)))
+        (cond
+          ;; Float wins over everything
+          ((or (>= r1 100) (>= r2 100))
+           (if (>= (max r1 r2) 200) (make-double-type) (make-float-type)))
+          ;; Both integers - use wider type
+          ((> r1 r2) t1)
+          ((> r2 r1) t2)
+          ;; Same rank, different types - prefer unsigned if either is unsigned
+          ((or (unsigned-p k1) (unsigned-p k2))
+           (if (unsigned-p k1) t1 t2))
+          ;; Default to first type
+          (t t1))))))
+
 (defun compile-binop (op form env)
   (multiple-value-bind (lhs lt) (compile-expr (second form) env)
     (multiple-value-bind (rhs rt) (compile-expr (third form) env)
-      (declare (ignore rt))
       (let ((result-type
               (cond
+                ;; Comparison and logical operators always return bool (int in C)
                 ((member op '("<" ">" "<=" ">=" "==" "!=" "&&" "||") :test #'string=)
                  (make-bool-type))
+                ;; Bitwise operators return int (operate on integer types)
                 ((member op '("&" "|" "^" "<<" ">>") :test #'string=)
                  (make-int-type))
-                (t lt))))
+                ;; Arithmetic operators: use C99 promotion rules
+                (t (sysp-arithmetic-type lt rt)))))
         (values (format nil "(~a ~a ~a)" lhs op rhs) result-type)))))
 
 (defun compile-logical (op form env)
@@ -1760,12 +1940,32 @@
     (:bool (format nil "val_int(~a)" code))
     (otherwise (format nil "val_int(~a)" code))))
 
-(defun cons-arg-needs-retain-p (arg-form env)
-  "Does this cons argument need val_retain? Yes if it's a local variable of Value type."
-  (and (symbolp arg-form)
-       (not (sym= arg-form "nil"))
-       (let ((tp (env-lookup env (string arg-form))))
-         (and tp (value-type-p tp)))))
+(defun fresh-value-allocation-p (form)
+  "Is this form a fresh Value allocation (cons/list/quote)? These have rc=1, don't need retain."
+  (and (listp form)
+       (symbolp (first form))
+       (member (string (first form)) '("cons" "list" "quote" "quasiquote") :test #'string-equal)))
+
+(defun needs-retain-for-storage-p (arg-form env)
+  "Does this expression need val_retain when stored?
+   YES for: variables (sharing), car/cdr (borrowed ref)
+   NO for: fresh allocations (cons/list/quote already have rc=1), primitives"
+  (cond
+    ;; Fresh allocations don't need retain
+    ((fresh-value-allocation-p arg-form) nil)
+    ;; Variables need retain (shared ownership)
+    ((and (symbolp arg-form)
+          (not (sym= arg-form "nil"))
+          (let ((tp (env-lookup env (string arg-form))))
+            (and tp (value-type-p tp))))
+     t)
+    ;; car/cdr calls need retain (borrowed refs being stored)
+    ((and (listp arg-form)
+          (symbolp (first arg-form))
+          (member (string (first arg-form)) '("car" "cdr") :test #'string-equal))
+     t)
+    ;; Everything else (primitives, nil, etc.) - no retain needed
+    (t nil)))
 
 (defun compile-cons (form env)
   "(cons x y)"
@@ -1774,16 +1974,40 @@
     (multiple-value-bind (cdr-code cdr-type) (compile-expr (third form) env)
       (let ((car-val (wrap-as-value car-code car-type))
             (cdr-val (wrap-as-value cdr-code cdr-type)))
-        ;; If args are local variables, retain them (cons shares ownership)
-        (when (cons-arg-needs-retain-p (second form) env)
+        ;; Retain if storing borrowed ref or shared variable
+        (when (needs-retain-for-storage-p (second form) env)
           (setf car-val (format nil "val_retain(~a)" car-val)))
-        (when (cons-arg-needs-retain-p (third form) env)
+        (when (needs-retain-for-storage-p (third form) env)
           (setf cdr-val (format nil "val_retain(~a)" cdr-val)))
         (values (format nil "val_cons(make_cons(~a, ~a))" car-val cdr-val)
                 (make-value-type))))))
 
-(define-value-accessor car "sysp_car" make-value-type)
-(define-value-accessor cdr "sysp_cdr" make-value-type)
+;; car/cdr with constant folding for quoted literals
+(defun compile-car (form env)
+  "(car x) - with constant folding for (car 'literal)"
+  (setf *uses-value-type* t)
+  (let ((arg (second form)))
+    ;; Constant fold: (car '(a b c)) -> compile 'a directly
+    (if (and (listp arg) (symbolp (first arg))
+             (string-equal (string (first arg)) "quote")
+             (listp (second arg)))
+        (values (compile-quoted-datum (first (second arg))) (make-value-type))
+        (multiple-value-bind (code tp) (compile-expr arg env)
+          (declare (ignore tp))
+          (values (format nil "sysp_car(~a)" code) (make-value-type))))))
+
+(defun compile-cdr (form env)
+  "(cdr x) - with constant folding for (cdr 'literal)"
+  (setf *uses-value-type* t)
+  (let ((arg (second form)))
+    ;; Constant fold: (cdr '(a b c)) -> compile '(b c) directly
+    (if (and (listp arg) (symbolp (first arg))
+             (string-equal (string (first arg)) "quote")
+             (listp (second arg)))
+        (values (compile-quoted-datum (rest (second arg))) (make-value-type))
+        (multiple-value-bind (code tp) (compile-expr arg env)
+          (declare (ignore tp))
+          (values (format nil "sysp_cdr(~a)" code) (make-value-type))))))
 (define-value-accessor nilp "sysp_nilp" make-bool-type)
 
 (defun compile-list-expr (form env)
@@ -1797,8 +2021,8 @@
                        "val_nil()"
                        (multiple-value-bind (code tp) (compile-expr (first items) env)
                          (let ((val (wrap-as-value code tp)))
-                           ;; Retain if variable (same logic as compile-cons)
-                           (when (cons-arg-needs-retain-p (first items) env)
+                           ;; Retain if storing borrowed ref or shared variable
+                           (when (needs-retain-for-storage-p (first items) env)
                              (setf val (format nil "val_retain(~a)" val)))
                            (format nil "val_cons(make_cons(~a, ~a))"
                                    val (build (rest items))))))))
@@ -1868,8 +2092,8 @@
                 (string-equal (symbol-name (first first-item)) "unquote"))
            (multiple-value-bind (code tp) (compile-expr (second first-item) env)
              (let ((val (wrap-as-value code tp)))
-               ;; Retain if variable (same logic as compile-cons/compile-list-expr)
-               (when (cons-arg-needs-retain-p (second first-item) env)
+               ;; Retain if storing borrowed ref or shared variable
+               (when (needs-retain-for-storage-p (second first-item) env)
                  (setf val (format nil "val_retain(~a)" val)))
                (format nil "val_cons(make_cons(~a, ~a))" val rest-code))))
           ;; Regular element — quote it and cons
@@ -2021,13 +2245,10 @@
         (let* ((lifted-stmts *pending-stmts*)
                (final-type (or type-ann init-type))
                (c-name (sanitize-name name))
-               ;; Copying a Value variable needs retain (variable ref = shared ownership)
-               ;; Fresh allocations (cons, list, quote, car, cdr) already have correct refcount
+               ;; Retain if storing borrowed ref or shared variable (not fresh allocs)
                (needs-retain (and *uses-value-type*
                                  (value-type-p final-type)
-                                 (symbolp init-form)
-                                 (not (sym= init-form "nil"))
-                                 (env-lookup env (string init-form)))))
+                                 (needs-retain-for-storage-p init-form env))))
           (env-bind env name final-type)
           (when is-mut (env-mark-mutable env name))
           ;; Track Value-typed locals for release at scope exit
@@ -2047,24 +2268,63 @@
             (append lifted-stmts decl)))))))
 
 (defun format-print-arg (val-code val-type)
-  "Return format string and arg for a typed value"
+  "Return format string and arg for a typed value (C99 format specifiers)
+   Uses inttypes.h macros for portable fixed-width printing."
   (case (sysp-type-kind val-type)
+    ;; Signed integers
+    (:char (values "%d" val-code))  ; %c for char, %d for numeric
+    (:short (values "%hd" val-code))
+    (:int (values "%d" val-code))
+    (:long (values "%ld" val-code))
+    (:long-long (values "%lld" val-code))
+    ;; Unsigned integers
+    (:uchar (values "%u" val-code))
+    (:ushort (values "%hu" val-code))
+    (:uint (values "%u" val-code))
+    (:ulong (values "%lu" val-code))
+    (:ulong-long (values "%llu" val-code))
+    ;; Fixed-width signed (portable via inttypes.h macros)
+    (:i8 (values :pri "PRId8" val-code))
+    (:i16 (values :pri "PRId16" val-code))
+    (:i32 (values :pri "PRId32" val-code))
+    (:i64 (values :pri "PRId64" val-code))
+    ;; Fixed-width unsigned (portable via inttypes.h macros)
+    (:u8 (values :pri "PRIu8" val-code))
+    (:u16 (values :pri "PRIu16" val-code))
+    (:u32 (values :pri "PRIu32" val-code))
+    (:u64 (values :pri "PRIu64" val-code))
+    ;; Floating point
     (:float (values "%f" val-code))
     (:f32 (values "%f" val-code))
+    (:double (values "%f" val-code))
+    (:f64 (values "%f" val-code))
+    ;; Size/pointer types (C99)
+    (:size (values "%zu" val-code))
+    (:ptrdiff (values "%td" val-code))
+    (:intptr (values :pri "PRIdPTR" val-code))
+    (:uintptr (values :pri "PRIuPTR" val-code))
+    ;; Strings and chars
     (:str (values "%s" val-code))
-    (:char (values "%c" val-code))
-    (:u8 (values "%u" val-code))
+    ;; Bool
     (:bool (values "%s" (format nil "(~a ? \"true\" : \"false\")" val-code)))
+    ;; Value types
     ((:value :cons) (values :value-print val-code))
+    ;; Default to %d for unknown int-like types
     (otherwise (values "%d" val-code))))
 
 (defun compile-print-stmt (form env)
   "(print expr) — print without newline"
   (multiple-value-bind (val-code val-type) (compile-expr (second form) env)
     (multiple-value-bind (fmt arg) (format-print-arg val-code val-type)
-      (if (eq fmt :value-print)
-          (list (format nil "  sysp_print_value(~a);" arg))
-          (list (format nil "  printf(\"~a\", ~a);" fmt arg))))))
+      (cond
+        ((eq fmt :value-print)
+         (list (format nil "  sysp_print_value(~a);" arg)))
+        ((eq fmt :pri)
+         ;; Use inttypes.h macros for portable fixed-width printing
+         ;; arg is the macro name (e.g., "PRId64"), val-code is the value
+         (list (format nil "  printf(\"%\" ~a, ~a);" arg val-code)))
+        (t
+         (list (format nil "  printf(\"~a\", ~a);" fmt arg)))))))
 
 (defun compile-println-stmt (form env)
   "(println expr) or (println) — print with newline"
@@ -2072,9 +2332,14 @@
       (list "  printf(\"\\n\");")
       (multiple-value-bind (val-code val-type) (compile-expr (second form) env)
         (multiple-value-bind (fmt arg) (format-print-arg val-code val-type)
-          (if (eq fmt :value-print)
-              (list (format nil "  sysp_print_value(~a); printf(\"\\n\");" arg))
-              (list (format nil "  printf(\"~a\\n\", ~a);" fmt arg)))))))
+          (cond
+            ((eq fmt :value-print)
+             (list (format nil "  sysp_print_value(~a); printf(\"\\n\");" arg)))
+            ((eq fmt :pri)
+             ;; Use inttypes.h macros for portable fixed-width printing
+             (list (format nil "  printf(\"%\" ~a \"\\n\", ~a);" arg val-code)))
+            (t
+             (list (format nil "  printf(\"~a\\n\", ~a);" fmt arg))))))))
 
 (defun compile-if-stmt (form env)
   "(if cond then-body...) or (if cond then-body... else else-body...)"
@@ -2850,11 +3115,12 @@
   (format out "static Value val_sym(Symbol x) { Value v = {.tag = VAL_SYM}; v.as_sym = x; return v; }~%")
   (format out "static Value val_cons(Cons* x) { Value v = {.tag = VAL_CONS}; v.as_cons = x; return v; }~%")
   (format out "static Cons* make_cons(Value car, Value cdr) { Cons* c = malloc(sizeof(Cons)); c->car = car; c->cdr = cdr; c->refcount = 1; return c; }~%")
-  ;; Refcounting (before car/cdr which use val_retain)
+  ;; Refcounting
   (format out "static Value val_retain(Value v) { if(v.tag == VAL_CONS && v.as_cons) v.as_cons->refcount++; return v; }~%")
   (format out "static void val_release(Value v) { if(v.tag == VAL_CONS && v.as_cons && --v.as_cons->refcount == 0) { val_release(v.as_cons->car); val_release(v.as_cons->cdr); free(v.as_cons); } }~%")
-  (format out "static Value sysp_car(Value v) { return val_retain(v.as_cons->car); }~%")
-  (format out "static Value sysp_cdr(Value v) { return val_retain(v.as_cons->cdr); }~%")
+  ;; car/cdr use borrow semantics (no retain) - caller retains if storing
+  (format out "static Value sysp_car(Value v) { return v.as_cons->car; }~%")
+  (format out "static Value sysp_cdr(Value v) { return v.as_cons->cdr; }~%")
   (format out "static int sysp_nilp(Value v) { return v.tag == VAL_NIL; }~%")
   (format out "static int sysp_sym_eq(Value a, Value b) { return a.tag == VAL_SYM && b.tag == VAL_SYM && a.as_sym == b.as_sym; }~%")
   ;; sysp_append: use direct field access instead of sysp_car/sysp_cdr to avoid double-retain
@@ -2900,8 +3166,10 @@
   (with-open-file (out out-path :direction :output :if-exists :supersede)
     (format out "#include <stdio.h>~%")
     (format out "#include <stdlib.h>~%")
+    (format out "#include <stdint.h>~%")   ; C99 fixed-width types
+    (format out "#include <inttypes.h>~%") ; PRId64, PRIu64, etc.
+    (format out "#include <stddef.h>~%")   ; size_t, ptrdiff_t
     (when *uses-value-type*
-      (format out "#include <stdint.h>~%")
       (format out "#include <stdarg.h>~%"))
     (dolist (inc *includes*)
       (format out "#include <~a>~%" inc))

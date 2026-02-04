@@ -1,0 +1,227 @@
+;;; Test: C99 numeric types and promotion rules
+;;; Tests integer types, promotion, and arithmetic
+
+;; === Basic integer types ===
+
+(defn test-int-basics [] :int
+  (let a :int 42)
+  (let b :int -17)
+  (print "int basics: ")
+  (print a)
+  (print " ")
+  (println b)
+  (+ a b))  ;; 25
+
+(defn test-long-basics [] :long
+  (let a :long 2147483648)  ;; > INT_MAX
+  (let b :long 1000000000)
+  (print "long basics: ")
+  (print a)
+  (print " + ")
+  (print b)
+  (print " = ")
+  (println (+ a b))
+  (+ a b))  ;; 3147483648
+
+(defn test-unsigned-basics [] :int
+  (let a :u8 255)
+  (let b :u8 1)
+  (print "u8 wrap test: 255 + 1 = ")
+  ;; In C, u8 promotes to int for arithmetic, result is 256
+  ;; But if stored back to u8, it wraps to 0
+  (println (+ a b))  ;; prints 256 (promoted to int)
+  (+ a b))
+
+;; === Float/double ===
+
+(defn test-float-basics [] :float
+  (let a :float 3.14159)
+  (let b :float 2.71828)
+  (print "float: ")
+  (println (+ a b))
+  (+ a b))
+
+(defn test-double-basics [] :double
+  (let a :double 3.141592653589793)
+  (let b :double 2.718281828459045)
+  (print "double: ")
+  (println (+ a b))
+  (+ a b))
+
+;; === Promotion tests ===
+
+(defn test-int-to-long [] :long
+  ;; int + long -> long
+  (let a :int 100)
+  (let b :long 9999999999)
+  (print "int + long = long: ")
+  (println (+ a b))
+  (+ a b))
+
+(defn test-int-to-float [] :float
+  ;; int + float -> float
+  (let a :int 42)
+  (let b :float 0.5)
+  (print "int + float = float: ")
+  (println (+ a b))
+  (+ a b))
+
+(defn test-int-to-double [] :double
+  ;; int + double -> double
+  (let a :int 42)
+  (let b :double 0.123456789012345)
+  (print "int + double = double: ")
+  (println (+ a b))
+  (+ a b))
+
+(defn test-float-to-double [] :double
+  ;; float + double -> double
+  (let a :float 1.5)
+  (let b :double 2.5)
+  (print "float + double = double: ")
+  (println (+ a b))
+  (+ a b))
+
+(defn test-long-to-double [] :double
+  ;; long + double -> double
+  (let a :long 1000000)
+  (let b :double 0.5)
+  (print "long + double = double: ")
+  (println (+ a b))
+  (+ a b))
+
+;; === Comparison operators ===
+
+(defn test-comparisons [] :int
+  (let-mut passed 0)
+
+  ;; int comparisons
+  (when (< 1 2) (set! passed (+ passed 1)))
+  (when (> 2 1) (set! passed (+ passed 1)))
+  (when (<= 1 1) (set! passed (+ passed 1)))
+  (when (>= 2 2) (set! passed (+ passed 1)))
+  (when (== 42 42) (set! passed (+ passed 1)))
+  (when (!= 1 2) (set! passed (+ passed 1)))
+
+  ;; mixed type comparisons
+  (when (< 1 2.5) (set! passed (+ passed 1)))      ;; int < float
+  (when (> 3.0 2) (set! passed (+ passed 1)))      ;; float > int
+
+  (print "comparisons passed: ")
+  (print passed)
+  (println "/8")
+  passed)
+
+;; === Division and modulo ===
+
+(defn test-division [] :int
+  (let a :int 17)
+  (let b :int 5)
+  (print "17 / 5 = ")
+  (print (/ a b))  ;; 3 (integer division)
+  (print ", 17 % 5 = ")
+  (println (% a b))  ;; 2
+
+  (let c :float 17.0)
+  (let d :float 5.0)
+  (print "17.0 / 5.0 = ")
+  (println (/ c d))  ;; 3.4
+
+  0)
+
+;; === Bitwise operations (integers only) ===
+
+(defn test-bitwise [] :int
+  (let a :int 255)   ;; 0xFF
+  (let b :int 15)    ;; 0x0F
+
+  (print "0xFF & 0x0F = ")
+  (println (bit-and a b))   ;; 15
+
+  (print "0xFF | 0x0F = ")
+  (println (bit-or a b))    ;; 255
+
+  (print "0xFF ^ 0x0F = ")
+  (println (bit-xor a b))   ;; 240
+
+  (print "0x0F << 4 = ")
+  (println (shl b 4))       ;; 240
+
+  (print "0xFF >> 4 = ")
+  (println (shr a 4))       ;; 15
+
+  0)
+
+;; === Negative numbers ===
+
+(defn test-negatives [] :int
+  (let a :int -42)
+  (let b :int 17)
+
+  (print "-42 + 17 = ")
+  (println (+ a b))  ;; -25
+
+  (print "-42 * 2 = ")
+  (println (* a 2))  ;; -84
+
+  (print "-42 / 5 = ")
+  (println (/ a 5))  ;; -8 (truncates toward zero in C99)
+
+  (print "-42 % 5 = ")
+  (println (% a 5))  ;; -2 (sign follows dividend in C99)
+
+  0)
+
+;; === Overflow behavior ===
+
+(defn test-overflow [] :int
+  ;; Note: signed overflow is undefined in C, but these should work
+  (let max-int :int 2147483647)
+  (print "INT_MAX = ")
+  (println max-int)
+
+  ;; Unsigned overflow is well-defined (wraps)
+  (let max-u8 :u8 255)
+  (print "u8 max = ")
+  (println max-u8)
+
+  0)
+
+(defn main [] :int
+  (println "=== Numeric Type Tests ===")
+  (println "")
+
+  (test-int-basics)
+  (test-long-basics)
+  (test-unsigned-basics)
+  (println "")
+
+  (test-float-basics)
+  (test-double-basics)
+  (println "")
+
+  (println "--- Promotion tests ---")
+  (test-int-to-long)
+  (test-int-to-float)
+  (test-int-to-double)
+  (test-float-to-double)
+  (test-long-to-double)
+  (println "")
+
+  (test-comparisons)
+  (println "")
+
+  (test-division)
+  (println "")
+
+  (test-bitwise)
+  (println "")
+
+  (test-negatives)
+  (println "")
+
+  (test-overflow)
+
+  (println "")
+  (println "=== All numeric tests complete ===")
+  0)

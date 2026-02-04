@@ -1,0 +1,197 @@
+;;; Test: Comprehensive C99 type coverage
+;;; Tests all numeric types, fixed-width, unsigned, and promotion
+
+;; === Fixed-width signed integers ===
+
+(defn test-i8 [] :int
+  (let a :i8 127)
+  (let b :i8 -128)
+  (print "i8: ")
+  (print a)
+  (print " ")
+  (println b)
+  0)
+
+(defn test-i16 [] :int
+  (let a :i16 32767)
+  (let b :i16 -32768)
+  (print "i16: ")
+  (print a)
+  (print " ")
+  (println b)
+  0)
+
+(defn test-i32 [] :int
+  (let a :i32 2147483647)
+  (let b :i32 -2147483648)
+  (print "i32: ")
+  (print a)
+  (print " ")
+  (println b)
+  0)
+
+(defn test-i64 [] :int
+  (let a :i64 9223372036854775807)
+  (let b :i64 -9223372036854775808)
+  (print "i64: ")
+  (print a)
+  (print " ")
+  (println b)
+  0)
+
+;; === Fixed-width unsigned integers ===
+
+(defn test-u8 [] :int
+  (let a :u8 255)
+  (let b :u8 0)
+  (print "u8: ")
+  (print a)
+  (print " ")
+  (println b)
+  0)
+
+(defn test-u16 [] :int
+  (let a :u16 65535)
+  (let b :u16 0)
+  (print "u16: ")
+  (print a)
+  (print " ")
+  (println b)
+  0)
+
+(defn test-u32 [] :int
+  (let a :u32 4294967295)
+  (let b :u32 0)
+  (print "u32: ")
+  (print a)
+  (print " ")
+  (println b)
+  0)
+
+(defn test-u64 [] :int
+  (let a :u64 18446744073709551615)
+  (let b :u64 0)
+  (print "u64: ")
+  (print a)
+  (print " ")
+  (println b)
+  0)
+
+;; === C basic types ===
+
+(defn test-short [] :int
+  (let a :short 32767)
+  (let b :short -32768)
+  (print "short: ")
+  (print a)
+  (print " ")
+  (println b)
+  0)
+
+(defn test-uint [] :int
+  (let a :uint 4294967295)
+  (print "uint: ")
+  (println a)
+  0)
+
+(defn test-ulong [] :int
+  (let a :ulong 4294967295)
+  (print "ulong: ")
+  (println a)
+  0)
+
+;; === Mixed signed/unsigned promotion ===
+
+(defn test-signed-unsigned [] :int
+  ;; int + uint -> uint (C99)
+  (let a :int 10)
+  (let b :uint 20)
+  (print "int + uint = ")
+  (println (+ a b))
+
+  ;; Careful: int + uint with negative can wrap
+  (let c :int -1)
+  (let d :uint 1)
+  (print "-1 + 1u = ")
+  (println (+ c d))  ;; 0 due to unsigned promotion
+
+  0)
+
+;; === Size types ===
+
+(defn test-size [] :int
+  (let a :size 12345)
+  (print "size_t: ")
+  (println a)
+  0)
+
+;; === Float promotion ===
+
+(defn test-f64 [] :int
+  (let a :f64 3.141592653589793)
+  (let b :f32 2.718281828)
+  (print "f64: ")
+  (println a)
+  (print "f32: ")
+  (println b)
+  (print "f32 + f64 = ")
+  (println (+ b a))  ;; promotes to f64/double
+  0)
+
+;; === Arithmetic with fixed-width ===
+
+(defn test-fixed-arithmetic [] :int
+  (let a :i32 1000000)
+  (let b :i32 2000000)
+  (print "i32 arithmetic: ")
+  (println (* a b))  ;; 2000000000000 - would overflow i32!
+
+  (let c :i64 1000000)
+  (let d :i64 2000000)
+  (print "i64 arithmetic: ")
+  (println (* c d))  ;; 2000000000000 - fits in i64
+
+  0)
+
+(defn main [] :int
+  (println "=== C99 Type Coverage Tests ===")
+  (println "")
+
+  (println "--- Fixed-width signed ---")
+  (test-i8)
+  (test-i16)
+  (test-i32)
+  (test-i64)
+  (println "")
+
+  (println "--- Fixed-width unsigned ---")
+  (test-u8)
+  (test-u16)
+  (test-u32)
+  (test-u64)
+  (println "")
+
+  (println "--- C basic types ---")
+  (test-short)
+  (test-uint)
+  (test-ulong)
+  (println "")
+
+  (println "--- Size types ---")
+  (test-size)
+  (println "")
+
+  (println "--- Float types ---")
+  (test-f64)
+  (println "")
+
+  (println "--- Mixed signed/unsigned ---")
+  (test-signed-unsigned)
+  (println "")
+
+  (println "--- Fixed-width arithmetic ---")
+  (test-fixed-arithmetic)
+
+  (println "")
+  (println "=== All type tests complete ===")
+  0)
