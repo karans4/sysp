@@ -911,15 +911,60 @@
 
 (defvar *sysp-readtable* (make-sysp-readtable))
 
+;; Comments associated with top-level forms (form-index -> list of comment strings)
+(defvar *form-comments* (make-hash-table))
+
+(defun extract-comments-from-file (path)
+  "Read file and extract comment lines with their line numbers.
+   Returns list of (line-number . comment-text) pairs."
+  (with-open-file (in path :direction :input)
+    (loop for line = (read-line in nil nil)
+          for line-num from 1
+          while line
+          when (and (> (length line) 0)
+                    (let ((trimmed (string-left-trim '(#\Space #\Tab) line)))
+                      (and (> (length trimmed) 0)
+                           (char= (char trimmed 0) #\;))))
+          collect (cons line-num (string-left-trim '(#\Space #\Tab) line)))))
+
 (defun read-sysp-file (path)
-  (let ((*readtable* *sysp-readtable*))
-    (with-open-file (in path :direction :input)
-      (let ((forms nil)
-            (eof (gensym)))
-        (loop for form = (read in nil eof)
-              until (eq form eof)
-              do (push form forms))
-        (nreverse forms)))))
+  "Read sysp file and capture associated comments for each top-level form."
+  (clrhash *form-comments*)
+  (let ((comments (extract-comments-from-file path))
+        (forms nil)
+        (form-positions nil))  ; list of (form . start-line)
+    ;; Read forms and track their positions
+    (let ((*readtable* *sysp-readtable*))
+      (with-open-file (in path :direction :input)
+        (let ((eof (gensym)))
+          (loop for form = (let ((start-line (file-position in)))
+                            (let ((f (read in nil eof)))
+                              (unless (eq f eof)
+                                (push (cons f start-line) form-positions))
+                              f))
+                until (eq form eof)
+                do (push form forms)))))
+    (setf forms (nreverse forms))
+    (setf form-positions (nreverse form-positions))
+    ;; Associate comments with forms
+    ;; Comments before a form belong to that form
+    (loop for (form . pos) in form-positions
+          for form-idx from 0
+          do (let ((form-comments nil))
+               ;; Collect comments that appear before this form's position
+               ;; and haven't been claimed by a previous form
+               (loop for (line-num . text) in comments
+                     while (< line-num (or (and (< form-idx (1- (length form-positions)))
+                                               (cdr (nth (1+ form-idx) form-positions)))
+                                           most-positive-fixnum))
+                     when (or (null form-positions)
+                             (>= line-num (if (> form-idx 0)
+                                             (cdr (nth (1- form-idx) form-positions))
+                                             0)))
+                     do (push text form-comments))
+               (when form-comments
+                 (setf (gethash form-idx *form-comments*) (nreverse form-comments)))))
+    forms))
 
 ;;; === Macro System ===
 
@@ -2745,8 +2790,11 @@
                                 (format nil "  return ~a;~%" last-code))))))))
           (let ((body-stmts (if uses-recur
                                   (cons "  _recur_top: ;" (or stmts nil))
-                                  (or stmts nil))))
-            (push (format nil "~a ~a(~a) {~%~{~a~%~}~@[~a~]}~%"
+                                  (or stmts nil)))
+                ;; Look up any comments for this function
+                (fn-comments (cdr (assoc name *function-comments* :test #'string-equal))))
+            (push (format nil "~@[~{~a~%~}~]~a ~a(~a) {~%~{~a~%~}~@[~a~]}~%"
+                          fn-comments
                           (type-to-c ret-type)
                           c-name
                           (if (string= param-str "") "void" param-str)
@@ -3077,85 +3125,239 @@
          (raw-body (if (keywordp (first rest-forms)) (cdr rest-forms) rest-forms)))
     (setf (gethash name *macro-fns*) (list params-raw raw-body))))
 
+;; Comments to emit with functions/structs/vars
+(defvar *function-comments* nil)  ; alist (name . (comment-strings...))
+(defvar *struct-comments* nil)
+(defvar *var-comments* nil)
+
+(defun sysp-comment-to-c (comment)
+  "Convert a sysp comment (;; ...) to C comment (// ...)"
+  (let ((text (string-left-trim '(#\;) comment)))
+    (format nil "//~a" text)))
+
 (defun compile-toplevel (forms)
-  (dolist (form forms)
-    (when (listp form)
-      ;; Handle defmacro and defn-ct first (no C emission)
-      (cond
-        ((sym= (first form) "defmacro") (compile-defmacro form))
-        ((sym= (first form) "defn-ct") (compile-defn-ct form))
-        (t
-         ;; Expand macros, then compile
-         (let ((expanded (macroexpand-all form)))
-           (when (listp expanded)
-             (cond
-               ((sym= (first expanded) "struct") (compile-struct expanded))
-               ((sym= (first expanded) "foreign-struct") (compile-foreign-struct expanded))
-               ((sym= (first expanded) "enum") (compile-enum expanded))
-               ((sym= (first expanded) "defn") (compile-defn expanded))
-               ((sym= (first expanded) "extern") (compile-extern expanded))
-               ((sym= (first expanded) "include") (compile-include expanded))
-               ((sym= (first expanded) "let") (compile-toplevel-let expanded nil))
-               ((sym= (first expanded) "let-mut") (compile-toplevel-let expanded t))
-               ((sym= (first expanded) "const") (compile-toplevel-let expanded nil)) ; legacy alias
-               (t (warn "Unknown top-level form: ~a" (first expanded)))))))))))
+  (let ((form-idx 0))
+    (dolist (form forms)
+      (when (listp form)
+        ;; Get comments associated with this form
+        (let ((comments (gethash form-idx *form-comments*)))
+          ;; Handle defmacro and defn-ct first (no C emission)
+          (cond
+            ((sym= (first form) "defmacro") (compile-defmacro form))
+            ((sym= (first form) "defn-ct") (compile-defn-ct form))
+            (t
+             ;; Expand macros, then compile
+             (let ((expanded (macroexpand-all form)))
+               (when (listp expanded)
+                 ;; Queue comments to emit with definition
+                 (when comments
+                   (let ((c-comments (mapcar #'sysp-comment-to-c comments)))
+                     (cond
+                       ((sym= (first expanded) "defn")
+                        (push (cons (string (second expanded)) c-comments) *function-comments*))
+                       ((sym= (first expanded) "struct")
+                        (push (cons (string (second expanded)) c-comments) *struct-comments*))
+                       ((or (sym= (first expanded) "let")
+                            (sym= (first expanded) "let-mut")
+                            (sym= (first expanded) "const"))
+                        (push (cons (string (second expanded)) c-comments) *var-comments*)))))
+                 (cond
+                   ((sym= (first expanded) "struct") (compile-struct expanded))
+                   ((sym= (first expanded) "foreign-struct") (compile-foreign-struct expanded))
+                   ((sym= (first expanded) "enum") (compile-enum expanded))
+                   ((sym= (first expanded) "defn") (compile-defn expanded))
+                   ((sym= (first expanded) "extern") (compile-extern expanded))
+                   ((sym= (first expanded) "include") (compile-include expanded))
+                   ((sym= (first expanded) "let") (compile-toplevel-let expanded nil))
+                   ((sym= (first expanded) "let-mut") (compile-toplevel-let expanded t))
+                   ((sym= (first expanded) "const") (compile-toplevel-let expanded nil)) ; legacy alias
+                   (t (warn "Unknown top-level form: ~a" (first expanded))))))))))
+      (incf form-idx))))
 
 (defun emit-value-preamble (out)
-  "Emit the Value/Cons/Symbol type system preamble"
-  (format out "/* === Value Type System === */~%")
+  "Emit the Value/Cons/Symbol type system preamble with readable formatting"
+  ;; Type definitions
+  (format out "/*~%")
+  (format out " * Value Type System~%")
+  (format out " * Tagged union for dynamic values: nil, int, float, string, symbol, cons~%")
+  (format out " */~%~%")
+
   (format out "typedef uint32_t Symbol;~%")
-  (format out "typedef struct Cons Cons;~%")
-  (format out "typedef enum { VAL_NIL, VAL_INT, VAL_FLOAT, VAL_STR, VAL_SYM, VAL_CONS } ValueTag;~%")
-  (format out "typedef struct { ValueTag tag; union { int as_int; double as_float; const char* as_str; Symbol as_sym; Cons* as_cons; }; } Value;~%")
-  (format out "struct Cons { Value car; Value cdr; int refcount; };~%")
-  (format out "static Value val_nil(void) { return (Value){.tag = VAL_NIL}; }~%")
-  (format out "static Value val_int(int x) { Value v = {.tag = VAL_INT}; v.as_int = x; return v; }~%")
-  (format out "static Value val_float(double x) { Value v = {.tag = VAL_FLOAT}; v.as_float = x; return v; }~%")
-  (format out "static Value val_str(const char* x) { Value v = {.tag = VAL_STR}; v.as_str = x; return v; }~%")
-  (format out "static Value val_sym(Symbol x) { Value v = {.tag = VAL_SYM}; v.as_sym = x; return v; }~%")
-  (format out "static Value val_cons(Cons* x) { Value v = {.tag = VAL_CONS}; v.as_cons = x; return v; }~%")
-  (format out "static Cons* make_cons(Value car, Value cdr) { Cons* c = malloc(sizeof(Cons)); c->car = car; c->cdr = cdr; c->refcount = 1; return c; }~%")
-  ;; Refcounting
-  (format out "static Value val_retain(Value v) { if(v.tag == VAL_CONS && v.as_cons) v.as_cons->refcount++; return v; }~%")
-  (format out "static void val_release(Value v) { if(v.tag == VAL_CONS && v.as_cons && --v.as_cons->refcount == 0) { val_release(v.as_cons->car); val_release(v.as_cons->cdr); free(v.as_cons); } }~%")
-  ;; car/cdr use borrow semantics (no retain) - caller retains if storing
+  (format out "typedef struct Cons Cons;~%~%")
+
+  (format out "typedef enum {~%")
+  (format out "    VAL_NIL,~%")
+  (format out "    VAL_INT,~%")
+  (format out "    VAL_FLOAT,~%")
+  (format out "    VAL_STR,~%")
+  (format out "    VAL_SYM,~%")
+  (format out "    VAL_CONS~%")
+  (format out "} ValueTag;~%~%")
+
+  (format out "typedef struct {~%")
+  (format out "    ValueTag tag;~%")
+  (format out "    union {~%")
+  (format out "        int as_int;~%")
+  (format out "        double as_float;~%")
+  (format out "        const char* as_str;~%")
+  (format out "        Symbol as_sym;~%")
+  (format out "        Cons* as_cons;~%")
+  (format out "    };~%")
+  (format out "} Value;~%~%")
+
+  (format out "struct Cons {~%")
+  (format out "    Value car;~%")
+  (format out "    Value cdr;~%")
+  (format out "    int refcount;~%")
+  (format out "};~%~%")
+
+  ;; Value constructors
+  (format out "/* Value constructors */~%")
+  (format out "static Value val_nil(void) {~%")
+  (format out "    return (Value){.tag = VAL_NIL};~%")
+  (format out "}~%~%")
+
+  (format out "static Value val_int(int x) {~%")
+  (format out "    Value v = {.tag = VAL_INT};~%")
+  (format out "    v.as_int = x;~%")
+  (format out "    return v;~%")
+  (format out "}~%~%")
+
+  (format out "static Value val_float(double x) {~%")
+  (format out "    Value v = {.tag = VAL_FLOAT};~%")
+  (format out "    v.as_float = x;~%")
+  (format out "    return v;~%")
+  (format out "}~%~%")
+
+  (format out "static Value val_str(const char* x) {~%")
+  (format out "    Value v = {.tag = VAL_STR};~%")
+  (format out "    v.as_str = x;~%")
+  (format out "    return v;~%")
+  (format out "}~%~%")
+
+  (format out "static Value val_sym(Symbol x) {~%")
+  (format out "    Value v = {.tag = VAL_SYM};~%")
+  (format out "    v.as_sym = x;~%")
+  (format out "    return v;~%")
+  (format out "}~%~%")
+
+  (format out "static Value val_cons(Cons* x) {~%")
+  (format out "    Value v = {.tag = VAL_CONS};~%")
+  (format out "    v.as_cons = x;~%")
+  (format out "    return v;~%")
+  (format out "}~%~%")
+
+  (format out "static Cons* make_cons(Value car, Value cdr) {~%")
+  (format out "    Cons* c = malloc(sizeof(Cons));~%")
+  (format out "    c->car = car;~%")
+  (format out "    c->cdr = cdr;~%")
+  (format out "    c->refcount = 1;~%")
+  (format out "    return c;~%")
+  (format out "}~%~%")
+
+  ;; Reference counting
+  (format out "/* Reference counting */~%")
+  (format out "static Value val_retain(Value v) {~%")
+  (format out "    if (v.tag == VAL_CONS && v.as_cons)~%")
+  (format out "        v.as_cons->refcount++;~%")
+  (format out "    return v;~%")
+  (format out "}~%~%")
+
+  (format out "static void val_release(Value v) {~%")
+  (format out "    if (v.tag == VAL_CONS && v.as_cons && --v.as_cons->refcount == 0) {~%")
+  (format out "        val_release(v.as_cons->car);~%")
+  (format out "        val_release(v.as_cons->cdr);~%")
+  (format out "        free(v.as_cons);~%")
+  (format out "    }~%")
+  (format out "}~%~%")
+
+  ;; Accessors (borrow semantics)
+  (format out "/* Accessors (borrow semantics - caller retains if storing) */~%")
   (format out "static Value sysp_car(Value v) { return v.as_cons->car; }~%")
   (format out "static Value sysp_cdr(Value v) { return v.as_cons->cdr; }~%")
-  (format out "static int sysp_nilp(Value v) { return v.tag == VAL_NIL; }~%")
-  (format out "static int sysp_sym_eq(Value a, Value b) { return a.tag == VAL_SYM && b.tag == VAL_SYM && a.as_sym == b.as_sym; }~%")
-  ;; sysp_append: use direct field access instead of sysp_car/sysp_cdr to avoid double-retain
-  (format out "static Value sysp_append(Value lst, Value tail) { if(lst.tag == VAL_NIL) return val_retain(tail); return val_cons(make_cons(val_retain(lst.as_cons->car), sysp_append(lst.as_cons->cdr, tail))); }~%")
-  ;; sysp_list: build a list from n arguments (for variadic functions)
+  (format out "static int sysp_nilp(Value v) { return v.tag == VAL_NIL; }~%~%")
+
+  (format out "static int sysp_sym_eq(Value a, Value b) {~%")
+  (format out "    return a.tag == VAL_SYM && b.tag == VAL_SYM && a.as_sym == b.as_sym;~%")
+  (format out "}~%~%")
+
+  ;; List operations
+  (format out "/* List operations */~%")
+  (format out "static Value sysp_append(Value lst, Value tail) {~%")
+  (format out "    if (lst.tag == VAL_NIL)~%")
+  (format out "        return val_retain(tail);~%")
+  (format out "    return val_cons(make_cons(val_retain(lst.as_cons->car),~%")
+  (format out "                              sysp_append(lst.as_cons->cdr, tail)));~%")
+  (format out "}~%~%")
+
   (format out "static Value sysp_list(int n, ...) {~%")
-  (format out "  va_list args;~%")
-  (format out "  va_start(args, n);~%")
-  (format out "  Value result = val_nil();~%")
-  (format out "  Value* values = malloc(n * sizeof(Value));~%")
-  (format out "  for(int i = 0; i < n; i++) values[i] = va_arg(args, Value);~%")
-  (format out "  va_end(args);~%")
-  (format out "  for(int i = n - 1; i >= 0; i--) result = val_cons(make_cons(val_retain(values[i]), result));~%")
-  (format out "  free(values);~%")
-  (format out "  return result;~%")
-  (format out "}~%")
-  (format out "static uint32_t _sysp_gensym = 0x80000000;~%")
-  ;; Emit symbol name table for printing (before print_value which uses it)
+  (format out "    va_list args;~%")
+  (format out "    va_start(args, n);~%")
+  (format out "    Value result = val_nil();~%")
+  (format out "    Value* values = malloc(n * sizeof(Value));~%")
+  (format out "    for (int i = 0; i < n; i++)~%")
+  (format out "        values[i] = va_arg(args, Value);~%")
+  (format out "    va_end(args);~%")
+  (format out "    for (int i = n - 1; i >= 0; i--)~%")
+  (format out "        result = val_cons(make_cons(val_retain(values[i]), result));~%")
+  (format out "    free(values);~%")
+  (format out "    return result;~%")
+  (format out "}~%~%")
+
+  (format out "static uint32_t _sysp_gensym = 0x80000000;~%~%")
+
+  ;; Symbol table for printing
   (let ((max-id *symbol-counter*))
-    (format out "static const char* _sym_names[~d] = {\"\"" (1+ max-id))
+    (format out "static const char* _sym_names[~d] = {~%" (1+ max-id))
+    (format out "    \"\"")
     (loop for i from 1 to max-id do
       (let ((name nil))
         (maphash (lambda (n id) (when (= id i) (setf name n))) *symbol-table*)
-        (format out ", \"~a\"" (or name ""))))
-    (format out "};~%"))
+        (format out ",~%    \"~a\"" (or name ""))))
+    (format out "~%};~%~%"))
+
+  ;; Print function
   (format out "static void sysp_print_value(Value v) {~%")
-  (format out "  switch(v.tag) {~%")
-  (format out "    case VAL_NIL: printf(\"nil\"); break;~%")
-  (format out "    case VAL_INT: printf(\"%d\", v.as_int); break;~%")
-  (format out "    case VAL_FLOAT: printf(\"%f\", v.as_float); break;~%")
-  (format out "    case VAL_STR: printf(\"%s\", v.as_str); break;~%")
-  (format out "    case VAL_SYM: if(v.as_sym < sizeof(_sym_names)/sizeof(_sym_names[0])) printf(\"%s\", _sym_names[v.as_sym]); else printf(\"g%u\", v.as_sym); break;~%")
-  (format out "    case VAL_CONS: printf(\"(\"); sysp_print_value(v.as_cons->car); Value tail = v.as_cons->cdr; while(tail.tag == VAL_CONS) { printf(\" \"); sysp_print_value(tail.as_cons->car); tail = tail.as_cons->cdr; } if(tail.tag != VAL_NIL) { printf(\" . \"); sysp_print_value(tail); } printf(\")\"); break;~%")
-  (format out "  }~%}~%")
-  ;; Emit symbol table as defines
+  (format out "    switch (v.tag) {~%")
+  (format out "    case VAL_NIL:~%")
+  (format out "        printf(\"nil\");~%")
+  (format out "        break;~%")
+  (format out "    case VAL_INT:~%")
+  (format out "        printf(\"%d\", v.as_int);~%")
+  (format out "        break;~%")
+  (format out "    case VAL_FLOAT:~%")
+  (format out "        printf(\"%f\", v.as_float);~%")
+  (format out "        break;~%")
+  (format out "    case VAL_STR:~%")
+  (format out "        printf(\"%s\", v.as_str);~%")
+  (format out "        break;~%")
+  (format out "    case VAL_SYM:~%")
+  (format out "        if (v.as_sym < sizeof(_sym_names)/sizeof(_sym_names[0]))~%")
+  (format out "            printf(\"%s\", _sym_names[v.as_sym]);~%")
+  (format out "        else~%")
+  (format out "            printf(\"g%u\", v.as_sym);~%")
+  (format out "        break;~%")
+  (format out "    case VAL_CONS: {~%")
+  (format out "        printf(\"(\");~%")
+  (format out "        sysp_print_value(v.as_cons->car);~%")
+  (format out "        Value tail = v.as_cons->cdr;~%")
+  (format out "        while (tail.tag == VAL_CONS) {~%")
+  (format out "            printf(\" \");~%")
+  (format out "            sysp_print_value(tail.as_cons->car);~%")
+  (format out "            tail = tail.as_cons->cdr;~%")
+  (format out "        }~%")
+  (format out "        if (tail.tag != VAL_NIL) {~%")
+  (format out "            printf(\" . \");~%")
+  (format out "            sysp_print_value(tail);~%")
+  (format out "        }~%")
+  (format out "        printf(\")\");~%")
+  (format out "        break;~%")
+  (format out "    }~%")
+  (format out "    }~%")
+  (format out "}~%~%")
+
+  ;; Symbol defines
+  (format out "/* Symbol constants */~%")
   (maphash (lambda (name id)
              (format out "#define SYM_~a ~d~%"
                      (mangle-symbol-name name) id))
@@ -3222,7 +3424,10 @@
   (setf *sysp-gensym-counter* #x80000000)
   (setf *uses-value-type* nil)
   (setf *macro-fns* (make-hash-table :test 'equal))
-  (setf *interp-gensym-counter* 0))
+  (setf *interp-gensym-counter* 0)
+  (setf *function-comments* nil)
+  (setf *struct-comments* nil)
+  (setf *var-comments* nil))
 
 (defun compile-file-to-c (in-path out-path)
   (reset-state)
