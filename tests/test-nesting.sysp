@@ -1,0 +1,145 @@
+;;; Test: deeply nested if/do/cond with statement lifting
+
+;; if in expression position (ternary)
+(defn abs-val [x :int] :int
+  (if (< x 0) (- x) x))
+
+;; Nested if as argument to function call
+(defn nested-if-arg [x :int] :int
+  (+ (if (> x 0) x (- x))
+     (if (> x 10) 100 0)))
+
+;; if inside do, do inside if
+(defn if-do-if [x :int] :int
+  (if (> x 0)
+    (do
+      (let a :int (* x 2))
+      (if (> a 20) a 20))
+  else
+    (do
+      (let b :int (- x))
+      (if (> b 5) b 5))))
+
+;; Triple nesting: if in if in if as expression
+(defn triple-if [x :int] :int
+  (if (> x 100)
+    (if (> x 200) 3 2)
+    (if (> x 50) 1 0)))
+
+;; Nested if as argument to arithmetic
+(defn nested-arith [x :int, y :int] :int
+  (* (if (> x 0) x (- x))
+     (if (> y 0) y (- y))))
+
+;; do block as if branch, returning a value
+(defn do-in-branch [x :int] :int
+  (if (> x 0)
+    (do
+      (let a :int (+ x 1))
+      (let b :int (+ a 1))
+      (* a b))
+  else
+    0))
+
+;; Arc-style if nested in Arc-style if
+(defn nested-arc [x :int] :int
+  (if (< x 0)   (if (< x -10) -2 -1)
+      (== x 0)  0
+      (if (> x 10) 2 1)))
+
+;; cond with nested if expressions
+(defn cond-nested [x :int] :int
+  (cond
+    [(< x 0) (if (< x -100) -3 (if (< x -10) -2 -1))]
+    [(== x 0) 0]
+    [else (if (> x 100) 3 (if (> x 10) 2 1))]))
+
+;; if expression inside let initializer
+(defn if-in-let [x :int] :int
+  (let a :int (if (> x 0) x (- x)))
+  (let b :int (if (> a 10) (* a 2) a))
+  (+ a b))
+
+;; Deeply nested: if in do in if in do in if
+(defn deep-nest [x :int] :int
+  (if (> x 0)
+    (do
+      (let a :int (+ x 1))
+      (if (> a 10)
+        (do
+          (let b :int (* a 2))
+          (if (> b 50) b 50))
+      else
+        a))
+  else
+    0))
+
+;; Multiple if expressions in one arithmetic expression
+(defn multi-if-expr [a :int, b :int, c :int] :int
+  (+ (+ (if (> a 0) a 0)
+        (if (> b 0) b 0))
+     (if (> c 0) c 0)))
+
+(defn main [] :int
+  ;; abs-val
+  (println (abs-val -7))      ;; 7
+  (println (abs-val 3))       ;; 3
+
+  ;; nested-if-arg
+  (println (nested-if-arg 15))  ;; 15 + 100 = 115
+  (println (nested-if-arg -3))  ;; 3 + 0 = 3
+  (println (nested-if-arg 5))   ;; 5 + 0 = 5
+
+  ;; if-do-if
+  (println (if-do-if 15))    ;; a=30 > 20, return 30
+  (println (if-do-if 5))     ;; a=10 <= 20, return 20
+  (println (if-do-if -3))    ;; b=3 <= 5, return 5
+  (println (if-do-if -10))   ;; b=10 > 5, return 10
+
+  ;; triple-if
+  (println (triple-if 250))  ;; 3
+  (println (triple-if 150))  ;; 2
+  (println (triple-if 75))   ;; 1
+  (println (triple-if 25))   ;; 0
+
+  ;; nested-arith
+  (println (nested-arith 3 -4))   ;; 3 * 4 = 12
+  (println (nested-arith -5 -6))  ;; 5 * 6 = 30
+
+  ;; do-in-branch
+  (println (do-in-branch 10))  ;; a=11 b=12 -> 132
+  (println (do-in-branch -5))  ;; 0
+
+  ;; nested-arc
+  (println (nested-arc -20))  ;; -2
+  (println (nested-arc -5))   ;; -1
+  (println (nested-arc 0))    ;; 0
+  (println (nested-arc 5))    ;; 1
+  (println (nested-arc 20))   ;; 2
+
+  ;; cond-nested
+  (println (cond-nested -200)) ;; -3
+  (println (cond-nested -50))  ;; -2
+  (println (cond-nested -5))   ;; -1
+  (println (cond-nested 0))    ;; 0
+  (println (cond-nested 5))    ;; 1
+  (println (cond-nested 50))   ;; 2
+  (println (cond-nested 200))  ;; 3
+
+  ;; if-in-let
+  (println (if-in-let 7))     ;; a=7 b=7 -> 14
+  (println (if-in-let -3))    ;; a=3 b=3 -> 6
+  (println (if-in-let 20))    ;; a=20 b=40 -> 60
+
+  ;; deep-nest
+  (println (deep-nest 20))    ;; a=21>10, b=42<=50 -> 50
+  (println (deep-nest 30))    ;; a=31 b=62 > 50 -> 62
+  (println (deep-nest 5))     ;; a=6 <= 10 -> 6
+  (println (deep-nest -5))    ;; 0
+
+  ;; multi-if-expr
+  (println (multi-if-expr 1 2 3))     ;; 6
+  (println (multi-if-expr -1 2 -3))   ;; 0 + 2 + 0 = 2
+  (println (multi-if-expr -1 -2 -3))  ;; 0
+
+  0)
