@@ -1698,32 +1698,91 @@
     (declare (ignore tp))
     (values (format nil "(~~~a)" val) (make-int-type))))
 
+(defun parse-if-branches (forms &key arc-style)
+  "Parse forms after (if cond ...) into (values then-forms elif-list else-forms).
+   elif-list is ((cond . body-forms) ...).
+   Handles: keyword else/elif, positional else (2 forms), Arc-style pairs (arc-style t).
+   Styles cannot be mixed: keywords or implicit pairs, not both."
+  (let* ((has-elif (some (lambda (x) (and (symbolp x) (sym= x "elif"))) forms))
+         (has-else (some (lambda (x) (and (symbolp x) (sym= x "else"))) forms))
+         (has-keywords (or has-elif has-else)))
+    ;; Positional else: exactly 2 forms, no keywords
+    (when (and (not has-keywords) (= (length forms) 2))
+      (return-from parse-if-branches
+        (values (list (first forms)) nil (list (second forms)))))
+    ;; Arc-style: no keywords, >2 forms -> alternating cond/expr pairs
+    (when (and arc-style (not has-keywords) (> (length forms) 2))
+      (let ((then-form (first forms))
+            (remaining (rest forms))
+            (pairs nil))
+        (loop while (> (length remaining) 1)
+              do (let ((c (pop remaining))
+                       (e (pop remaining)))
+                   (push (cons c (list e)) pairs)))
+        (return-from parse-if-branches
+          (values (list then-form) (nreverse pairs) remaining))))
+    ;; Keyword-based parsing
+    (let ((then-forms nil)
+          (elifs nil)
+          (else-forms nil)
+          (state :then)
+          (current nil)
+          (elif-cond nil))
+      (dolist (f forms)
+        (cond
+          ((and (symbolp f) (sym= f "elif"))
+           (case state
+             (:then (setf then-forms (nreverse current)))
+             (:elif-body (push (cons elif-cond (nreverse current)) elifs))
+             (:elif-cond (error "sysp: elif without body before next elif")))
+           (setf state :elif-cond current nil))
+          ((and (symbolp f) (sym= f "else"))
+           (case state
+             (:then (setf then-forms (nreverse current)))
+             (:elif-body (push (cons elif-cond (nreverse current)) elifs))
+             (:elif-cond (error "sysp: elif without body before else")))
+           (setf state :else current nil))
+          ((eq state :elif-cond)
+           (setf elif-cond f state :elif-body current nil))
+          (t (push f current))))
+      (when (eq state :elif-cond)
+        (error "sysp: elif at end of if without condition/body"))
+      (case state
+        (:then (setf then-forms (nreverse current)))
+        (:elif-body (push (cons elif-cond (nreverse current)) elifs))
+        (:else (setf else-forms (nreverse current))))
+      (values then-forms (nreverse elifs) else-forms))))
+
 (defun compile-if-expr (form env)
-  "(if cond then else) or (if cond then else else-expr) -> ternary"
+  "(if cond then [elif cond2 then2]... [else else-expr]) -> ternary"
   (multiple-value-bind (cond-code ct) (compile-expr (second form) env)
     (declare (ignore ct))
     (multiple-value-bind (then-code then-type) (compile-expr (third form) env)
-      ;; Check for else keyword (statement-style) vs positional (expression-style)
-      (let ((else-form (if (and (fourth form) (symbolp (fourth form))
-                                (sym= (fourth form) "else"))
-                           (fifth form)    ; skip 'else' keyword
-                           (fourth form)))) ; positional
-        (if else-form
-            (multiple-value-bind (else-code else-type) (compile-expr else-form env)
-              ;; Unify branch types: same → use directly, different → union
+      (let ((rest (cdddr form)))
+        (if (null rest)
+            (values (format nil "(~a ? ~a : 0)" cond-code then-code) then-type)
+            ;; Get else expression: elif recurses, else/positional are direct
+            (multiple-value-bind (else-code else-type)
+                (cond
+                  ((and (symbolp (first rest)) (sym= (first rest) "elif"))
+                   (compile-if-expr (list* 'if (cdr rest)) env))
+                  ((and (symbolp (first rest)) (sym= (first rest) "else"))
+                   (compile-expr (second rest) env))
+                  ;; Multiple forms, no keywords -> Arc-style pairs
+                  ((> (length rest) 1)
+                   (compile-if-expr (list* 'if rest) env))
+                  ;; Single form -> positional else
+                  (t (compile-expr (first rest) env)))
               (let ((result-type (if (type-equal-p then-type else-type)
                                      then-type
                                      (make-union-type (list then-type else-type)))))
                 (if (union-type-p result-type)
-                    ;; Wrap each branch into the union
                     (values (format nil "(~a ? ~a : ~a)" cond-code
                                     (wrap-as-union then-code then-type result-type)
                                     (wrap-as-union else-code else-type result-type))
                             result-type)
                     (values (format nil "(~a ? ~a : ~a)" cond-code then-code else-code)
-                            result-type))))
-            (values (format nil "(~a ? ~a : 0)" cond-code then-code)
-                    then-type))))))
+                            result-type)))))))))
 
 (defun compile-do-expr (form env)
   "(do expr...) -> GNU statement expression, value is last"
@@ -1767,31 +1826,50 @@
                                 result-type))))))))))
 
 (defun compile-if-stmt-returning (form env target)
-  "(if cond then [else] else) -> if statement assigning to target"
+  "(if cond then [elif cond2 then2]... [else else]) -> if/else-if chain assigning to target"
   (multiple-value-bind (cond-code ct) (compile-expr (second form) env)
     (declare (ignore ct))
-    (let* ((else-form (if (and (fourth form) (symbolp (fourth form))
-                               (sym= (fourth form) "else"))
-                          (fifth form)
-                          (fourth form))))
-      (multiple-value-bind (then-type then-stmts)
-          (compile-expr-returning (third form) env target)
-        (multiple-value-bind (else-type else-stmts)
-            (if else-form
-                (compile-expr-returning else-form env target)
-                (values then-type (list (format nil "  ~a = 0;" target))))
-          ;; Compute result type: skip :void branches (recur/return)
-          (let* ((result-type (cond
-                                ((eq then-type :void) else-type)
-                                ((eq else-type :void) then-type)
-                                ((type-equal-p then-type else-type) then-type)
-                                (t (make-union-type (list then-type else-type)))))
-                 (result (list (format nil "  if (~a) {" cond-code))))
-            (dolist (s then-stmts) (setf result (append result (list (format nil "  ~a" s)))))
+    (multiple-value-bind (then-forms elifs else-forms) (parse-if-branches (cddr form) :arc-style t)
+      (let ((all-types nil)
+            (result nil))
+        ;; Then branch
+        (let ((then-form (if (= (length then-forms) 1) (first then-forms) (cons 'do then-forms))))
+          (multiple-value-bind (then-type then-stmts) (compile-expr-returning then-form env target)
+            (push then-type all-types)
+            (setf result (list (format nil "  if (~a) {" cond-code)))
+            (dolist (s then-stmts) (setf result (append result (list (format nil "  ~a" s)))))))
+        ;; Elif branches
+        (dolist (elif-pair elifs)
+          (let ((elif-cond (car elif-pair))
+                (elif-body (cdr elif-pair)))
+            (multiple-value-bind (econd-code ect) (compile-expr elif-cond env)
+              (declare (ignore ect))
+              (let ((elif-form (if (= (length elif-body) 1) (first elif-body) (cons 'do elif-body))))
+                (multiple-value-bind (elif-type elif-stmts) (compile-expr-returning elif-form env target)
+                  (push elif-type all-types)
+                  (setf result (append result (list (format nil "  } else if (~a) {" econd-code))))
+                  (dolist (s elif-stmts) (setf result (append result (list (format nil "  ~a" s))))))))))
+        ;; Else branch
+        (let ((else-form (cond
+                           ((= (length else-forms) 1) (first else-forms))
+                           (else-forms (cons 'do else-forms))
+                           (t nil))))
+          (multiple-value-bind (else-type else-stmts)
+              (if else-form
+                  (compile-expr-returning else-form env target)
+                  (values (first all-types) (list (format nil "  ~a = 0;" target))))
+            (push else-type all-types)
             (setf result (append result (list "  } else {")))
             (dolist (s else-stmts) (setf result (append result (list (format nil "  ~a" s)))))
-            (setf result (append result (list "  }")))
-            (values result-type result)))))))
+            (setf result (append result (list "  }")))))
+        ;; Compute result type from all branches
+        (let ((result-type (reduce (lambda (a b)
+                                     (cond ((eq a :void) b)
+                                           ((eq b :void) a)
+                                           ((type-equal-p a b) a)
+                                           (t (make-union-type (list a b)))))
+                                   (nreverse all-types))))
+          (values result-type result))))))
 
 (defun compile-do-stmt-returning (form env target)
   "(do stmt... expr) -> statements, last expr assigned to target"
@@ -2402,8 +2480,11 @@
     ((and (listp form) (sym= (first form) "block"))
      (compile-block-stmt form env))
     ((and (listp form) (sym= (first form) "do"))
-     ;; do as statement: just compile all sub-forms as statements
-     (compile-body (rest form) env))
+     ;; do with binding spec [var start end] -> for loop
+     (if (and (listp (second form)) (symbolp (first (second form))))
+         (compile-for-stmt form env)
+         ;; do as block: compile all sub-forms as statements
+         (compile-body (rest form) env)))
     (t (let ((*pending-stmts* nil))
          (multiple-value-bind (code tp) (compile-expr form env)
            (declare (ignore tp))
@@ -2522,32 +2603,36 @@
              (list (format nil "  printf(\"~a\\n\", ~a);" fmt arg))))))))
 
 (defun compile-if-stmt (form env)
-  "(if cond then-body...) or (if cond then-body... else else-body...)
-   Also: (if cond then else) positional (no else keyword, exactly 2 forms)"
+  "(if cond then-body... [elif cond2 body2...]... [else else-body...])
+   Also: (if cond then else) positional (no keywords, exactly 2 forms)"
   (multiple-value-bind (cond-code ct) (compile-expr (second form) env)
     (declare (ignore ct))
-    (let* ((rest (cddr form))
-           (else-pos (position-if (lambda (x) (and (symbolp x) (sym= x "else"))) rest))
-           ;; Positional else: no keyword, exactly 2 forms after cond
-           (positional-else (and (not else-pos) (= (length rest) 2)))
-           (then-forms (cond (else-pos (subseq rest 0 else-pos))
-                             (positional-else (list (first rest)))
-                             (t rest)))
-           (else-forms (cond (else-pos (subseq rest (1+ else-pos)))
-                             (positional-else (list (second rest)))
-                             (t nil))))
-      (let ((then-env (make-env :parent env))
-            (else-env (make-env :parent env)))
-        (let ((result (list (format nil "  if (~a) {" cond-code))))
+    (multiple-value-bind (then-forms elifs else-forms) (parse-if-branches (cddr form))
+      (let ((result (list (format nil "  if (~a) {" cond-code))))
+        ;; Then body
+        (let ((then-env (make-env :parent env)))
           (dolist (s (compile-body then-forms then-env))
             (push (format nil "  ~a" s) result))
-          (push "  }" result)
-          (when else-forms
+          (push "  }" result))
+        ;; Elif chains
+        (dolist (elif-pair elifs)
+          (let ((elif-cond (car elif-pair))
+                (elif-body (cdr elif-pair))
+                (elif-env (make-env :parent env)))
+            (multiple-value-bind (econd-code ect) (compile-expr elif-cond env)
+              (declare (ignore ect))
+              (setf (car result) (format nil "  } else if (~a) {" econd-code))
+              (dolist (s (compile-body elif-body elif-env))
+                (push (format nil "  ~a" s) result))
+              (push "  }" result))))
+        ;; Else body
+        (when else-forms
+          (let ((else-env (make-env :parent env)))
             (setf (car result) "  } else {")
             (dolist (s (compile-body else-forms else-env))
               (push (format nil "  ~a" s) result))
-            (push "  }" result))
-          (nreverse result))))))
+            (push "  }" result)))
+        (nreverse result)))))
 
 (defun compile-when-stmt (form env)
   "(when cond body...)"

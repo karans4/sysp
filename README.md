@@ -28,8 +28,8 @@ Most numerical computing is either written in C/CUDA (fast but verbose) or Pytho
 ```lisp
 (defn clamp [x :int, lo :int, hi :int] :int
   (if (< x lo) lo
-  else (if (> x hi) hi
-  else x)))
+      (> x hi) hi
+      x))
 ```
 
 Compiles to:
@@ -38,12 +38,10 @@ int clamp(int x, int lo, int hi) {
   int _tmp1;
   if ((x < lo)) {
     _tmp1 = lo;
+  } else if ((x > hi)) {
+    _tmp1 = hi;
   } else {
-    if ((x > hi)) {
-      _tmp1 = hi;
-    } else {
-      _tmp1 = x;
-    }
+    _tmp1 = x;
   }
   return _tmp1;
 }
