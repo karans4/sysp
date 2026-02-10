@@ -28,22 +28,20 @@ Most numerical computing is either written in C/CUDA (fast but verbose) or Pytho
 ```lisp
 (defn clamp [x :int, lo :int, hi :int] :int
   (if (< x lo) lo
-      (> x hi) hi
-      x))
+  elif (> x hi) hi
+  else x))
 ```
 
 Compiles to:
 ```c
 int clamp(int x, int lo, int hi) {
-  int _tmp1;
   if ((x < lo)) {
-    _tmp1 = lo;
+    return lo;
   } else if ((x > hi)) {
-    _tmp1 = hi;
+    return hi;
   } else {
-    _tmp1 = x;
+    return x;
   }
-  return _tmp1;
 }
 ```
 
@@ -65,9 +63,8 @@ Compiles to:
 ```c
 int factorial(int n, int acc) {
   _recur_top: ;
-  int _tmp1;
   if ((n == 0)) {
-    _tmp1 = acc;
+    return acc;
   } else {
     int __recur_0 = (n - 1);
     int __recur_1 = (acc * n);
@@ -75,7 +72,6 @@ int factorial(int n, int acc) {
     acc = __recur_1;
     goto _recur_top;
   }
-  return _tmp1;
 }
 
 int main(void) {

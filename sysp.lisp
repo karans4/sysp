@@ -1358,12 +1358,14 @@
     ;; Statement-like: compile-stmt-returning returns stmts directly
     ((statement-like-p form)
      (compile-stmt-returning form env target))
-    ;; Simple expression: isolate pending stmts, compile, assign to target
+    ;; Simple expression: isolate pending stmts, compile, assign/return
     (t (let ((*pending-stmts* nil))
          (multiple-value-bind (code type) (compile-expr form env)
            (values type
                    (append *pending-stmts*
-                           (list (format nil "  ~a = ~a;" target code)))))))))
+                           (list (if (string= target ":return")
+                                     (format nil "  return ~a;" code)
+                                     (format nil "  ~a = ~a;" target code))))))))))
 
 ;; Compile a statement-like form so its value is assigned to target.
 ;; Returns (values type statements-list).
@@ -1577,6 +1579,12 @@
       ((sym= head "sym") (compile-sym-literal form env))
       ((sym= head "sym-eq?") (compile-sym-eq form env))
       ((sym= head "gensym") (compile-gensym-expr form env))
+      ;; recur in expression position = not tail position
+      ((sym= head "recur")
+       (error "sysp: recur must be in tail position (last expression of a function, or branch of if/cond in tail position)"))
+      ;; return in expression position
+      ((sym= head "return")
+       (error "sysp: return cannot be used as an expression"))
       ;; Otherwise: function/constructor call
       (t (compile-call form env)))))
 
@@ -1857,7 +1865,9 @@
           (multiple-value-bind (else-type else-stmts)
               (if else-form
                   (compile-expr-returning else-form env target)
-                  (values (first all-types) (list (format nil "  ~a = 0;" target))))
+                  (values (first all-types) (list (if (string= target ":return")
+                                                      "  return 0;"
+                                                      (format nil "  ~a = 0;" target)))))
             (push else-type all-types)
             (setf result (append result (list "  } else {")))
             (dolist (s else-stmts) (setf result (append result (list (format nil "  ~a" s)))))
@@ -3020,39 +3030,47 @@
             ;; If the last form is statement-like (if/cond/do/let) and uses recur,
             ;; use compile-expr-returning to handle branches that recur (goto)
             ;; vs branches that produce values (assign to temp).
-            (if (and uses-recur (statement-like-p last-form))
-                ;; Statement-like with recur: compile to temp, return temp
-                (let* ((tmp (fresh-tmp))
-                       (tmp-decl (format nil "  ~a ~a;" (type-to-c ret-type) tmp)))
-                  (multiple-value-bind (type ret-stmts)
-                      (compile-expr-returning last-form env tmp)
-                    (declare (ignore type))
-                    (setf stmts (append stmts (list tmp-decl) ret-stmts))
-                    (let ((releases (when *uses-value-type* (emit-releases env))))
-                      (setf return-stmt
-                            (if (and *uses-value-type* releases)
-                                (format nil "~{~a~%~}  return ~a;~%" releases tmp)
-                                (format nil "  return ~a;~%" tmp))))))
-                ;; Normal: compile last form as expression
-                (let ((*pending-stmts* nil))
-                  (multiple-value-bind (last-code lt) (compile-expr last-form env)
-                    (declare (ignore lt))
-                    ;; Any statements lifted from the return expression
-                    (when *pending-stmts*
-                      (setf stmts (append stmts *pending-stmts*)))
-                    (let* ((releases (when *uses-value-type* (emit-releases env)))
-                           (ret-var (and (symbolp last-form)
-                                         (member (sanitize-name (string last-form))
-                                                 (env-releases env) :test #'equal))))
-                      (setf return-stmt
-                            (if (and ret-var *uses-value-type* releases)
-                                (format nil "  val_retain(~a);~%~{~a~%~}  return ~a;~%"
-                                        (sanitize-name (string last-form))
-                                        releases
-                                        last-code)
-                                (if (and *uses-value-type* releases)
-                                    (format nil "~{~a~%~}  return ~a;~%" releases last-code)
-                                    (format nil "  return ~a;~%" last-code)))))))))
+            (cond
+              ;; Return unlifting: statement-like, no Value cleanup needed
+              ;; Branches emit "return expr;" directly, no temp variable
+              ((and (statement-like-p last-form) (not *uses-value-type*))
+               (multiple-value-bind (type ret-stmts)
+                   (compile-expr-returning last-form env ":return")
+                 (declare (ignore type))
+                 (setf stmts (append stmts ret-stmts))))
+              ;; Statement-like with Value cleanup: need temp for releases before return
+              ((statement-like-p last-form)
+               (let* ((tmp (fresh-tmp))
+                      (tmp-decl (format nil "  ~a ~a;" (type-to-c ret-type) tmp)))
+                 (multiple-value-bind (type ret-stmts)
+                     (compile-expr-returning last-form env tmp)
+                   (declare (ignore type))
+                   (setf stmts (append stmts (list tmp-decl) ret-stmts))
+                   (let ((releases (when *uses-value-type* (emit-releases env))))
+                     (setf return-stmt
+                           (if (and *uses-value-type* releases)
+                               (format nil "~{~a~%~}  return ~a;~%" releases tmp)
+                               (format nil "  return ~a;~%" tmp)))))))
+              ;; Normal: compile last form as expression
+              (t
+               (let ((*pending-stmts* nil))
+                 (multiple-value-bind (last-code lt) (compile-expr last-form env)
+                   (declare (ignore lt))
+                   (when *pending-stmts*
+                     (setf stmts (append stmts *pending-stmts*)))
+                   (let* ((releases (when *uses-value-type* (emit-releases env)))
+                          (ret-var (and (symbolp last-form)
+                                        (member (sanitize-name (string last-form))
+                                                (env-releases env) :test #'equal))))
+                     (setf return-stmt
+                           (if (and ret-var *uses-value-type* releases)
+                               (format nil "  val_retain(~a);~%~{~a~%~}  return ~a;~%"
+                                       (sanitize-name (string last-form))
+                                       releases
+                                       last-code)
+                               (if (and *uses-value-type* releases)
+                                   (format nil "~{~a~%~}  return ~a;~%" releases last-code)
+                                   (format nil "  return ~a;~%" last-code))))))))))
           (let ((body-stmts (if uses-recur
                                   (cons "  _recur_top: ;" (or stmts nil))
                                   (or stmts nil)))
