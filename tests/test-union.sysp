@@ -1,0 +1,31 @@
+;;; Test: Union types
+
+;; Define a union type
+(deftype IntOrFloat (:union :int :float))
+
+;; Wrap values into the union using generated constructors
+(defn make-int-val [x :int] :IntOrFloat
+  (IntOrFloat-from-int x))
+
+(defn make-float-val [x :float] :IntOrFloat
+  (IntOrFloat-from-float x))
+
+;; Query the tag at runtime, extract variants
+(defn print-int-union [v :IntOrFloat] :void
+  (println (as :int v)))
+
+(defn print-float-union [v :IntOrFloat] :void
+  (printf "%f" (as :float v)))
+
+;; Test tag enum values
+(defn test-tag [v :IntOrFloat] :int
+  (runtype v))
+
+(defn main [] :int
+  (let-mut v :IntOrFloat (make-int-val 42))
+  (println (test-tag v))        ;; 0 (TAG_INT)
+  (print-int-union v)           ;; 42
+
+  (set! v (make-float-val 3.14))
+  (println (test-tag v))        ;; 1 (TAG_FLOAT)
+  0)

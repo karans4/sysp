@@ -1,17 +1,49 @@
-;;; Test: GCC optimization of local cons allocations
-;;;
-;;; Investigates whether GCC -O3 can eliminate malloc/free for cons cells
-;;; that don't escape their local scope. Result: GCC computes the answer
-;;; at compile time but cannot eliminate the allocations due to malloc's
-;;; observable side effects. sysp will need escape analysis for this.
+;;; Test: deftype, union types, and recur together
 
-(defn local-cons-sum [] :int
-  ;; Create a cons, use it locally, release it
-  ;; Can GCC eliminate the malloc/free?
-  (let xs (cons 1 (cons 2 (cons 3 '()))))
-  (let sum (+ (car xs) (+ (car (cdr xs)) (car (cdr (cdr xs))))))
-  sum)
+;; Simple type aliases
+(deftype Nat :int)
+(deftype Real :float)
+
+;; Union type with constructors
+(deftype NumVal (:union :int :float))
+
+;; GCD using recur — no dummy return
+(defn gcd [a :Nat, b :Nat] :Nat
+  (if (== b 0)
+    a
+    (recur b (% a b))))
+
+;; Collatz sequence length using recur
+(defn collatz-len [n :int, steps :int] :int
+  (if (== n 1)
+    steps
+    (if (== (% n 2) 0)
+      (recur (/ n 2) (+ steps 1))
+      (recur (+ (* 3 n) 1) (+ steps 1)))))
+
+;; Union wrapping
+(defn wrap-int [x :int] :NumVal
+  (NumVal-from-int x))
+
+(defn wrap-float [x :float] :NumVal
+  (NumVal-from-float x))
+
+(defn unwrap-int [v :NumVal] :int
+  (as :int v))
 
 (defn main [] :int
-  (println (local-cons-sum))  ;; should print 6
+  ;; Type aliases
+  (println (gcd 48 18))           ;; 6
+  (println (gcd 100 75))          ;; 25
+
+  ;; Recur in nested if
+  (println (collatz-len 27 0))    ;; 111
+
+  ;; Union types
+  (let v :NumVal (wrap-int 42))
+  (println (runtype v))           ;; 0 (TAG_INT)
+  (println (unwrap-int v))        ;; 42
+
+  (let w :NumVal (wrap-float 2.5))
+  (println (runtype w))           ;; 1 (TAG_FLOAT)
   0)

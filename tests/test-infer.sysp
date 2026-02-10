@@ -1,29 +1,42 @@
-;;; Test: HM type inference (constraint generation)
+;;; Test: HM type inference
 ;;; Functions without type annotations should have types inferred
 
-;; Test 1: Infer int params from arithmetic usage
+;; Infer int params from arithmetic usage
 (defn add [a, b] :int
   (+ a b))
 
-;; Test 2: Infer return type from body
+;; Infer return type from body
 (defn square [x :int]
   (* x x))
 
-;; Test 3: Infer both params and return type
+;; Infer both params and return type
 (defn double [n]
   (+ n n))
 
-;; Test 4: Infer float from literal usage
+;; Infer float from literal usage
 (defn half [x :float] :float
   (/ x 2.0))
 
-;; Test 5: Multiple calls constrain types
+;; Multiple calls constrain types
 (defn apply-twice [x]
   (add (add x x) (add x x)))
+
+;; Recursive function with recur — no dummy return needed
+(defn sum-to [n :int, acc :int] :int
+  (if (<= n 0)
+    acc
+    (recur (- n 1) (+ acc n))))
+
+;; Inferred param type from comparison + arithmetic
+(defn abs-val [x]
+  (if (< x 0) (- x) x))
 
 (defn main [] :int
   (println (add 3 4))           ;; 7
   (println (square 5))          ;; 25
   (println (double 10))         ;; 20
   (println (apply-twice 2))     ;; 8
+  (println (sum-to 100 0))      ;; 5050
+  (println (abs-val -42))       ;; 42
+  (println (abs-val 17))        ;; 17
   0)

@@ -1,0 +1,34 @@
+;;; Test: if+recur without dummy returns
+;;; Factorial and other recursive patterns should work without trailing 0
+
+;; Factorial — the classic test case
+(defn factorial [n :int, acc :int] :int
+  (if (== n 0)
+    acc
+    (recur (- n 1) (* acc n))))
+
+;; Fibonacci with recur (two accumulators)
+(defn fib [n :int, a :int, b :int] :int
+  (if (== n 0)
+    a
+    (recur (- n 1) b (+ a b))))
+
+;; Sum from 1 to n
+(defn sum-to [n :int, acc :int] :int
+  (if (<= n 0)
+    acc
+    (recur (- n 1) (+ acc n))))
+
+;; Power: base^exp via recur
+(defn power [base :int, exp :int, acc :int] :int
+  (if (== exp 0)
+    acc
+    (recur base (- exp 1) (* acc base))))
+
+(defn main [] :int
+  (println (factorial 5 1))     ;; 120
+  (println (factorial 10 1))    ;; 3628800
+  (println (fib 10 0 1))        ;; 55
+  (println (sum-to 100 0))      ;; 5050
+  (println (power 2 10 1))      ;; 1024
+  0)

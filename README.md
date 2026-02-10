@@ -20,31 +20,69 @@ Most numerical computing is either written in C/CUDA (fast but verbose) or Pytho
 - **Symbols** as interned integers with compile-time symbol table
 - **Structs, enums, tuples, vectors** with generated C type definitions
 - **Foreign function interface** - `extern` declarations, pointer types, casts
-- **Type inference** - Hindley-Milner unification engine (WIP: constraint generation, monomorphization)
+- **Type inference** - Hindley-Milner unification with constraint generation
+- **Tagged unions** - `deftype`, `(:union ...)`, `runtype`/`as` for runtime dispatch
 
-## Example
+## Examples
+
+```lisp
+(defn clamp [x :int, lo :int, hi :int] :int
+  (if (< x lo) lo
+  else (if (> x hi) hi
+  else x)))
+```
+
+Compiles to:
+```c
+int clamp(int x, int lo, int hi) {
+  int _tmp1;
+  if ((x < lo)) {
+    _tmp1 = lo;
+  } else {
+    if ((x > hi)) {
+      _tmp1 = hi;
+    } else {
+      _tmp1 = x;
+    }
+  }
+  return _tmp1;
+}
+```
+
+The more Lisp features you use (recursion, lambdas, closures, polymorphism, cons cells), the less the output resembles "normal" C. But it's always the same algorithm you'd write by hand; the compiler just does the mechanical work for you.
 
 ```lisp
 (defn factorial [n :int, acc :int] :int
-  (if (== n 0) (return acc)
-  else (recur (- n 1) (* acc n)))
-  0)
+  (if (== n 0)
+    acc
+  else
+    (recur (- n 1) (* acc n))))
 
-(defn main []
-  (println (factorial 12 1)))
+(defn main [] :int
+  (println (factorial 12 1))
+  0)
 ```
 
 Compiles to:
 ```c
 int factorial(int n, int acc) {
-_recur_top:
-    if ((n == 0)) { return acc; }
-    else { int _t0 = (n - 1); int _t1 = (acc * n); n = _t0; acc = _t1; goto _recur_top; }
-    return 0;
+  _recur_top: ;
+  int _tmp1;
+  if ((n == 0)) {
+    _tmp1 = acc;
+  } else {
+    int __recur_0 = (n - 1);
+    int __recur_1 = (acc * n);
+    n = __recur_0;
+    acc = __recur_1;
+    goto _recur_top;
+  }
+  return _tmp1;
 }
+
 int main(void) {
-    printf("%d\n", factorial(12, 1));
-    return 0;
+  printf("%d\n", factorial(12, 1));
+  return 0;
 }
 ```
 
@@ -68,22 +106,25 @@ cc tictactoe.c -lraylib -lm -o tictactoe
 
 ## Architecture
 
-The compiler is a single Common Lisp file (`sysp.lisp`, ~3000 lines):
+The compiler is a single Common Lisp file (`sysp.lisp`, ~3600 lines):
 
 1. **Read** - custom readtable for `[]` arrays and backquote syntax
 2. **Macro-expand** - recursive expansion of `defmacro` + built-in macros (`->`, `->>`, `when-let`, `dotimes`, etc.)
-3. **Infer** *(WIP)* - Hindley-Milner type inference with unification, generalize/instantiate for let-polymorphism
+3. **Infer** - Hindley-Milner type inference with unification, generalize/instantiate for let-polymorphism
 4. **Compile** - AST → C code generation with type tracking
 5. **Emit** - headers, type declarations, forward decls, function bodies
 
-## Type System (in progress)
+## Type System
 
-The goal is gradual typing with aggressive monomorphization:
+Gradual typing with Hindley-Milner inference and tagged unions:
 
 - Unresolved types box into `Value` (tagged union: int, float, string, symbol, cons)
 - Resolved types generate specialized C: `Vector_int`, `Fn_int_int`, `Cons_int_symbol`
 - The inference engine supports type variables, structural unification, occurs check, and let-polymorphism
-- `Value` acts as the "any" type - unifies with everything, zero annotation burden
+- `Value` acts as the "any" type, unifies with everything, zero annotation burden
+- `deftype` for named type aliases and union types: `(deftype NumVal (:union :int :float))`
+- if/cond branches with different types automatically produce union types
+- `runtype` for runtime tag query, `as` for variant extraction
 
 ## Roadmap
 
@@ -91,10 +132,10 @@ The goal is gradual typing with aggressive monomorphization:
 - [x] Macro system (defmacro + compile-time eval)
 - [x] Cons cells with refcounting
 - [x] Symbols, quasiquote, splice
-- [ ] Type inference (constraint generation from AST)
+- [x] Type inference (HM unification, constraint generation)
+- [x] Tagged unions (sum types, deftype, runtype/as)
 - [ ] Monomorphization (specialized C output per concrete type)
 - [ ] Pattern matching / destructuring
-- [ ] Tagged unions (sum types)
 - [ ] Borrow checker (linear types)
 - [ ] CUDA backend (GPU kernels from Lisp)
 - [ ] HPC primitives (SIMD, parallel loops)

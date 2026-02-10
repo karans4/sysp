@@ -1,0 +1,17 @@
+;;; Test: deftype — named type aliases
+
+;; Simple alias
+(deftype Int :int)
+(deftype Float :float)
+
+;; Use aliases in function signatures
+(defn add-ints [a :Int, b :Int] :Int
+  (+ a b))
+
+;; Pointer alias
+(deftype IntPtr (:ptr :int))
+
+(defn main [] :int
+  (println (add-ints 3 7))     ;; 10
+  (println (add-ints 100 23))  ;; 123
+  0)

@@ -1,0 +1,19 @@
+;;; Test: Automatic branch type unification
+;;; When if/cond branches return different types, the result is a union
+
+(deftype IntOrFloat (:union :int :float))
+
+;; if with different branch types should produce union
+(defn choose [flag :int] :IntOrFloat
+  (if (== flag 0)
+    (IntOrFloat-from-int 42)
+    (IntOrFloat-from-float 3.14)))
+
+(defn main [] :int
+  (let v :IntOrFloat (choose 0))
+  (println (runtype v))        ;; 0 (int)
+  (println (as :int v))        ;; 42
+
+  (let w :IntOrFloat (choose 1))
+  (println (runtype w))        ;; 1 (float)
+  0)

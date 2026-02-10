@@ -6,134 +6,120 @@
 (in-package :sysp)
 
 ;;; === Types ===
+;;; Types are s-expressions:
+;;;   Primitives: :int, :float, :bool, :void, :str, :char, :value, :nil, ...
+;;;   Compound:   (:ptr :int), (:fn (:int :int) :int), (:array :int 10)
+;;;              (:struct "Point"), (:enum "Color"), (:list :int)
+;;;              (:cons :int :str), (:vector :float), (:tuple :int :str)
+;;;              (:variadic :int)
+;;;   Type vars:  (:tvar 1), (:tvar 2), ...
 
-(defstruct sysp-type
-  (kind nil) ; :int :float :bool :void :str :char :struct :vector :tuple :fn :ptr :symbol :value :cons :unknown
-  (name nil)
-  (params nil)) ; type params (element types for vector/tuple, arg+ret for fn, pointee for ptr)
+;; Primitive type constructors — just return the keyword
+(defun make-char-type () :char)
+(defun make-short-type () :short)
+(defun make-int-type () :int)
+(defun make-long-type () :long)
+(defun make-long-long-type () :long-long)
+(defun make-uchar-type () :uchar)
+(defun make-ushort-type () :ushort)
+(defun make-uint-type () :uint)
+(defun make-ulong-type () :ulong)
+(defun make-ulong-long-type () :ulong-long)
+(defun make-i8-type () :i8)
+(defun make-i16-type () :i16)
+(defun make-i32-type () :i32)
+(defun make-i64-type () :i64)
+(defun make-u8-type () :u8)
+(defun make-u16-type () :u16)
+(defun make-u32-type () :u32)
+(defun make-u64-type () :u64)
+(defun make-float-type () :float)
+(defun make-double-type () :double)
+(defun make-f32-type () :f32)
+(defun make-f64-type () :f64)
+(defun make-size-type () :size)
+(defun make-ptrdiff-type () :ptrdiff)
+(defun make-intptr-type () :intptr)
+(defun make-uintptr-type () :uintptr)
+(defun make-void-type () :void)
+(defun make-bool-type () :bool)
+(defun make-str-type () :str)
+(defun make-symbol-type () :symbol)
+(defun make-value-type () :value)
+(defun make-cons-type* () :cons)  ; bare cons (no params)
+(defun make-nil-type () :nil)
 
-(defmacro deftypector (name kind)
-  `(defun ,(intern (format nil "MAKE-~a-TYPE" (string-upcase name))) ()
-     (make-sysp-type :kind ,kind)))
+;; Compound type constructors — return lists
+(defun make-ptr-type (pointee) `(:ptr ,pointee))
+(defun make-list-type (elem-type) `(:list ,elem-type))
+(defun make-variadic-type (elem-type) `(:variadic ,elem-type))
+(defun make-cons-type (car-type cdr-type) `(:cons ,car-type ,cdr-type))
+(defun make-struct-type (name) `(:struct ,name))
+(defun make-enum-type (name) `(:enum ,name))
+(defun make-fn-type (arg-types ret-type) `(:fn ,arg-types ,ret-type))
+(defun make-vector-type (elem-type) `(:vector ,elem-type))
+(defun make-tuple-type (elem-types) `(:tuple ,@elem-types))
+(defun make-array-type (elem-type size) `(:array ,elem-type ,size))
 
-;; === C99 Type Constructors ===
+;; Union types: (:union :int :str) — sorted, deduped, flattened
+(defun make-union-type (variants)
+  "Create a normalized union type from a list of variant types.
+   Sorts alphabetically by mangle name, deduplicates, flattens nested unions.
+   Single-variant unions collapse to the variant itself."
+  (let ((flat nil))
+    ;; Flatten nested unions
+    (dolist (v variants)
+      (if (and (consp v) (eq (car v) :union))
+          (dolist (inner (cdr v)) (push inner flat))
+          (push v flat)))
+    ;; Deduplicate
+    (setf flat (remove-duplicates flat :test #'equal))
+    ;; Single variant → collapse
+    (when (= (length flat) 1)
+      (return-from make-union-type (first flat)))
+    ;; Sort by mangled name for canonical ordering
+    (setf flat (sort flat #'string<
+                     :key (lambda (tp) (mangle-type-name tp))))
+    `(:union ,@flat)))
 
-;; Signed integers (platform-dependent widths)
-(deftypector char :char)           ; typically 8-bit
-(deftypector short :short)         ; at least 16-bit
-(deftypector int :int)             ; at least 16-bit, typically 32-bit
-(deftypector long :long)           ; at least 32-bit
-(deftypector long-long :long-long) ; at least 64-bit
+(defun union-type-p (tp) (and (consp tp) (eq (car tp) :union)))
+(defun union-variants (tp) (cdr tp))
 
-;; Unsigned integers
-(deftypector uchar :uchar)
-(deftypector ushort :ushort)
-(deftypector uint :uint)
-(deftypector ulong :ulong)
-(deftypector ulong-long :ulong-long)
+;; Accessors for compound types
+(defun fn-type-args (ft) (second ft))
+(defun fn-type-ret (ft) (third ft))
 
-;; Fixed-width signed integers (C99 stdint.h)
-(deftypector i8 :i8)
-(deftypector i16 :i16)
-(deftypector i32 :i32)
-(deftypector i64 :i64)
+;; Backward-compatible accessors for the rest of the codebase
+(defun sysp-type-kind (tp)
+  "Extract the kind of a type (backward compat)"
+  (cond
+    ((keywordp tp) tp)                     ; :int -> :int
+    ((and (consp tp) (keywordp (car tp)))  ; (:ptr :int) -> :ptr
+     (car tp))
+    (t :unknown)))
 
-;; Fixed-width unsigned integers (C99 stdint.h)
-(deftypector u8 :u8)
-(deftypector u16 :u16)
-(deftypector u32 :u32)
-(deftypector u64 :u64)
+(defun sysp-type-name (tp)
+  "Extract the name of a type (backward compat)"
+  (cond
+    ((keywordp tp) nil)
+    ((and (consp tp) (member (car tp) '(:struct :enum :tvar)))
+     (second tp))
+    (t nil)))
 
-;; Floating point
-(deftypector float :float)
-(deftypector double :double)
-(deftypector f32 :f32)             ; alias for float
-(deftypector f64 :f64)             ; alias for double
-
-;; Size/pointer types
-(deftypector size :size)           ; size_t
-(deftypector ptrdiff :ptrdiff)     ; ptrdiff_t
-(deftypector intptr :intptr)       ; intptr_t
-(deftypector uintptr :uintptr)     ; uintptr_t
-
-;; Other
-(deftypector void :void)
-(deftypector bool :bool)
-(deftypector str :str)
-(deftypector symbol :symbol)
-(deftypector value :value)
-(deftypector cons :cons)
-(deftypector nil :nil)  ; Empty list type
-
-(defun make-ptr-type (pointee)
-  (make-sysp-type :kind :ptr :params (list pointee)))
-
-;; List type: (:list elem-type) - homogeneous, nil-terminated
-(defun make-list-type (elem-type)
-  (make-sysp-type :kind :list :params (list elem-type)))
-
-;; Variadic type: (:variadic elem-type) - for rest params, incompatible with :list
-(defun make-variadic-type (elem-type)
-  (make-sysp-type :kind :variadic :params (list elem-type)))
-
-;; Cons type: (:cons car-type cdr-type) - arbitrary pair
-(defun make-cons-type (car-type cdr-type)
-  (make-sysp-type :kind :cons :params (list car-type cdr-type)))
-
-;; Struct type constructor
-(defun make-struct-type (name)
-  (make-sysp-type :kind :struct :name name))
-
-;; Enum type constructor
-(defun make-enum-type (name)
-  (make-sysp-type :kind :enum :name name))
-
-;; Function type constructor: (:fn (arg-types...) ret-type)
-(defun make-fn-type (arg-types ret-type)
-  (make-sysp-type :kind :fn :params (append arg-types (list ret-type))))
-
-(defun make-vector-type (elem-type)
-  (make-sysp-type :kind :vector :params (list elem-type)))
-
-(defun make-tuple-type (elem-types)
-  (make-sysp-type :kind :tuple :params elem-types))
-
-(defun make-fn-type (arg-types ret-type)
-  (make-sysp-type :kind :fn :params (append arg-types (list ret-type))))
-
-(defun make-array-type (elem-type size)
-  (make-sysp-type :kind :array :params (list elem-type size)))
-
-(defun make-enum-type (name)
-  (make-sysp-type :kind :enum :name name))
-
-(defun make-struct-type (name)
-  (make-sysp-type :kind :struct :name name))
-
-;; NEW: Recursive list type - homogeneous, nil-terminated
-(defun make-list-type (elem-type)
-  (make-sysp-type :kind :list :params (list elem-type)))
-
-;; NEW: Variadic type - distinct from list, compile-time only
-(defun make-variadic-type (elem-type)
-  (make-sysp-type :kind :variadic :params (list elem-type)))
-
-;; NEW: Proper cons type with car and cdr types
-(defun make-cons-type (car-type cdr-type)
-  (make-sysp-type :kind :cons :params (list car-type cdr-type)))
-
-(defun fn-type-ret (ft)
-  (car (last (sysp-type-params ft))))
-
-(defun fn-type-args (ft)
-  (butlast (sysp-type-params ft)))
+(defun sysp-type-params (tp)
+  "Extract the params of a type (backward compat)"
+  (cond
+    ((keywordp tp) nil)                    ; :int -> nil
+    ((and (consp tp) (eq (car tp) :fn))    ; (:fn (:int :int) :int) -> (:int :int :int)
+     (append (second tp) (list (third tp))))
+    ((and (consp tp) (eq (car tp) :tuple)) ; (:tuple :int :str) -> (:int :str)
+     (cdr tp))
+    ((consp tp) (cdr tp))                  ; (:ptr :int) -> (:int), (:cons :int :str) -> (:int :str)
+    (t nil)))
 
 (defun type-equal-p (a b)
-  (and (eq (sysp-type-kind a) (sysp-type-kind b))
-       (equal (sysp-type-name a) (sysp-type-name b))
-       (= (length (sysp-type-params a)) (length (sysp-type-params b)))
-       (every #'type-equal-p
-              (sysp-type-params a) (sysp-type-params b))))
+  "Check if two types are equal"
+  (equal a b))
 
 ;;; === Type Inference (Hindley-Milner) ===
 
@@ -146,24 +132,30 @@
 ;; Pending statements to emit before current expression
 (defvar *pending-stmts* nil)
 
-;; Create a fresh type variable
+;; Type variable bindings: hash table from tvar-id -> type
+(defvar *tvar-bindings* (make-hash-table))
+
+;; Create a fresh type variable: (:tvar 1), (:tvar 2), ...
 (defun make-tvar ()
   (let ((id (incf *tvar-counter*)))
-    (make-sysp-type :kind :tvar :name id :params nil)))
-;; params slot used as binding: nil = free, (type) = bound
+    `(:tvar ,id)))
 
-(defun tvar-id (tv) (sysp-type-name tv))
-(defun tvar-bound (tv) (car (sysp-type-params tv)))
+(defun tvar-p (tp)
+  (and (consp tp) (eq (car tp) :tvar)))
+
+(defun tvar-id (tv) (second tv))
+
+(defun tvar-bound (tv)
+  (gethash (tvar-id tv) *tvar-bindings*))
+
 (defun tvar-bind! (tv type)
-  (setf (sysp-type-params tv) (list type)))
-
-(defun tvar-p (tp) (eq (sysp-type-kind tp) :tvar))
+  (setf (gethash (tvar-id tv) *tvar-bindings*) type))
 
 ;; Follow type variable chains to find the concrete type (or unbound tvar)
 (defun resolve-type (tp)
   (if (and (tvar-p tp) (tvar-bound tp))
       (let ((resolved (resolve-type (tvar-bound tp))))
-        ;; Path compression: point directly to final target
+        ;; Path compression
         (tvar-bind! tp resolved)
         resolved)
       tp))
@@ -173,41 +165,44 @@
   (let ((tp (resolve-type tp)))
     (cond
       ((tvar-p tp) (= (tvar-id tv) (tvar-id tp)))
-      ((sysp-type-params tp)
-       (some (lambda (p) (occurs-in-p tv p)) (sysp-type-params tp)))
+      ((consp tp)
+       (some (lambda (p) (occurs-in-p tv p)) (cdr tp)))
       (t nil))))
 
 ;; Numeric type checking and ranking for C-like promotion
 (defun numeric-type-p (tp)
-  "Check if a type is a numeric type (can participate in promotion)."
-  (let ((kind (sysp-type-kind tp)))
-    (member kind '(:int :long :long-long :float :double))))
+  "Check if a type is numeric (can participate in promotion)."
+  (member (resolve-type tp) '(:int :i8 :i16 :i32 :i64
+                               :uint :u8 :u16 :u32 :u64
+                               :long :long-long :ulong :ulong-long
+                               :char :uchar :short :ushort
+                               :float :double :f32 :f64
+                               :size :ptrdiff :intptr :uintptr)))
 
 (defun numeric-rank (tp)
-  "Return the numeric rank of a type (higher = wider type)."
-  (case (sysp-type-kind tp)
-    (:int 1)
-    (:long 2)
-    (:long-long 3)
-    (:float 4)
-    (:double 5)
+  "Return numeric rank for promotion (higher = wider)."
+  (case (resolve-type tp)
+    ((:char :uchar :i8 :u8) 1)
+    ((:short :ushort :i16 :u16) 2)
+    ((:int :uint :i32 :u32) 3)
+    ((:long :ulong) 4)
+    ((:long-long :ulong-long :i64 :u64 :size :ptrdiff :intptr :uintptr) 5)
+    ((:float :f32) 6)
+    ((:double :f64) 7)
     (t 0)))
 
 ;; Unify two types. Returns t on success, nil on failure.
-;; On failure, does NOT modify any bindings (unification is atomic per call).
-;; For gradual typing: caller can fall back to :value on failure.
 (defun unify (t1 t2)
   (let ((t1 (resolve-type t1))
         (t2 (resolve-type t2)))
     (cond
-      ;; Same object or structurally equal
-      ((eq t1 t2) t)
-      ((type-equal-p t1 t2) t)
+      ;; Same type (equal handles both atoms and lists)
+      ((equal t1 t2) t)
 
       ;; Type variable on left: bind it
       ((tvar-p t1)
        (if (occurs-in-p t1 t2)
-           nil ; infinite type — fail
+           nil ; infinite type
            (progn (tvar-bind! t1 t2) t)))
 
       ;; Type variable on right: bind it
@@ -217,57 +212,41 @@
            (progn (tvar-bind! t2 t1) t)))
 
       ;; :value unifies with anything (it's the Any type)
-      ((eq (sysp-type-kind t1) :value) t)
-      ((eq (sysp-type-kind t2) :value) t)
+      ((eq t1 :value) t)
+      ((eq t2 :value) t)
 
-      ;; Same kind with params: unify pairwise
-      ((and (eq (sysp-type-kind t1) (sysp-type-kind t2))
-            (equal (sysp-type-name t1) (sysp-type-name t2))
-            (= (length (sysp-type-params t1))
-               (length (sysp-type-params t2))))
-       (every #'unify (sysp-type-params t1) (sysp-type-params t2)))
+      ;; Same compound kind: unify params pairwise
+      ((and (consp t1) (consp t2)
+            (eq (car t1) (car t2))
+            (= (length t1) (length t2)))
+       (every #'unify (cdr t1) (cdr t2)))
 
-      ;; List type compatibility:
-      ;; (:list T) unifies with nil (empty list)
-      ((and (eq (sysp-type-kind t1) :list) (eq (sysp-type-kind t2) :nil)) t)
-      ((and (eq (sysp-type-kind t2) :list) (eq (sysp-type-kind t1) :nil)) t)
+      ;; List/nil compatibility
+      ((and (consp t1) (eq (car t1) :list) (eq t2 :nil)) t)
+      ((and (consp t2) (eq (car t2) :list) (eq t1 :nil)) t)
 
-      ;; (:list T) unifies with (:cons T (:list T)) - homogeneous cons chain
-      ((and (eq (sysp-type-kind t1) :list)
-            (eq (sysp-type-kind t2) :cons))
-       (let ((car-type (first (sysp-type-params t2)))
-             (cdr-type (second (sysp-type-params t2))))
-         (and (unify (first (sysp-type-params t1)) car-type)
-              (unify t1 cdr-type))))  ; cdr should also be (:list T)
-      ((and (eq (sysp-type-kind t2) :list)
-            (eq (sysp-type-kind t1) :cons))
-       (let ((car-type (first (sysp-type-params t1)))
-             (cdr-type (second (sysp-type-params t1))))
-         (and (unify (first (sysp-type-params t2)) car-type)
-              (unify t2 cdr-type))))
+      ;; (:list T) unifies with (:cons T (:list T))
+      ((and (consp t1) (eq (car t1) :list)
+            (consp t2) (eq (car t2) :cons))
+       (and (unify (second t1) (second t2))       ; elem = car
+            (unify t1 (third t2))))                ; list = cdr
+      ((and (consp t2) (eq (car t2) :list)
+            (consp t1) (eq (car t1) :cons))
+       (and (unify (second t2) (second t1))
+            (unify t2 (third t1))))
 
-      ;; Variadic is INCOMPATIBLE with list (explicitly fail)
-      ;; This prevents accidental (sum-all '(1 2 3)) when variadic expected
-      ((or (eq (sysp-type-kind t1) :variadic)
-           (eq (sysp-type-kind t2) :variadic))
+      ;; Variadic is incompatible with list
+      ((or (and (consp t1) (eq (car t1) :variadic))
+           (and (consp t2) (eq (car t2) :variadic)))
        nil)
 
-      ;; Numeric type promotion (like C)
-      ;; Integer promotion: int -> long -> long-long
-      ;; Float promotion: float -> double
-      ;; Mixed: integer promotes to float
-      ((and (numeric-type-p t1) (numeric-type-p t2))
-       ;; Allow unification if one can promote to the other
-       (let ((rank1 (numeric-rank t1))
-             (rank2 (numeric-rank t2)))
-         ;; Can always unify if ranks are compatible
-         ;; The result is the higher-ranked type
-         t))
+      ;; Numeric promotion
+      ((and (numeric-type-p t1) (numeric-type-p t2)) t)
 
-      ;; Incompatible types
+      ;; Incompatible
       (t nil))))
 
-;; Generalize: replace free tvars (not in env) with fresh quantified vars
+;; Generalize: replace free tvars with quantified vars
 ;; Returns a type scheme: (:scheme (tvar-ids...) type)
 (defun free-tvars (tp &optional (seen nil))
   "Collect all unbound type variable IDs in a type."
@@ -275,10 +254,10 @@
     (cond
       ((tvar-p tp)
        (if (member (tvar-id tp) seen) nil (list (tvar-id tp))))
-      ((sysp-type-params tp)
+      ((consp tp)
        (reduce #'append
                (mapcar (lambda (p) (free-tvars p seen))
-                       (sysp-type-params tp))
+                       (cdr tp))
                :initial-value nil))
       (t nil))))
 
@@ -297,25 +276,24 @@
              (body (third scheme))
              (subst (mapcar (lambda (id) (cons id (make-tvar))) quantified)))
         (apply-subst body subst))
-      scheme)) ; not a scheme, return as-is
+      scheme))
 
 (defun apply-subst (tp subst)
-  "Replace tvar IDs in subst with their fresh tvars."
+  "Apply substitution to type."
   (let ((tp (resolve-type tp)))
     (cond
       ((tvar-p tp)
        (let ((entry (assoc (tvar-id tp) subst)))
          (if entry (cdr entry) tp)))
-      ((sysp-type-params tp)
-       (make-sysp-type :kind (sysp-type-kind tp)
-                       :name (sysp-type-name tp)
-                       :params (mapcar (lambda (p) (apply-subst p subst))
-                                       (sysp-type-params tp))))
+      ((consp tp)
+       (cons (car tp)
+             (mapcar (lambda (p) (apply-subst p subst)) (cdr tp))))
       (t tp))))
 
 ;; Reset inference state (call before each compilation unit)
 (defun reset-inference ()
-  (setf *tvar-counter* 0))
+  (setf *tvar-counter* 0)
+  (clrhash *tvar-bindings*))
 
 ;;; === Constraint Generation (Phase 2: AST → Type Constraints) ===
 
@@ -362,14 +340,12 @@
 ;; Resolve a type variable to its final concrete type, defaulting unbound tvars to :int
 (defun resolve-or-default (tp)
   (let ((resolved (resolve-type tp)))
-    (if (tvar-p resolved)
-        (make-int-type)  ; unbound tvar defaults to int (gradual typing)
-        (if (sysp-type-params resolved)
-            (make-sysp-type :kind (sysp-type-kind resolved)
-                           :name (sysp-type-name resolved)
-                           :params (mapcar #'resolve-or-default
-                                           (sysp-type-params resolved)))
-            resolved))))
+    (cond
+      ((tvar-p resolved) :int)  ; unbound tvar defaults to int
+      ((consp resolved)
+       (cons (car resolved)
+             (mapcar #'resolve-or-default (cdr resolved))))
+      (t resolved))))
 
 ;; Infer the type of an expression, generating constraints via unification.
 ;; Returns the inferred type (may contain tvars until resolution).
@@ -843,6 +819,8 @@
 (defvar *symbol-table* (make-hash-table :test 'equal))  ; name -> integer ID
 (defvar *symbol-counter* 0)
 (defvar *sysp-gensym-counter* #x80000000)  ; gensyms start high to avoid collision
+(defvar *type-aliases* (make-hash-table :test 'equal))  ; name -> type s-expr (deftype)
+(defvar *name-overrides* (make-hash-table :test 'equal))  ; sysp name -> C name override
 (defvar *uses-value-type* nil)  ; emit Value/Cons preamble if true
 (defvar *macro-fns* (make-hash-table :test 'equal))  ; name -> (params body) for compile-time eval
 (defvar *interp-gensym-counter* 0)
@@ -1041,6 +1019,35 @@
 
 ;;; === Type Annotation Parsing ===
 
+(defun parse-type-expr (form)
+  "Parse a type expression: keyword → parse-type-annotation, list → compound type.
+   Handles (:cons :int :int), (:ptr :int), (:fn (:int) :int), (:union :int :str), etc.
+   Note: readtable-case :preserve means keywords from source are lowercase (:|ptr|).
+   We normalize via string-downcase comparison."
+  (cond
+    ((keywordp form)
+     (parse-type-annotation form))
+    ((symbolp form)
+     ;; Could be a named type alias (no colon prefix)
+     (let ((sname (symbol-name form)))
+       (or (gethash sname *type-aliases*)
+           `(:unknown ,sname))))
+    ((and (listp form) (keywordp (first form)))
+     (let ((head (string-downcase (symbol-name (first form)))))
+       (cond
+         ((string= head "ptr") (make-ptr-type (parse-type-expr (second form))))
+         ((string= head "fn") (make-fn-type (mapcar #'parse-type-expr (second form))
+                                             (parse-type-expr (third form))))
+         ((string= head "cons") (make-cons-type (parse-type-expr (second form))
+                                                 (parse-type-expr (third form))))
+         ((string= head "array") (make-array-type (parse-type-expr (second form)) (third form)))
+         ((string= head "vector") (make-vector-type (parse-type-expr (second form))))
+         ((string= head "list") (make-list-type (parse-type-expr (second form))))
+         ((string= head "tuple") (make-tuple-type (mapcar #'parse-type-expr (rest form))))
+         ((string= head "union") `(:union ,@(mapcar #'parse-type-expr (rest form))))
+         (t form))))
+    (t form)))
+
 (defun parse-type-annotation (sym)
   (let ((name (string-downcase (symbol-name sym))))
     (cond
@@ -1083,7 +1090,7 @@
       ;; Value types
       ((string= name "symbol") (make-symbol-type))
       ((string= name "value") (make-value-type))
-      ((string= name "cons") (make-cons-type))
+      ((string= name "cons") :cons)
       ((string= name "nil") (make-nil-type))
       ;; Pointer shorthand: :ptr-int, :ptr-float, etc.
       ((and (> (length name) 4) (string= (subseq name 0 4) "ptr-"))
@@ -1093,7 +1100,10 @@
            (cond
              ((gethash sname *structs*) (make-struct-type sname))
              ((gethash sname *enums*) (make-enum-type sname))
-             (t (make-sysp-type :kind :unknown :name sname))))))))
+             ;; Type aliases (deftype)
+             ((gethash sname *type-aliases*)
+              (gethash sname *type-aliases*))
+             (t `(:unknown ,sname))))))))
 
 
 ;;; === C Type Emission ===
@@ -1150,20 +1160,38 @@
     (:nil "Value")   ; nil is a Value
     (:list "Value")  ; lists are also Values (tagged cons chain)
     (:variadic "Value")  ; variadic rest compiles to Value at runtime
+    (:union (union-type-c-name tp))
     (otherwise "int")))
 
 (defun mangle-type-name (tp)
   (case (sysp-type-kind tp)
+    ;; Integer types
     (:int "int")
+    (:char "char")
+    (:short "short")
     (:long "long")
     (:long-long "longlong")
-    (:float "float")
-    (:double "double")
+    (:uchar "uchar")
+    (:ushort "ushort")
+    (:uint "uint")
+    (:ulong "ulong")
+    (:ulong-long "ulonglong")
+    ;; Fixed-width integers
+    (:i8 "i8") (:i16 "i16") (:i32 "i32") (:i64 "i64")
+    (:u8 "u8") (:u16 "u16") (:u32 "u32") (:u64 "u64")
+    ;; Size types
+    (:size "size") (:ptrdiff "ptrdiff") (:intptr "intptr") (:uintptr "uintptr")
+    ;; Float types
+    (:float "float") (:double "double") (:f32 "f32") (:f64 "f64")
+    ;; Other primitives
     (:bool "bool")
     (:str "str")
-    (:char "char")
-    (:u8 "u8")
-    (:f32 "f32")
+    (:void "void")
+    (:symbol "sym")
+    (:value "val")
+    (:cons "cons")
+    (:nil "nil")
+    ;; Compound types
     (:ptr (format nil "ptr_~a" (mangle-type-name (first (sysp-type-params tp)))))
     (:struct (sysp-type-name tp))
     (:enum (sysp-type-name tp))
@@ -1172,13 +1200,11 @@
     (:vector (vector-type-c-name tp))
     (:tuple (tuple-type-c-name tp))
     (:fn (fn-type-c-name tp))
-    (:symbol "sym")
-    (:value "val")
-    (:cons "val")
-    (:nil "nil")
     (:list (format nil "list_~a" (mangle-type-name (first (sysp-type-params tp)))))
     (:variadic (format nil "var_~a" (mangle-type-name (first (sysp-type-params tp)))))
-    (otherwise "unknown")))
+    ;; Union types
+    (:union (format nil "Union_~{~a~^_~}" (mapcar #'mangle-type-name (cdr tp))))
+    (otherwise (warn "mangle-type-name: unhandled type ~a" tp) "unknown")))
 
 (defun vector-type-c-name (tp)
   (let* ((elem (first (sysp-type-params tp)))
@@ -1229,6 +1255,47 @@
                     (type-to-c ret-type) name arg-str)
             *type-decls*))))
 
+(defun ensure-union-type (tp)
+  "Ensure the C tagged union for a union type is generated.
+   Returns the C type name (e.g. Union_int_str)."
+  (let* ((variants (union-variants tp))
+         (name (format nil "Union_~{~a~^_~}" (mapcar #'mangle-type-name variants))))
+    (unless (gethash name *generated-types*)
+      (setf (gethash name *generated-types*) t)
+      ;; Generate: typedef enum { Union_int_str_TAG_INT, ... } Union_int_str_tag;
+      ;; typedef struct { Union_int_str_tag tag; union { int as_int; ... }; } Union_int_str;
+      ;; static Union_int_str Union_int_str_from_int(int x) { ... }
+      (let* ((tag-enum-name (format nil "~a_tag" name))
+             (tag-values (mapcar (lambda (v)
+                                   (format nil "~a_TAG_~a"
+                                           name (string-upcase (mangle-type-name v))))
+                                 variants))
+             (enum-def (format nil "typedef enum { ~{~a~^, ~} } ~a;~%"
+                               tag-values tag-enum-name))
+             ;; Union fields
+             (fields (mapcar (lambda (v)
+                               (format nil "    ~a as_~a;"
+                                       (type-to-c v) (mangle-type-name v)))
+                             variants))
+             (struct-def (format nil "typedef struct {~%  ~a tag;~%  union {~%~{~a~%~}  };~%} ~a;~%"
+                                 tag-enum-name fields name))
+             ;; Constructor functions
+             (ctors (mapcar (lambda (v tag)
+                              (let ((mname (mangle-type-name v)))
+                                (format nil "static ~a ~a_from_~a(~a x) { ~a r; r.tag = ~a; r.as_~a = x; return r; }~%"
+                                        name name mname (type-to-c v) name tag mname)))
+                            variants tag-values)))
+        ;; First pushed = last after nreverse. Want: enum, struct, ctors.
+        (push enum-def *type-decls*)
+        (push struct-def *type-decls*)
+        (dolist (ctor (reverse ctors))
+          (push ctor *type-decls*))))
+    name))
+
+(defun union-type-c-name (tp)
+  "Get the C type name for a union type, ensuring it's generated."
+  (ensure-union-type tp))
+
 (defun ensure-vector-helper (name c-elem c-vec)
   "Emit a helper function for creating vectors of a specific type"
   (unless (gethash name *generated-types*)
@@ -1243,6 +1310,15 @@
                       c-elem)
                   c-vec)
           *functions*)))
+
+(defun wrap-as-union (code concrete-type union-type)
+  "Generate C code to wrap a concrete value into a union type.
+   e.g., (wrap-as-union \"42\" :int (:union :int :str)) → \"Union_int_str_from_int(42)\""
+  (if (union-type-p union-type)
+      (let ((union-name (ensure-union-type union-type))
+            (mname (mangle-type-name concrete-type)))
+        (format nil "~a_from_~a(~a)" union-name mname code))
+      code))
 
 (defun ensure-vector-push-helper (name c-vec c-elem)
   "Emit a helper function for pushing to vectors of a specific type"
@@ -1272,15 +1348,22 @@
 ;; Returns (values type statements-list).
 ;; Recursively handles nested statement-like forms.
 (defun compile-expr-returning (form env target)
-  (if (statement-like-p form)
-      ;; Statement-like: compile-stmt-returning returns stmts directly
-      (compile-stmt-returning form env target)
-      ;; Simple expression: isolate pending stmts, compile, assign to target
-      (let ((*pending-stmts* nil))
-        (multiple-value-bind (code type) (compile-expr form env)
-          (values type
-                  (append *pending-stmts*
-                          (list (format nil "  ~a = ~a;" target code))))))))
+  (cond
+    ;; recur → goto, no target assignment (recur never produces a value)
+    ((and (listp form) (symbolp (first form)) (sym= (first form) "recur"))
+     (values :void (compile-recur-stmt form env)))
+    ;; return → explicit return, no target assignment
+    ((and (listp form) (symbolp (first form)) (sym= (first form) "return"))
+     (values :void (compile-return-stmt form env)))
+    ;; Statement-like: compile-stmt-returning returns stmts directly
+    ((statement-like-p form)
+     (compile-stmt-returning form env target))
+    ;; Simple expression: isolate pending stmts, compile, assign to target
+    (t (let ((*pending-stmts* nil))
+         (multiple-value-bind (code type) (compile-expr form env)
+           (values type
+                   (append *pending-stmts*
+                           (list (format nil "  ~a = ~a;" target code)))))))))
 
 ;; Compile a statement-like form so its value is assigned to target.
 ;; Returns (values type statements-list).
@@ -1341,14 +1424,14 @@
                         (values (sanitize-name name)
                                 (make-enum-type (car enum-info)))
                         (values (sanitize-name name)
-                                (make-sysp-type :kind :unknown))))))))))
+                                :unknown)))))))))
     ((listp form)
      ;; Try macro expansion first
      (multiple-value-bind (expanded was-expanded) (macroexpand-1-sysp form)
        (if was-expanded
            (compile-expr (macroexpand-all expanded) env)
            (compile-list form env))))
-    (t (values (format nil "~a" form) (make-sysp-type :kind :unknown)))))
+    (t (values (format nil "~a" form) :unknown))))
 
 (defun sanitize-name (name)
   (let ((result (substitute #\_ #\- name)))
@@ -1480,6 +1563,9 @@
       ;; Type ops
       ((sym= head "cast") (compile-cast form env))
       ((sym= head "sizeof") (compile-sizeof form env))
+      ;; Union ops
+      ((sym= head "runtype") (compile-runtype form env))
+      ((sym= head "as") (compile-as form env))
       ;; Cons / Value ops
       ((sym= head "cons") (compile-cons form env))
       ((sym= head "car") (compile-car form env))
@@ -1623,10 +1709,19 @@
                            (fifth form)    ; skip 'else' keyword
                            (fourth form)))) ; positional
         (if else-form
-            (multiple-value-bind (else-code et) (compile-expr else-form env)
-              (declare (ignore et))
-              (values (format nil "(~a ? ~a : ~a)" cond-code then-code else-code)
-                      then-type))
+            (multiple-value-bind (else-code else-type) (compile-expr else-form env)
+              ;; Unify branch types: same → use directly, different → union
+              (let ((result-type (if (type-equal-p then-type else-type)
+                                     then-type
+                                     (make-union-type (list then-type else-type)))))
+                (if (union-type-p result-type)
+                    ;; Wrap each branch into the union
+                    (values (format nil "(~a ? ~a : ~a)" cond-code
+                                    (wrap-as-union then-code then-type result-type)
+                                    (wrap-as-union else-code else-type result-type))
+                            result-type)
+                    (values (format nil "(~a ? ~a : ~a)" cond-code then-code else-code)
+                            result-type))))
             (values (format nil "(~a ? ~a : 0)" cond-code then-code)
                     then-type))))))
 
@@ -1658,10 +1753,18 @@
             (multiple-value-bind (test-code tt) (compile-expr (first clause) env)
               (declare (ignore tt))
               (multiple-value-bind (then-code then-type) (compile-expr (second clause) env)
-                (multiple-value-bind (rest-code rt) (compile-cond-clauses (rest clauses) env)
-                  (declare (ignore rt))
-                  (values (format nil "(~a ? ~a : ~a)" test-code then-code rest-code)
-                          then-type))))))))
+                (multiple-value-bind (rest-code rest-type) (compile-cond-clauses (rest clauses) env)
+                  ;; Unify this clause type with rest type
+                  (let ((result-type (if (type-equal-p then-type rest-type)
+                                         then-type
+                                         (make-union-type (list then-type rest-type)))))
+                    (if (union-type-p result-type)
+                        (values (format nil "(~a ? ~a : ~a)" test-code
+                                        (wrap-as-union then-code then-type result-type)
+                                        (wrap-as-union rest-code rest-type result-type))
+                                result-type)
+                        (values (format nil "(~a ? ~a : ~a)" test-code then-code rest-code)
+                                result-type))))))))))
 
 (defun compile-if-stmt-returning (form env target)
   "(if cond then [else] else) -> if statement assigning to target"
@@ -1673,17 +1776,22 @@
                           (fourth form))))
       (multiple-value-bind (then-type then-stmts)
           (compile-expr-returning (third form) env target)
-        (multiple-value-bind (et else-stmts)
+        (multiple-value-bind (else-type else-stmts)
             (if else-form
                 (compile-expr-returning else-form env target)
                 (values then-type (list (format nil "  ~a = 0;" target))))
-          (declare (ignore et))
-          (let ((result (list (format nil "  if (~a) {" cond-code))))
+          ;; Compute result type: skip :void branches (recur/return)
+          (let* ((result-type (cond
+                                ((eq then-type :void) else-type)
+                                ((eq else-type :void) then-type)
+                                ((type-equal-p then-type else-type) then-type)
+                                (t (make-union-type (list then-type else-type)))))
+                 (result (list (format nil "  if (~a) {" cond-code))))
             (dolist (s then-stmts) (setf result (append result (list (format nil "  ~a" s)))))
             (setf result (append result (list "  } else {")))
             (dolist (s else-stmts) (setf result (append result (list (format nil "  ~a" s)))))
             (setf result (append result (list "  }")))
-            (values then-type result)))))))
+            (values result-type result)))))))
 
 (defun compile-do-stmt-returning (form env target)
   "(do stmt... expr) -> statements, last expr assigned to target"
@@ -1702,7 +1810,7 @@
   (let ((clauses (rest form))
         (result nil)
         (first-clause t)
-        (result-type (make-int-type)))
+        (clause-types nil))
     (dolist (clause clauses)
       (let ((test (first clause))
             (body (second clause)))
@@ -1710,14 +1818,14 @@
           ((and (symbolp test) (sym= test "else"))
            (setf result (append result (list "  } else {")))
            (multiple-value-bind (type stmts) (compile-expr-returning body env target)
-             (setf result-type type)
+             (unless (eq type :void) (push type clause-types))
              (dolist (s stmts) (setf result (append result (list (format nil "  ~a" s)))))))
           (first-clause
            (multiple-value-bind (test-code tt) (compile-expr test env)
              (declare (ignore tt))
              (setf result (append result (list (format nil "  if (~a) {" test-code))))
              (multiple-value-bind (type stmts) (compile-expr-returning body env target)
-               (setf result-type type)
+               (unless (eq type :void) (push type clause-types))
                (dolist (s stmts) (setf result (append result (list (format nil "  ~a" s))))))
              (setf first-clause nil)))
           (t
@@ -1725,10 +1833,16 @@
              (declare (ignore tt))
              (setf result (append result (list (format nil "  } else if (~a) {" test-code))))
              (multiple-value-bind (type stmts) (compile-expr-returning body env target)
-               (setf result-type type)
+               (unless (eq type :void) (push type clause-types))
                (dolist (s stmts) (setf result (append result (list (format nil "  ~a" s)))))))))))
     (setf result (append result (list "  }")))
-    (values result-type result)))
+    ;; Compute result type from all clause types
+    (let ((result-type (cond
+                         ((null clause-types) (make-int-type))
+                         ((every (lambda (t2) (type-equal-p (first clause-types) t2)) (rest clause-types))
+                          (first clause-types))
+                         (t (make-union-type clause-types)))))
+      (values result-type result))))
 
 (defun compile-let-stmt-returning (form env target)
   "(let name [type] init body...) -> let decl + body, last expr assigned to target"
@@ -1969,6 +2083,22 @@
         (values (format nil "sizeof(~a)" (sanitize-name (string arg)))
                 (make-int-type)))))
 
+;;; === Union Type Ops ===
+
+(defun compile-runtype (form env)
+  "(runtype expr) → expr.tag (integer). For union types, returns the tag enum value."
+  (multiple-value-bind (code tp) (compile-expr (second form) env)
+    (declare (ignore tp))
+    (values (format nil "~a.tag" code) (make-int-type))))
+
+(defun compile-as (form env)
+  "(as :type expr) → expr.as_type. Extract a specific variant from a union."
+  (let* ((target-type (parse-type-annotation (second form)))
+         (mname (mangle-type-name target-type)))
+    (multiple-value-bind (code tp) (compile-expr (third form) env)
+      (declare (ignore tp))
+      (values (format nil "~a.as_~a" code mname) target-type))))
+
 ;;; === Value Type (cons cells, symbols, quote) ===
 
 (defun wrap-as-value (code tp)
@@ -2168,6 +2298,11 @@
   (setf *uses-value-type* t)
   (values "val_sym(_sysp_gensym++)" (make-value-type)))
 
+(defun c-fn-name (fn-name)
+  "Get the C name for a function, checking overrides first."
+  (or (gethash fn-name *name-overrides*)
+      (sanitize-name fn-name)))
+
 (defun compile-call (form env)
   "Compile a function call, handling variadic functions."
   (let* ((fn-name (string (first form)))
@@ -2204,11 +2339,11 @@
                                      (format nil "sysp_list(~d, ~a)" (- (length args) fixed-count) rest-list)
                                      "val_nil()")))
                   (setf all-args (append all-args (list rest-code)))
-                  (values (format nil "~a(~{~a~^, ~})" (sanitize-name fn-name) all-args)
+                  (values (format nil "~a(~{~a~^, ~})" (c-fn-name fn-name) all-args)
                           ret-type)))
               ;; Non-variadic: compile all args directly
               (let ((compiled-args (mapcar (lambda (a) (first (multiple-value-list (compile-expr a env)))) args)))
-                (values (format nil "~a(~{~a~^, ~})" (sanitize-name fn-name) compiled-args)
+                (values (format nil "~a(~{~a~^, ~})" (c-fn-name fn-name) compiled-args)
                         ret-type)))))))
 
 (defun compile-struct-construct (name args env)
@@ -2387,14 +2522,20 @@
              (list (format nil "  printf(\"~a\\n\", ~a);" fmt arg))))))))
 
 (defun compile-if-stmt (form env)
-  "(if cond then-body...) or (if cond then-body... else else-body...)"
-  ;; Find the else keyword position
+  "(if cond then-body...) or (if cond then-body... else else-body...)
+   Also: (if cond then else) positional (no else keyword, exactly 2 forms)"
   (multiple-value-bind (cond-code ct) (compile-expr (second form) env)
     (declare (ignore ct))
     (let* ((rest (cddr form))
            (else-pos (position-if (lambda (x) (and (symbolp x) (sym= x "else"))) rest))
-           (then-forms (if else-pos (subseq rest 0 else-pos) rest))
-           (else-forms (when else-pos (subseq rest (1+ else-pos)))))
+           ;; Positional else: no keyword, exactly 2 forms after cond
+           (positional-else (and (not else-pos) (= (length rest) 2)))
+           (then-forms (cond (else-pos (subseq rest 0 else-pos))
+                             (positional-else (list (first rest)))
+                             (t rest)))
+           (else-forms (cond (else-pos (subseq rest (1+ else-pos)))
+                             (positional-else (list (second rest)))
+                             (t nil))))
       (let ((then-env (make-env :parent env))
             (else-env (make-env :parent env)))
         (let ((result (list (format nil "  if (~a) {" cond-code))))
@@ -2645,6 +2786,30 @@
                   name)
           *struct-defs*)))
 
+(defun compile-deftype (form)
+  "(deftype Name TypeExpr) — register a named type alias and emit C typedef"
+  (let* ((name (string (second form)))
+         (type-expr (parse-type-expr (third form))))
+    ;; Register in *type-aliases* for lookup by parse-type-annotation
+    (setf (gethash name *type-aliases*) type-expr)
+    ;; Emit C typedef
+    (let ((c-type (type-to-c type-expr)))
+      (push (format nil "typedef ~a ~a;~%" c-type name)
+            *type-decls*))
+    ;; For union types: register constructor functions in global env
+    ;; e.g. (deftype IntOrFloat (:union :int :float)) registers:
+    ;;   IntOrFloat-from-int : (:fn (:int) union-type)
+    ;;   IntOrFloat-from-float : (:fn (:float) union-type)
+    (when (union-type-p type-expr)
+      (dolist (variant (union-variants type-expr))
+        (let* ((mname (mangle-type-name variant))
+               (fn-name (format nil "~a-from-~a" name mname))
+               (c-name (format nil "~a_from_~a" (ensure-union-type type-expr) mname))
+               (fn-type (make-fn-type (list variant) type-expr)))
+          (env-bind *global-env* fn-name fn-type)
+          ;; Register name mapping so compile-call emits the right C name
+          (setf (gethash fn-name *name-overrides*) c-name))))))
+
 (defun form-uses-recur-p (forms)
   "Check if any form in the tree contains a (recur ...) call"
   (cond
@@ -2769,25 +2934,42 @@
                 (when releases
                   (setf return-stmt (format nil "~{~a~%~}" releases)))))
             ;; Non-void: last form is return value
-            (let ((*pending-stmts* nil))
-              (multiple-value-bind (last-code lt) (compile-expr last-form env)
-                (declare (ignore lt))
-                ;; Any statements lifted from the return expression
-                (when *pending-stmts*
-                  (setf stmts (append stmts *pending-stmts*)))
-                (let* ((releases (when *uses-value-type* (emit-releases env)))
-                       (ret-var (and (symbolp last-form)
-                                     (member (sanitize-name (string last-form))
-                                             (env-releases env) :test #'equal))))
-                  (setf return-stmt
-                        (if (and ret-var *uses-value-type* releases)
-                            (format nil "  val_retain(~a);~%~{~a~%~}  return ~a;~%"
-                                    (sanitize-name (string last-form))
-                                    releases
-                                    last-code)
+            ;; If the last form is statement-like (if/cond/do/let) and uses recur,
+            ;; use compile-expr-returning to handle branches that recur (goto)
+            ;; vs branches that produce values (assign to temp).
+            (if (and uses-recur (statement-like-p last-form))
+                ;; Statement-like with recur: compile to temp, return temp
+                (let* ((tmp (fresh-tmp))
+                       (tmp-decl (format nil "  ~a ~a;" (type-to-c ret-type) tmp)))
+                  (multiple-value-bind (type ret-stmts)
+                      (compile-expr-returning last-form env tmp)
+                    (declare (ignore type))
+                    (setf stmts (append stmts (list tmp-decl) ret-stmts))
+                    (let ((releases (when *uses-value-type* (emit-releases env))))
+                      (setf return-stmt
                             (if (and *uses-value-type* releases)
-                                (format nil "~{~a~%~}  return ~a;~%" releases last-code)
-                                (format nil "  return ~a;~%" last-code))))))))
+                                (format nil "~{~a~%~}  return ~a;~%" releases tmp)
+                                (format nil "  return ~a;~%" tmp))))))
+                ;; Normal: compile last form as expression
+                (let ((*pending-stmts* nil))
+                  (multiple-value-bind (last-code lt) (compile-expr last-form env)
+                    (declare (ignore lt))
+                    ;; Any statements lifted from the return expression
+                    (when *pending-stmts*
+                      (setf stmts (append stmts *pending-stmts*)))
+                    (let* ((releases (when *uses-value-type* (emit-releases env)))
+                           (ret-var (and (symbolp last-form)
+                                         (member (sanitize-name (string last-form))
+                                                 (env-releases env) :test #'equal))))
+                      (setf return-stmt
+                            (if (and ret-var *uses-value-type* releases)
+                                (format nil "  val_retain(~a);~%~{~a~%~}  return ~a;~%"
+                                        (sanitize-name (string last-form))
+                                        releases
+                                        last-code)
+                                (if (and *uses-value-type* releases)
+                                    (format nil "~{~a~%~}  return ~a;~%" releases last-code)
+                                    (format nil "  return ~a;~%" last-code)))))))))
           (let ((body-stmts (if uses-recur
                                   (cons "  _recur_top: ;" (or stmts nil))
                                   (or stmts nil)))
@@ -3164,6 +3346,7 @@
                  (cond
                    ((sym= (first expanded) "struct") (compile-struct expanded))
                    ((sym= (first expanded) "foreign-struct") (compile-foreign-struct expanded))
+                   ((sym= (first expanded) "deftype") (compile-deftype expanded))
                    ((sym= (first expanded) "enum") (compile-enum expanded))
                    ((sym= (first expanded) "defn") (compile-defn expanded))
                    ((sym= (first expanded) "extern") (compile-extern expanded))
@@ -3427,7 +3610,9 @@
   (setf *interp-gensym-counter* 0)
   (setf *function-comments* nil)
   (setf *struct-comments* nil)
-  (setf *var-comments* nil))
+  (setf *var-comments* nil)
+  (setf *type-aliases* (make-hash-table :test 'equal))
+  (setf *name-overrides* (make-hash-table :test 'equal)))
 
 (defun compile-file-to-c (in-path out-path)
   (reset-state)
