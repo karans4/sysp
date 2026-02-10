@@ -2480,11 +2480,9 @@
     ((and (listp form) (sym= (first form) "block"))
      (compile-block-stmt form env))
     ((and (listp form) (sym= (first form) "do"))
-     ;; do with binding spec [var start end] -> for loop
-     (if (and (listp (second form)) (symbolp (first (second form))))
-         (compile-for-stmt form env)
-         ;; do as block: compile all sub-forms as statements
-         (compile-body (rest form) env)))
+     ;; do as block: compile all sub-forms as statements
+     ;; Use (for [var start end] body...) for loops
+     (compile-body (rest form) env))
     (t (let ((*pending-stmts* nil))
          (multiple-value-bind (code tp) (compile-expr form env)
            (declare (ignore tp))
