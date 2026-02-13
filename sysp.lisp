@@ -473,6 +473,17 @@
       ((sym= head "array-set!") :void)
       ((sym= head "make-array") (make-tvar))
 
+      ;; match: infer scrutinee, collect body types from all clauses, unify
+      ((sym= head "match")
+       (infer-expr (second form))  ; scrutinee
+       (let ((body-type (make-tvar)))
+         (dolist (clause (cddr form))
+           (when (listp clause)
+             (let ((clause-body (second clause)))
+               (when clause-body
+                 (unify body-type (infer-expr clause-body))))))
+         body-type))
+
       ;; Function call: look up function type, unify args, return ret type
       (t (let* ((fn-name (string head))
                 (fn-type (infer-env-lookup fn-name)))
@@ -533,6 +544,14 @@
          (dolist (clause (cdr form))
            (when (listp clause)
              (infer-expr (first clause))
+             (dolist (f (cdr clause))
+               (infer-stmt f)))))
+
+        ;; match: walk scrutinee and clause bodies
+        ((sym= head "match")
+         (infer-expr (second form))
+         (dolist (clause (cddr form))
+           (when (listp clause)
              (dolist (f (cdr clause))
                (infer-stmt f)))))
 
@@ -1219,7 +1238,7 @@
        (not (null form))
        (symbolp (first form))
        (let ((head (string (first form))))
-         (member head '("do" "if" "cond" "let" "let-mut") :test #'string-equal))))
+         (member head '("do" "if" "cond" "let" "let-mut" "match") :test #'string-equal))))
 
 ;; Compile form so its value ends up assigned to target-var.
 ;; Returns (values type statements-list).
@@ -1252,6 +1271,7 @@
       ((string-equal head "if") (compile-if-stmt-returning form env target))
       ((string-equal head "do") (compile-do-stmt-returning form env target))
       ((string-equal head "cond") (compile-cond-stmt-returning form env target))
+      ((string-equal head "match") (compile-match-stmt-returning form env target))
       ((or (string-equal head "let") (string-equal head "let-mut"))
        (compile-let-stmt-returning form env target)))))
 
@@ -1377,7 +1397,8 @@
     ("quote" . compile-quote) ("quasiquote" . compile-quasiquote)
     ("sym" . compile-sym-literal) ("sym-eq?" . compile-sym-eq)
     ("gensym" . compile-gensym-expr)
-    ("not" . compile-not) ("bit-not" . compile-bit-not)))
+    ("not" . compile-not) ("bit-not" . compile-bit-not)
+    ("match" . compile-match-expr)))
 
 (defun compile-list (form env)
   (let* ((head (first form))
@@ -2266,6 +2287,8 @@
      (compile-recur-stmt form env))
     ((and (listp form) (sym= (first form) "cond"))
      (compile-cond-stmt form env))
+    ((and (listp form) (sym= (first form) "match"))
+     (compile-match-stmt form env))
     ((and (listp form) (sym= (first form) "block"))
      (compile-block-stmt form env))
     ((and (listp form) (sym= (first form) "do"))
@@ -2500,6 +2523,209 @@
         (declare (ignore tp))
         (list (format nil "  return ~a;" code)))
       (list "  return;")))
+
+;;; === Pattern Matching ===
+
+(defun match-pattern-check (pattern scrutinee scrutinee-type env)
+  "Parse a match pattern and return (condition-code bindings-stmts bound-env).
+   Pattern types:
+     (:type var) — union variant match with binding
+     (:type literal) — union variant match with literal check inside
+     (:type _) — union variant match, no binding
+     42 / \"hello\" — literal equality check
+     _ — wildcard (always matches)"
+  (cond
+    ;; Union variant pattern: (:type var) or (:type literal) or (:type _)
+    ((and (listp pattern) (keywordp (first pattern)))
+     (let* ((variant-keyword (first pattern))
+            (variant-type (parse-type-annotation variant-keyword))
+            (mname (mangle-type-name variant-type))
+            (union-c-name (if (union-type-p scrutinee-type)
+                              (ensure-union-type scrutinee-type)
+                              (type-to-c scrutinee-type)))
+            (tag-check (format nil "~a.tag == ~a_TAG_~a"
+                               scrutinee union-c-name (string-upcase mname)))
+            (inner (second pattern))
+            (new-env (make-env :parent env)))
+       (cond
+         ;; (:type _) — match variant, no binding
+         ((and (symbolp inner) (string-equal (string inner) "_"))
+          (values tag-check nil new-env))
+         ;; (:type var) where var is a symbol — bind extracted value
+         ((and (symbolp inner) (not (integerp inner)))
+          (let* ((var-name (string inner))
+                 (c-var (sanitize-name var-name))
+                 (extract (format nil "~a.as_~a" scrutinee mname))
+                 (binding (format nil "  ~a ~a = ~a;" (type-to-c variant-type) c-var extract)))
+            (env-bind new-env var-name variant-type)
+            (values tag-check (list binding) new-env)))
+         ;; (:type literal) — match variant + literal equality
+         ((integerp inner)
+          (let ((lit-check (format nil "(~a && ~a.as_~a == ~d)"
+                                   tag-check scrutinee mname inner)))
+            (values lit-check nil new-env)))
+         ;; (:type string-literal)
+         ((stringp inner)
+          (pushnew "string.h" *includes* :test #'string=)
+          (let ((lit-check (format nil "(~a && strcmp(~a.as_~a, ~s) == 0)"
+                                   tag-check scrutinee mname inner)))
+            (values lit-check nil new-env)))
+         ;; Default: just tag check
+         (t (values tag-check nil new-env)))))
+    ;; Wildcard: always matches
+    ((and (symbolp pattern) (string-equal (string pattern) "_"))
+     (values nil nil (make-env :parent env)))
+    ;; Integer literal match
+    ((integerp pattern)
+     (let ((check (format nil "~a == ~d" scrutinee pattern)))
+       (values check nil (make-env :parent env))))
+    ;; String literal match
+    ((stringp pattern)
+     (pushnew "string.h" *includes* :test #'string=)
+     (let ((check (format nil "strcmp(~a, ~s) == 0" scrutinee pattern)))
+       (values check nil (make-env :parent env))))
+    ;; Bare symbol — bind scrutinee to name
+    ((symbolp pattern)
+     (let* ((var-name (string pattern))
+            (c-var (sanitize-name var-name))
+            (new-env (make-env :parent env))
+            (binding (format nil "  ~a ~a = ~a;" (type-to-c scrutinee-type) c-var scrutinee)))
+       (env-bind new-env var-name scrutinee-type)
+       (values nil (list binding) new-env)))
+    ;; Fallback
+    (t (values nil nil (make-env :parent env)))))
+
+(defun compile-match-stmt (form env)
+  "(match scrutinee (pattern1 body1...) (pattern2 body2...) ...)"
+  (let* ((*pending-stmts* nil)
+         (scrutinee-form (second form))
+         (clauses (cddr form)))
+    (multiple-value-bind (scrut-code scrut-type) (compile-expr scrutinee-form env)
+      (let* ((lifted *pending-stmts*)
+             ;; Store scrutinee in a temp to avoid re-evaluation
+             (tmp (fresh-tmp))
+             (tmp-decl (format nil "  ~a ~a = ~a;" (type-to-c scrut-type) tmp scrut-code))
+             (result (append lifted (list tmp-decl)))
+             (first-clause t))
+        (dolist (clause clauses)
+          (let* ((pattern (first clause))
+                 (body-forms (rest clause)))
+            (multiple-value-bind (cond-code bindings clause-env)
+                (match-pattern-check pattern tmp scrut-type env)
+              (let ((branch-stmts (compile-body body-forms clause-env)))
+                (cond
+                  ;; Wildcard (no condition) — emit else
+                  ((null cond-code)
+                   (if first-clause
+                       ;; Only clause, no condition needed
+                       (progn
+                         (when bindings (setf result (append result bindings)))
+                         (setf result (append result (list "  {")))
+                         (dolist (s branch-stmts)
+                           (setf result (append result (list (format nil "  ~a" s)))))
+                         (setf result (append result (list "  }"))))
+                       (progn
+                         (setf result (append result (list "  } else {")))
+                         (when bindings
+                           (dolist (b bindings)
+                             (setf result (append result (list (format nil "  ~a" b))))))
+                         (dolist (s branch-stmts)
+                           (setf result (append result (list (format nil "  ~a" s))))))))
+                  ;; First clause with condition
+                  (first-clause
+                   (setf result (append result (list (format nil "  if (~a) {" cond-code))))
+                   (when bindings
+                     (dolist (b bindings)
+                       (setf result (append result (list (format nil "  ~a" b))))))
+                   (dolist (s branch-stmts)
+                     (setf result (append result (list (format nil "  ~a" s)))))
+                   (setf first-clause nil))
+                  ;; Subsequent clause
+                  (t
+                   (setf result (append result (list (format nil "  } else if (~a) {" cond-code))))
+                   (when bindings
+                     (dolist (b bindings)
+                       (setf result (append result (list (format nil "  ~a" b))))))
+                   (dolist (s branch-stmts)
+                     (setf result (append result (list (format nil "  ~a" s)))))))))))
+        (unless first-clause
+          (setf result (append result (list "  }"))))
+        result))))
+
+(defun compile-match-stmt-returning (form env target)
+  "(match scrutinee (pattern1 body1) ...) -> if-else chain assigning to target"
+  (let* ((*pending-stmts* nil)
+         (scrutinee-form (second form))
+         (clauses (cddr form)))
+    (multiple-value-bind (scrut-code scrut-type) (compile-expr scrutinee-form env)
+      (let* ((lifted *pending-stmts*)
+             (tmp (fresh-tmp))
+             (tmp-decl (format nil "  ~a ~a = ~a;" (type-to-c scrut-type) tmp scrut-code))
+             (result (append lifted (list tmp-decl)))
+             (first-clause t)
+             (clause-types nil))
+        (dolist (clause clauses)
+          (let* ((pattern (first clause))
+                 (body-form (if (= (length (rest clause)) 1)
+                                (second clause)
+                                (cons 'do (rest clause)))))
+            (multiple-value-bind (cond-code bindings clause-env)
+                (match-pattern-check pattern tmp scrut-type env)
+              (multiple-value-bind (body-type body-stmts)
+                  (compile-expr-returning body-form clause-env target)
+                (unless (eq body-type :void) (push body-type clause-types))
+                (cond
+                  ;; Wildcard
+                  ((null cond-code)
+                   (if first-clause
+                       (progn
+                         (when bindings (setf result (append result bindings)))
+                         (setf result (append result (list "  {")))
+                         (dolist (s body-stmts)
+                           (setf result (append result (list (format nil "  ~a" s)))))
+                         (setf result (append result (list "  }"))))
+                       (progn
+                         (setf result (append result (list "  } else {")))
+                         (when bindings
+                           (dolist (b bindings)
+                             (setf result (append result (list (format nil "  ~a" b))))))
+                         (dolist (s body-stmts)
+                           (setf result (append result (list (format nil "  ~a" s))))))))
+                  (first-clause
+                   (setf result (append result (list (format nil "  if (~a) {" cond-code))))
+                   (when bindings
+                     (dolist (b bindings)
+                       (setf result (append result (list (format nil "  ~a" b))))))
+                   (dolist (s body-stmts)
+                     (setf result (append result (list (format nil "  ~a" s)))))
+                   (setf first-clause nil))
+                  (t
+                   (setf result (append result (list (format nil "  } else if (~a) {" cond-code))))
+                   (when bindings
+                     (dolist (b bindings)
+                       (setf result (append result (list (format nil "  ~a" b))))))
+                   (dolist (s body-stmts)
+                     (setf result (append result (list (format nil "  ~a" s)))))))))))
+        (unless first-clause
+          (setf result (append result (list "  }"))))
+        (let ((result-type (if clause-types
+                               (reduce (lambda (a b)
+                                         (cond ((eq a :void) b)
+                                               ((eq b :void) a)
+                                               ((type-equal-p a b) a)
+                                               (t (make-union-type (list a b)))))
+                                       clause-types)
+                               :void)))
+          (values result-type result))))))
+
+(defun compile-match-expr (form env)
+  "Expression form of match — lift to temp variable"
+  (let ((tmp (fresh-tmp)))
+    (multiple-value-bind (type stmts) (compile-match-stmt-returning form env tmp)
+      (setf *pending-stmts* (append *pending-stmts*
+                                    (list (format nil "  ~a ~a;" (type-to-c type) tmp))
+                                    stmts))
+      (values tmp type))))
 
 (defun compile-cond-stmt (form env)
   "(cond [test1 body1...] [test2 body2...] [else bodyN...])"

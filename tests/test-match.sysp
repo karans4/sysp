@@ -1,0 +1,24 @@
+;;; Test: Pattern matching on union types, literals, wildcards
+
+(deftype IntOrStr (:union :int :str))
+
+(defn describe [v :IntOrStr] :void
+  (match v
+    ((:int n) (do (print "int: ") (println n)))
+    ((:str s) (do (print "str: ") (println s)))))
+
+(defn classify [v :IntOrStr] :int
+  (match v
+    ((:int 42) 1)
+    ((:int _) 2)
+    ((:str _) 3)))
+
+(defn main [] :int
+  (let v1 (IntOrStr-from-int 42))
+  (let v2 (IntOrStr-from-str "hello"))
+  (describe v1)
+  (describe v2)
+  (println (classify v1))
+  (println (classify (IntOrStr-from-int 7)))
+  (println (classify v2))
+  0)
