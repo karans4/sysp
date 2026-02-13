@@ -14,42 +14,7 @@
 ;;;              (:variadic :int)
 ;;;   Type vars:  (:tvar 1), (:tvar 2), ...
 
-;; Primitive type constructors — just return the keyword
-(defun make-char-type () :char)
-(defun make-short-type () :short)
-(defun make-int-type () :int)
-(defun make-long-type () :long)
-(defun make-long-long-type () :long-long)
-(defun make-uchar-type () :uchar)
-(defun make-ushort-type () :ushort)
-(defun make-uint-type () :uint)
-(defun make-ulong-type () :ulong)
-(defun make-ulong-long-type () :ulong-long)
-(defun make-i8-type () :i8)
-(defun make-i16-type () :i16)
-(defun make-i32-type () :i32)
-(defun make-i64-type () :i64)
-(defun make-u8-type () :u8)
-(defun make-u16-type () :u16)
-(defun make-u32-type () :u32)
-(defun make-u64-type () :u64)
-(defun make-float-type () :float)
-(defun make-double-type () :double)
-(defun make-f32-type () :f32)
-(defun make-f64-type () :f64)
-(defun make-size-type () :size)
-(defun make-ptrdiff-type () :ptrdiff)
-(defun make-intptr-type () :intptr)
-(defun make-uintptr-type () :uintptr)
-(defun make-void-type () :void)
-(defun make-bool-type () :bool)
-(defun make-str-type () :str)
-(defun make-symbol-type () :symbol)
-(defun make-value-type () :value)
-(defun make-cons-type* () :cons)  ; bare cons (no params)
-(defun make-nil-type () :nil)
-
-;; Compound type constructors — return lists
+;; Compound type constructors
 (defun make-ptr-type (pointee) `(:ptr ,pointee))
 (defun make-list-type (elem-type) `(:list ,elem-type))
 (defun make-variadic-type (elem-type) `(:variadic ,elem-type))
@@ -89,33 +54,9 @@
 (defun fn-type-args (ft) (second ft))
 (defun fn-type-ret (ft) (third ft))
 
-;; Backward-compatible accessors for the rest of the codebase
-(defun sysp-type-kind (tp)
-  "Extract the kind of a type (backward compat)"
-  (cond
-    ((keywordp tp) tp)                     ; :int -> :int
-    ((and (consp tp) (keywordp (car tp)))  ; (:ptr :int) -> :ptr
-     (car tp))
-    (t :unknown)))
-
-(defun sysp-type-name (tp)
-  "Extract the name of a type (backward compat)"
-  (cond
-    ((keywordp tp) nil)
-    ((and (consp tp) (member (car tp) '(:struct :enum :tvar)))
-     (second tp))
-    (t nil)))
-
-(defun sysp-type-params (tp)
-  "Extract the params of a type (backward compat)"
-  (cond
-    ((keywordp tp) nil)                    ; :int -> nil
-    ((and (consp tp) (eq (car tp) :fn))    ; (:fn (:int :int) :int) -> (:int :int :int)
-     (append (second tp) (list (third tp))))
-    ((and (consp tp) (eq (car tp) :tuple)) ; (:tuple :int :str) -> (:int :str)
-     (cdr tp))
-    ((consp tp) (cdr tp))                  ; (:ptr :int) -> (:int), (:cons :int :str) -> (:int :str)
-    (t nil)))
+(defun type-kind (tp)
+  "Extract the kind/tag of a type: :int -> :int, (:ptr :int) -> :ptr"
+  (if (consp tp) (car tp) tp))
 
 (defun type-equal-p (a b)
   "Check if two types are equal"
@@ -179,17 +120,6 @@
                                :float :double :f32 :f64
                                :size :ptrdiff :intptr :uintptr)))
 
-(defun numeric-rank (tp)
-  "Return numeric rank for promotion (higher = wider)."
-  (case (resolve-type tp)
-    ((:char :uchar :i8 :u8) 1)
-    ((:short :ushort :i16 :u16) 2)
-    ((:int :uint :i32 :u32) 3)
-    ((:long :ulong) 4)
-    ((:long-long :ulong-long :i64 :u64 :size :ptrdiff :intptr :uintptr) 5)
-    ((:float :f32) 6)
-    ((:double :f64) 7)
-    (t 0)))
 
 ;; Unify two types. Returns t on success, nil on failure.
 (defun unify (t1 t2)
@@ -311,32 +241,6 @@
 (defun infer-env-bind (name type)
   (push (cons name type) *infer-env*))
 
-;; === Inference Rule Macros ===
-
-;; Simple inference rule: match symbol, return type
-(defmacro definfer (sym ret-type)
-  `((sym= head ,sym) ,ret-type))
-
-;; Inference rule with function call
-(defmacro definfer-call (sym fn)
-  `((sym= head ,sym) (,fn form)))
-
-;; Infer binary op with unification
-(defmacro definfer-bin (sym)
-  `((member (string head) '(,sym) :test #'string-equal)
-    (let ((lt (infer-expr (second form)))
-          (rt (infer-expr (third form))))
-      (unify lt rt)
-      lt)))
-
-;; Infer comparison (returns bool)
-(defmacro definfer-cmp (syms)
-  `((member (string head) ',syms :test #'string-equal)
-    (let ((lt (infer-expr (second form)))
-          (rt (infer-expr (third form))))
-      (unify lt rt)
-      (make-bool-type))))
-
 ;; Resolve a type variable to its final concrete type, defaulting unbound tvars to :int
 (defun resolve-or-default (tp)
   (let ((resolved (resolve-type tp)))
@@ -352,24 +256,24 @@
 (defun infer-expr (form)
   "Walk an expression form and return its inferred type."
   (cond
-    ((null form) (make-nil-type))  ; nil is the empty list type
+    ((null form) :nil)  ; nil is the empty list type
     ((integerp form)
      ;; Infer integer type based on value range (C99 rules)
      (cond
-       ((<= -2147483648 form 2147483647) (make-int-type))
-       ((<= form 9223372036854775807) (make-long-long-type))
-       (t (make-ulong-long-type))))
-    ((floatp form) (make-float-type))
-    ((stringp form) (make-str-type))
+       ((<= -2147483648 form 2147483647) :int)
+       ((<= form 9223372036854775807) :long-long)
+       (t :ulong-long)))
+    ((floatp form) :float)
+    ((stringp form) :str)
     ((symbolp form)
      (let ((name (string form)))
        (cond
-         ((string-equal name "true") (make-bool-type))
-         ((string-equal name "false") (make-bool-type))
-         ((string-equal name "null") (make-ptr-type (make-void-type)))
+         ((string-equal name "true") :bool)
+         ((string-equal name "false") :bool)
+         ((string-equal name "null") (make-ptr-type :void))
          (t (or (infer-env-lookup name) (make-tvar))))))
     ((listp form) (infer-list form))
-    (t (make-int-type))))
+    (t :int)))
 
 (defun infer-list (form)
   "Infer the type of a list expression."
@@ -394,14 +298,14 @@
        (let ((lt (infer-expr (second form)))
              (rt (infer-expr (third form))))
          (unify lt rt)
-         (make-bool-type)))
+         :bool))
 
       ;; Logical: result is bool
-      ((member (string head) '("and" "or" "not") :test #'string-equal) (make-bool-type))
+      ((member (string head) '("and" "or" "not") :test #'string-equal) :bool)
 
       ;; Bitwise: operands are int, result is int
       ((member (string head) '("bit-and" "bit-or" "bit-xor" "bit-not" "shl" "shr")
-               :test #'string-equal) (make-int-type))
+               :test #'string-equal) :int)
 
       ;; if expression: unify both branches
       ((sym= head "if")
@@ -414,7 +318,7 @@
 
       ;; do block: type of last expression
       ((sym= head "do")
-       (let ((result (make-int-type)))
+       (let ((result :int))
          (dolist (subform (cdr form))
            (setf result (infer-expr subform)))
          result))
@@ -465,7 +369,7 @@
                (infer-env-bind name type))))
          (setf param-types (nreverse param-types))
          ;; Infer body type
-         (let ((body-type (make-int-type)))
+         (let ((body-type :int))
            (dolist (f body)
              (setf body-type (infer-expr f)))
            (let ((ret-type (or ret-ann body-type)))
@@ -474,7 +378,7 @@
              (make-fn-type param-types ret-type)))))
 
       ;; nil? : returns bool
-      ((sym= head "nil?") (make-bool-type))
+      ((sym= head "nil?") :bool)
 
       ;; cons: creates a cons cell
       ;; If cdr is a (:list T), result is (:list T) (homogeneous)
@@ -484,11 +388,11 @@
              (cdr-type (infer-expr (third form))))
          (cond
            ;; If cdr is nil, create a new list
-           ((eq (sysp-type-kind cdr-type) :nil)
+           ((eq (type-kind cdr-type) :nil)
             (make-list-type car-type))
            ;; If cdr is already a list of same type, extend it
-           ((and (eq (sysp-type-kind cdr-type) :list)
-                 (unify car-type (first (sysp-type-params cdr-type))))
+           ((and (eq (type-kind cdr-type) :list)
+                 (unify car-type (second cdr-type)))
             cdr-type)
            ;; Otherwise create an improper cons
            (t (make-cons-type car-type cdr-type)))))
@@ -499,11 +403,11 @@
              (elem-tvar (make-tvar)))
          (cond
            ;; If it's a list, return the element type
-           ((eq (sysp-type-kind cons-type) :list)
-            (first (sysp-type-params cons-type)))
+           ((eq (type-kind cons-type) :list)
+            (second cons-type))
            ;; If it's a cons, return the car type
-           ((eq (sysp-type-kind cons-type) :cons)
-            (first (sysp-type-params cons-type)))
+           ((eq (type-kind cons-type) :cons)
+            (second cons-type))
            ;; Otherwise unify with expected and return element
            (t (unify cons-type (make-cons-type elem-tvar (make-tvar)))
               elem-tvar))))
@@ -514,11 +418,11 @@
              (cdr-tvar (make-tvar)))
          (cond
            ;; If it's a list, return (:list elem) or nil
-           ((eq (sysp-type-kind cons-type) :list)
+           ((eq (type-kind cons-type) :list)
             cons-type)  ; (:list T) cdr is (:list T) or nil
            ;; If it's a cons, return the cdr type
-           ((eq (sysp-type-kind cons-type) :cons)
-            (second (sysp-type-params cons-type)))
+           ((eq (type-kind cons-type) :cons)
+            (third cons-type))
            ;; Otherwise unify with expected
            (t (unify cons-type (make-cons-type (make-tvar) cdr-tvar))
               cdr-tvar))))
@@ -532,13 +436,13 @@
 
       ;; quote/quasiquote: for now return Value (could be smarter)
       ((member (string head) '("quote" "quasiquote") :test #'string-equal)
-       (make-value-type))
+       :value)
 
       ;; Simple type returns
-      ((sym= head "nil?") (make-bool-type))
-      ((sym= head "sym") (make-value-type))
-      ((sym= head "sym-eq?") (make-bool-type))
-      ((sym= head "gensym") (make-value-type))
+      ((sym= head "nil?") :bool)
+      ((sym= head "sym") :value)
+      ((sym= head "sym-eq?") :bool)
+      ((sym= head "gensym") :value)
 
       ;; get: struct field access — need struct info
       ((sym= head "get")
@@ -559,20 +463,20 @@
       ((sym= head "cast")
        (parse-type-annotation (second form)))
       ((sym= head "sizeof")
-       (make-int-type))
+       :int)
 
       ;; Simple type returns for vector/array ops
-      ((sym= head "vector-len") (make-int-type))
-      ((sym= head "vector-set!") (make-void-type))
-      ((sym= head "vector-push!") (make-void-type))
+      ((sym= head "vector-len") :int)
+      ((sym= head "vector-set!") :void)
+      ((sym= head "vector-push!") :void)
       ((sym= head "array-ref") (make-tvar))
-      ((sym= head "array-set!") (make-void-type))
+      ((sym= head "array-set!") :void)
       ((sym= head "make-array") (make-tvar))
 
       ;; Function call: look up function type, unify args, return ret type
       (t (let* ((fn-name (string head))
                 (fn-type (infer-env-lookup fn-name)))
-           (if (and fn-type (eq (sysp-type-kind fn-type) :fn))
+           (if (and fn-type (eq (type-kind fn-type) :fn))
                ;; Known function: unify arguments
                (let ((arg-types (fn-type-args fn-type))
                      (ret-type (fn-type-ret fn-type)))
@@ -699,7 +603,7 @@
                (infer-env-bind pname type)))))))
     (setf param-types (nreverse param-types))
     ;; Infer body
-    (let ((body-type (make-int-type)))
+    (let ((body-type :int))
       (dolist (f (butlast body-forms))
         (infer-stmt f))
       (when (car (last body-forms))
@@ -744,7 +648,7 @@
                 (rest (cdddr form))
                 (ret-type (if (keywordp (first rest))
                               (parse-type-annotation (first rest))
-                              (make-void-type)))
+                              :void))
                 (param-types nil))
            (let ((lst (if (listp params-raw) (copy-list params-raw) nil)))
              (loop while lst do
@@ -776,7 +680,7 @@
 
 (defun value-type-p (tp)
   "Does this type need refcount management?"
-  (member (sysp-type-kind tp) '(:value :cons)))
+  (member (type-kind tp) '(:value :cons)))
 
 (defun env-add-release (env c-name)
   "Record a variable name for release at scope exit"
@@ -1048,50 +952,25 @@
          (t form))))
     (t form)))
 
+(defparameter *primitive-type-map*
+  (let ((ht (make-hash-table :test #'equal)))
+    (dolist (pair '(("char" . :char) ("short" . :short) ("int" . :int) ("long" . :long)
+                    ("long-long" . :long-long) ("uchar" . :uchar) ("ushort" . :ushort)
+                    ("uint" . :uint) ("ulong" . :ulong) ("ulong-long" . :ulong-long)
+                    ("i8" . :i8) ("i16" . :i16) ("i32" . :i32) ("i64" . :i64)
+                    ("u8" . :u8) ("u16" . :u16) ("u32" . :u32) ("u64" . :u64)
+                    ("float" . :float) ("double" . :double) ("f32" . :f32) ("f64" . :f64)
+                    ("size" . :size) ("ptrdiff" . :ptrdiff) ("intptr" . :intptr) ("uintptr" . :uintptr)
+                    ("void" . :void) ("bool" . :bool) ("str" . :str)
+                    ("symbol" . :symbol) ("value" . :value) ("cons" . :cons) ("nil" . :nil))
+              ht)
+      (setf (gethash (car pair) ht) (cdr pair)))))
+
 (defun parse-type-annotation (sym)
-  (let ((name (string-downcase (symbol-name sym))))
+  (let* ((name (string-downcase (symbol-name sym)))
+         (prim (gethash name *primitive-type-map*)))
     (cond
-      ;; Signed integers
-      ((string= name "char") (make-char-type))
-      ((string= name "short") (make-short-type))
-      ((string= name "int") (make-int-type))
-      ((string= name "long") (make-long-type))
-      ((string= name "long-long") (make-long-long-type))
-      ;; Unsigned integers
-      ((string= name "uchar") (make-uchar-type))
-      ((string= name "ushort") (make-ushort-type))
-      ((string= name "uint") (make-uint-type))
-      ((string= name "ulong") (make-ulong-type))
-      ((string= name "ulong-long") (make-ulong-long-type))
-      ;; Fixed-width signed (C99 stdint.h)
-      ((string= name "i8") (make-i8-type))
-      ((string= name "i16") (make-i16-type))
-      ((string= name "i32") (make-i32-type))
-      ((string= name "i64") (make-i64-type))
-      ;; Fixed-width unsigned (C99 stdint.h)
-      ((string= name "u8") (make-u8-type))
-      ((string= name "u16") (make-u16-type))
-      ((string= name "u32") (make-u32-type))
-      ((string= name "u64") (make-u64-type))
-      ;; Floating point
-      ((string= name "float") (make-float-type))
-      ((string= name "double") (make-double-type))
-      ((string= name "f32") (make-f32-type))
-      ((string= name "f64") (make-f64-type))
-      ;; Size/pointer types
-      ((string= name "size") (make-size-type))
-      ((string= name "ptrdiff") (make-ptrdiff-type))
-      ((string= name "intptr") (make-intptr-type))
-      ((string= name "uintptr") (make-uintptr-type))
-      ;; Other
-      ((string= name "void") (make-void-type))
-      ((string= name "bool") (make-bool-type))
-      ((string= name "str") (make-str-type))
-      ;; Value types
-      ((string= name "symbol") (make-symbol-type))
-      ((string= name "value") (make-value-type))
-      ((string= name "cons") :cons)
-      ((string= name "nil") (make-nil-type))
+      (prim prim)
       ;; Pointer shorthand: :ptr-int, :ptr-float, etc.
       ((and (> (length name) 4) (string= (subseq name 0 4) "ptr-"))
        (make-ptr-type (parse-type-annotation
@@ -1100,16 +979,14 @@
            (cond
              ((gethash sname *structs*) (make-struct-type sname))
              ((gethash sname *enums*) (make-enum-type sname))
-             ;; Type aliases (deftype)
-             ((gethash sname *type-aliases*)
-              (gethash sname *type-aliases*))
+             ((gethash sname *type-aliases*) (gethash sname *type-aliases*))
              (t `(:unknown ,sname))))))))
 
 
 ;;; === C Type Emission ===
 
 (defun type-to-c (tp)
-  (case (sysp-type-kind tp)
+  (case (type-kind tp)
     ;; Signed integers
     (:char "char")
     (:short "short")
@@ -1147,10 +1024,10 @@
     (:void "void")
     (:str "const char*")
     ;; Compound types
-    (:ptr (format nil "~a*" (type-to-c (first (sysp-type-params tp)))))
-    (:struct (sysp-type-name tp))
-    (:enum (sysp-type-name tp))
-    (:array (type-to-c (first (sysp-type-params tp))))  ; array decl handled specially
+    (:ptr (format nil "~a*" (type-to-c (second tp))))
+    (:struct (second tp))
+    (:enum (second tp))
+    (:array (type-to-c (second tp)))  ; array decl handled specially
     (:vector (vector-type-c-name tp))
     (:tuple (tuple-type-c-name tp))
     (:fn (fn-type-c-name tp))
@@ -1164,7 +1041,7 @@
     (otherwise "int")))
 
 (defun mangle-type-name (tp)
-  (case (sysp-type-kind tp)
+  (case (type-kind tp)
     ;; Integer types
     (:int "int")
     (:char "char")
@@ -1192,28 +1069,28 @@
     (:cons "cons")
     (:nil "nil")
     ;; Compound types
-    (:ptr (format nil "ptr_~a" (mangle-type-name (first (sysp-type-params tp)))))
-    (:struct (sysp-type-name tp))
-    (:enum (sysp-type-name tp))
-    (:array (format nil "arr_~a_~a" (mangle-type-name (first (sysp-type-params tp)))
-                    (second (sysp-type-params tp))))
+    (:ptr (format nil "ptr_~a" (mangle-type-name (second tp))))
+    (:struct (second tp))
+    (:enum (second tp))
+    (:array (format nil "arr_~a_~a" (mangle-type-name (second tp))
+                    (third tp)))
     (:vector (vector-type-c-name tp))
     (:tuple (tuple-type-c-name tp))
     (:fn (fn-type-c-name tp))
-    (:list (format nil "list_~a" (mangle-type-name (first (sysp-type-params tp)))))
-    (:variadic (format nil "var_~a" (mangle-type-name (first (sysp-type-params tp)))))
+    (:list (format nil "list_~a" (mangle-type-name (second tp))))
+    (:variadic (format nil "var_~a" (mangle-type-name (second tp))))
     ;; Union types
     (:union (format nil "Union_~{~a~^_~}" (mapcar #'mangle-type-name (cdr tp))))
     (otherwise (warn "mangle-type-name: unhandled type ~a" tp) "unknown")))
 
 (defun vector-type-c-name (tp)
-  (let* ((elem (first (sysp-type-params tp)))
+  (let* ((elem (second tp))
          (name (format nil "Vector_~a" (mangle-type-name elem))))
     (ensure-vector-type name elem)
     name))
 
 (defun tuple-type-c-name (tp)
-  (let* ((elems (sysp-type-params tp))
+  (let* ((elems (cdr tp))
          (name (format nil "Tuple_~{~a~^_~}" (mapcar #'mangle-type-name elems))))
     (ensure-tuple-type name elems)
     name))
@@ -1397,26 +1274,26 @@
 (defun compile-expr-inner (form env)
   "Compile a non-statement-like expression"
   (cond
-    ((null form) (values "0" (make-int-type)))
+    ((null form) (values "0" :int))
     ((integerp form)
      ;; Add suffix for large integers (C99)
      (cond
        ((<= -2147483648 form 2147483647)
-        (values (format nil "~d" form) (make-int-type)))
+        (values (format nil "~d" form) :int))
        ((<= form 9223372036854775807)
         ;; Fits in signed long long
-        (values (format nil "~dLL" form) (make-long-long-type)))
+        (values (format nil "~dLL" form) :long-long))
        (t
         ;; Larger than signed max - use unsigned long long
-        (values (format nil "~dULL" form) (make-ulong-long-type)))))
-    ((floatp form) (values (format nil "~f" form) (make-float-type)))
-    ((stringp form) (values (format nil "~s" form) (make-str-type)))
+        (values (format nil "~dULL" form) :ulong-long))))
+    ((floatp form) (values (format nil "~f" form) :float))
+    ((stringp form) (values (format nil "~s" form) :str))
     ((symbolp form)
      (let ((name (string form)))
        (cond
-         ((string-equal name "true") (values "1" (make-bool-type)))
-         ((string-equal name "false") (values "0" (make-bool-type)))
-         ((string-equal name "null") (values "NULL" (make-ptr-type (make-void-type))))
+         ((string-equal name "true") (values "1" :bool))
+         ((string-equal name "false") (values "0" :bool))
+         ((string-equal name "null") (values "NULL" (make-ptr-type :void)))
          (t (let ((tp (env-lookup env name)))
               (if tp
                   (values (sanitize-name name) tp)
@@ -1450,12 +1327,6 @@
 (defun sym= (sym name)
   (and (symbolp sym) (string-equal (symbol-name sym) name)))
 
-(defmacro defbinops (compiler-name &rest syms-ops)
-  "Generate cond clauses for binary operators"
-  `(cond
-     ,@(loop for (sym op) in syms-ops
-             collect `((sym= head ,sym) (,(intern compiler-name) ,op form env)))))
-
 (defmacro define-accessor (name pattern type-expr)
   "Define a simple accessor compiler function.
    Pattern is a format string with ~a for object and ~a for index.
@@ -1471,164 +1342,72 @@
   `(defun ,(intern (format nil "COMPILE-~a" name)) (form env)
      (multiple-value-bind (obj tp) (compile-expr (second form) env)
        (declare (ignore tp))
-       (values (format nil ,pattern obj) (make-int-type)))))
+       (values (format nil ,pattern obj) :int))))
 
 (defmacro define-value-accessor (name c-fun ret-type)
   `(defun ,(intern (format nil "COMPILE-~a" name)) (form env)
      (setf *uses-value-type* t)
      (multiple-value-bind (code tp) (compile-expr (second form) env)
        (declare (ignore tp))
-       (values (format nil ,(format nil "~a(~~a)" c-fun) code) (,ret-type)))))
+       (values (format nil ,(format nil "~a(~~a)" c-fun) code) ,ret-type))))
 
-;; === Compilation Rule Macros ===
-;; These macros make the dispatch tables readable and declarative
+;; Operator dispatch tables
+(defparameter *binop-ops*
+  '(("+" . "+") ("-" . "-") ("*" . "*") ("/" . "/") ("%" . "%") ("mod" . "%")
+    ("<" . "<") (">" . ">") ("<=" . "<=") (">=" . ">=") ("==" . "==") ("!=" . "!=")
+    ("bit-and" . "&") ("bit-or" . "|") ("bit-xor" . "^") ("shl" . "<<") ("shr" . ">>")))
 
-(defmacro defbinop (sym op)
-  `((sym= head ,sym) (compile-binop ,op form env)))
+(defparameter *logical-ops* '(("and" . "&&") ("or" . "||")))
 
-(defmacro deflogical (sym op)
-  `((sym= head ,sym) (compile-logical ,op form env)))
-
-;; Simple compile rules: just call a function with (form env)
-(defmacro defcompile (sym fn)
-  `((sym= head ,sym) (,fn form env)))
-
-;; For operators with simple type returns
-(defmacro defop (sym ret-type)
-  `((sym= head ,sym)
-    (multiple-value-bind (code tp) (compile-expr (second form) env)
-      (declare (ignore tp))
-      (values code (,ret-type)))))
-
-;; For binary ops that need type-aware codegen
-(defmacro defbin (sym c-op result-type-expr)
-  `((sym= head ,sym)
-    (multiple-value-bind (lhs lt) (compile-expr (second form) env)
-      (multiple-value-bind (rhs rt) (compile-expr (third form) env)
-        (declare (ignore rt))
-        (values (format nil "(~a ~a ~a)" lhs ,c-op rhs) ,result-type-expr)))))
+(defparameter *expr-dispatch*
+  '(("if" . compile-if-expr) ("do" . compile-do-expr) ("cond" . compile-cond-expr)
+    ("get" . compile-get) ("vector" . compile-vector)
+    ("vector-ref" . compile-vector-ref) ("vector-set!" . compile-vector-set)
+    ("vector-push!" . compile-vector-push) ("vector-len" . compile-vector-len)
+    ("tuple" . compile-tuple) ("tuple-ref" . compile-tuple-ref)
+    ("lambda" . compile-lambda)
+    ("array-ref" . compile-array-ref) ("array-set!" . compile-array-set)
+    ("make-array" . compile-make-array)
+    ("set!" . compile-set-expr)
+    ("addr-of" . compile-addr-of) ("deref" . compile-deref)
+    ("cast" . compile-cast) ("sizeof" . compile-sizeof)
+    ("runtype" . compile-runtype) ("as" . compile-as)
+    ("cons" . compile-cons) ("car" . compile-car) ("cdr" . compile-cdr)
+    ("nil?" . compile-nilp) ("list" . compile-list-expr)
+    ("quote" . compile-quote) ("quasiquote" . compile-quasiquote)
+    ("sym" . compile-sym-literal) ("sym-eq?" . compile-sym-eq)
+    ("gensym" . compile-gensym-expr)
+    ("not" . compile-not) ("bit-not" . compile-bit-not)))
 
 (defun compile-list (form env)
-  (let ((head (first form)))
+  (let* ((head (first form))
+         (name (when (symbolp head) (symbol-name head))))
+    (unless name (return-from compile-list (compile-call form env)))
+    (let ((binop (cdr (assoc name *binop-ops* :test #'string-equal))))
+      (when binop
+        (return-from compile-list
+          (if (and (string= binop "-") (= (length form) 2))
+              (compile-unary-minus form env)
+              (compile-binop binop form env)))))
+    (let ((logical (cdr (assoc name *logical-ops* :test #'string-equal))))
+      (when logical
+        (return-from compile-list (compile-logical logical form env))))
+    (let ((handler (cdr (assoc name *expr-dispatch* :test #'string-equal))))
+      (when handler
+        (return-from compile-list (funcall handler form env))))
     (cond
-      ;; Arithmetic
-      ((sym= head "+") (compile-binop "+" form env))
-      ((sym= head "-")
-       (if (= (length form) 2)
-           (compile-unary-minus form env)
-           (compile-binop "-" form env)))
-      ((sym= head "*") (compile-binop "*" form env))
-      ((sym= head "/") (compile-binop "/" form env))
-      ((sym= head "%") (compile-binop "%" form env))
-      ((sym= head "mod") (compile-binop "%" form env))
-      ;; Comparison
-      ((sym= head "<") (compile-binop "<" form env))
-      ((sym= head ">") (compile-binop ">" form env))
-      ((sym= head "<=") (compile-binop "<=" form env))
-      ((sym= head ">=") (compile-binop ">=" form env))
-      ((sym= head "==") (compile-binop "==" form env))
-      ((sym= head "!=") (compile-binop "!=" form env))
-      ;; Logical (variadic)
-      ((sym= head "and") (compile-logical "&&" form env))
-      ((sym= head "or") (compile-logical "||" form env))
-      ((sym= head "not") (compile-not form env))
-      ;; Bitwise
-      ((sym= head "bit-and") (compile-binop "&" form env))
-      ((sym= head "bit-or") (compile-binop "|" form env))
-      ((sym= head "bit-xor") (compile-binop "^" form env))
-      ((sym= head "bit-not") (compile-bit-not form env))
-      ((sym= head "shl") (compile-binop "<<" form env))
-      ((sym= head "shr") (compile-binop ">>" form env))
-      ;; Control flow
-      ((sym= head "if") (compile-if-expr form env))
-      ((sym= head "do") (compile-do-expr form env))
-      ((sym= head "cond") (compile-cond-expr form env))
-      ;; Data structures
-      ((sym= head "get") (compile-get form env))
-      ((sym= head "vector") (compile-vector form env))
-      ((sym= head "vector-ref") (compile-vector-ref form env))
-      ((sym= head "vector-set!") (compile-vector-set form env))
-      ((sym= head "vector-push!") (compile-vector-push form env))
-      ((sym= head "vector-len") (compile-vector-len form env))
-      ((sym= head "tuple") (compile-tuple form env))
-      ((sym= head "tuple-ref") (compile-tuple-ref form env))
-      ((sym= head "lambda") (compile-lambda form env))
-      ;; Arrays
-      ((sym= head "array-ref") (compile-array-ref form env))
-      ((sym= head "array-set!") (compile-array-set form env))
-      ((sym= head "make-array") (compile-make-array form env))
-      ;; Assignment
-      ((sym= head "set!") (compile-set-expr form env))
-      ;; Pointer ops
-      ((sym= head "addr-of") (compile-addr-of form env))
-      ((sym= head "deref") (compile-deref form env))
-      ;; Type ops
-      ((sym= head "cast") (compile-cast form env))
-      ((sym= head "sizeof") (compile-sizeof form env))
-      ;; Union ops
-      ((sym= head "runtype") (compile-runtype form env))
-      ((sym= head "as") (compile-as form env))
-      ;; Cons / Value ops
-      ((sym= head "cons") (compile-cons form env))
-      ((sym= head "car") (compile-car form env))
-      ((sym= head "cdr") (compile-cdr form env))
-      ((sym= head "nil?") (compile-nilp form env))
-      ((sym= head "list") (compile-list-expr form env))
-      ((sym= head "quote") (compile-quote form env))
-      ((sym= head "quasiquote") (compile-quasiquote form env))
-      ((sym= head "sym") (compile-sym-literal form env))
-      ((sym= head "sym-eq?") (compile-sym-eq form env))
-      ((sym= head "gensym") (compile-gensym-expr form env))
-      ;; recur in expression position = not tail position
       ((sym= head "recur")
        (error "sysp: recur must be in tail position (last expression of a function, or branch of if/cond in tail position)"))
-      ;; return in expression position
       ((sym= head "return")
        (error "sysp: return cannot be used as an expression"))
-      ;; Otherwise: function/constructor call
       (t (compile-call form env)))))
-
-(defun type-rank (kind)
-  "Return numeric rank for C99 usual arithmetic conversions.
-   Higher rank = wider type. Negative for unsigned."
-  (case kind
-    ;; Floating point (highest ranks)
-    ((:double :f64) 100)
-    ((:float :f32) 90)
-    ;; Signed integers (rank = approximate bit width)
-    (:long-long 64)
-    (:i64 64)
-    (:long 32)  ; actually at least 32
-    (:i32 32)
-    (:int 16)   ; actually at least 16
-    (:i16 16)
-    (:short 16)
-    (:i8 8)
-    (:char 8)
-    ;; Unsigned integers (negative ranks to distinguish from signed)
-    (:ulong-long -64)
-    (:u64 -64)
-    (:ulong -32)
-    (:u32 -32)
-    (:uint -16)
-    (:u16 -16)
-    (:ushort -16)
-    (:u8 -8)
-    (:uchar -8)
-    ;; Size types (treat as unsigned long or long long)
-    (:size -32)
-    (:uintptr -32)
-    (:ptrdiff 32)
-    (:intptr 32)
-    ;; Default
-    (otherwise 16)))
 
 (defun sysp-arithmetic-type (t1 t2)
   "Compute result type for binary arithmetic.
    Unlike C, sysp preserves types: i8 + i8 = i8, not int.
    Only promotes when mixing different types."
-  (let ((k1 (sysp-type-kind t1))
-        (k2 (sysp-type-kind t2)))
+  (let ((k1 (type-kind t1))
+        (k2 (type-kind t2)))
     ;; Same type? Return it. No surprises.
     (when (eq k1 k2)
       (return-from sysp-arithmetic-type t1))
@@ -1656,7 +1435,7 @@
         (cond
           ;; Float wins over everything
           ((or (>= r1 100) (>= r2 100))
-           (if (>= (max r1 r2) 200) (make-double-type) (make-float-type)))
+           (if (>= (max r1 r2) 200) :double :float))
           ;; Both integers - use wider type
           ((> r1 r2) t1)
           ((> r2 r1) t2)
@@ -1673,10 +1452,10 @@
               (cond
                 ;; Comparison and logical operators always return bool (int in C)
                 ((member op '("<" ">" "<=" ">=" "==" "!=" "&&" "||") :test #'string=)
-                 (make-bool-type))
+                 :bool)
                 ;; Bitwise operators return int (operate on integer types)
                 ((member op '("&" "|" "^" "<<" ">>") :test #'string=)
-                 (make-int-type))
+                 :int)
                 ;; Arithmetic operators: use C99 promotion rules
                 (t (sysp-arithmetic-type lt rt)))))
         (values (format nil "(~a ~a ~a)" lhs op rhs) result-type)))))
@@ -1686,11 +1465,11 @@
   (let* ((args (rest form))
          (compiled (mapcar (lambda (a) (first (multiple-value-list (compile-expr a env)))) args)))
     (if (= (length compiled) 1)
-        (values (first compiled) (make-bool-type))
+        (values (first compiled) :bool)
         (values (format nil "(~a)"
                         (reduce (lambda (acc x) (format nil "~a ~a ~a" acc op x))
                                 compiled))
-                (make-bool-type)))))
+                :bool))))
 
 (defun compile-unary-minus (form env)
   (multiple-value-bind (val tp) (compile-expr (second form) env)
@@ -1699,12 +1478,12 @@
 (defun compile-not (form env)
   (multiple-value-bind (val tp) (compile-expr (second form) env)
     (declare (ignore tp))
-    (values (format nil "(!~a)" val) (make-bool-type))))
+    (values (format nil "(!~a)" val) :bool)))
 
 (defun compile-bit-not (form env)
   (multiple-value-bind (val tp) (compile-expr (second form) env)
     (declare (ignore tp))
-    (values (format nil "(~~~a)" val) (make-int-type))))
+    (values (format nil "(~~~a)" val) :int)))
 
 (defun parse-if-branches (forms &key arc-style)
   "Parse forms after (if cond ...) into (values then-forms elif-list else-forms).
@@ -1813,7 +1592,7 @@
 
 (defun compile-cond-clauses (clauses env)
   (if (null clauses)
-      (values "0" (make-int-type))
+      (values "0" :int)
       (let ((clause (first clauses)))
         (if (and (symbolp (first clause)) (sym= (first clause) "else"))
             (compile-expr (second clause) env)
@@ -1926,7 +1705,7 @@
     (setf result (append result (list "  }")))
     ;; Compute result type from all clause types
     (let ((result-type (cond
-                         ((null clause-types) (make-int-type))
+                         ((null clause-types) :int)
                          ((every (lambda (t2) (type-equal-p (first clause-types) t2)) (rest clause-types))
                           (first clause-types))
                          (t (make-union-type clause-types)))))
@@ -1958,19 +1737,19 @@
   "(get struct field)"
   (multiple-value-bind (obj tp) (compile-expr (second form) env)
     (let* ((field-name (string (third form)))
-           (field-type (if (and (eq (sysp-type-kind tp) :struct)
-                                (gethash (sysp-type-name tp) *structs*))
-                           (let ((fields (gethash (sysp-type-name tp) *structs*)))
+           (field-type (if (and (eq (type-kind tp) :struct)
+                                (gethash (second tp) *structs*))
+                           (let ((fields (gethash (second tp) *structs*)))
                              (cdr (assoc field-name fields :test #'equal)))
-                           (make-int-type))))
+                           :int)))
       (values (format nil "~a.~a" obj (sanitize-name field-name))
-              (or field-type (make-int-type))))))
+              (or field-type :int)))))
 
 (defun compile-vector (form env)
   "(vector elem ...) - C99 compound literal with malloc helper"
   (let* ((elems (rest form))
          (compiled (mapcar (lambda (e) (multiple-value-list (compile-expr e env))) elems))
-         (elem-type (if compiled (second (first compiled)) (make-int-type)))
+         (elem-type (if compiled (second (first compiled)) :int))
          (vec-type (make-vector-type elem-type))
          (c-name (type-to-c vec-type))
          (c-elem (type-to-c elem-type))
@@ -1986,9 +1765,9 @@
                   vec-type)))))
 
 (define-accessor vector-ref "~a.data[~a]"
-  (if (eq (sysp-type-kind tp) :vector)
-      (first (sysp-type-params tp))
-      (make-int-type)))
+  (if (eq (type-kind tp) :vector)
+      (second tp)
+      :int))
 
 (defun compile-vector-set (form env)
   "(vector-set! vec idx val)"
@@ -1997,9 +1776,9 @@
       (declare (ignore it))
       (multiple-value-bind (val val-type) (compile-expr (fourth form) env)
         (declare (ignore val-type))
-        (let ((elem-type (if (eq (sysp-type-kind vt) :vector)
-                             (first (sysp-type-params vt))
-                             (make-int-type))))
+        (let ((elem-type (if (eq (type-kind vt) :vector)
+                             (second vt)
+                             :int)))
           (values (format nil "(~a.data[~a] = ~a)" vec idx val) elem-type))))))
 
 (defun compile-vector-push (form env)
@@ -2007,15 +1786,15 @@
   (multiple-value-bind (vec vt) (compile-expr (second form) env)
     (multiple-value-bind (val val-type) (compile-expr (third form) env)
       (declare (ignore val-type))
-      (let* ((elem-type (if (eq (sysp-type-kind vt) :vector)
-                            (first (sysp-type-params vt))
-                            (make-int-type)))
+      (let* ((elem-type (if (eq (type-kind vt) :vector)
+                            (second vt)
+                            :int))
              (c-vec (type-to-c vt))
              (c-elem (type-to-c elem-type))
              (helper-name (format nil "sysp_vecpush_~a" (mangle-type-name elem-type))))
         (ensure-vector-push-helper helper-name c-vec c-elem)
         (values (format nil "~a(&~a, ~a)" helper-name vec val)
-                (make-void-type))))))
+                :void)))))
 
 (define-len vector-len "~a.len")
 
@@ -2034,15 +1813,15 @@
   "(tuple-ref tup idx)"
   (multiple-value-bind (tup tt) (compile-expr (second form) env)
     (let* ((idx (third form))
-           (elem-type (if (eq (sysp-type-kind tt) :tuple)
-                          (nth idx (sysp-type-params tt))
-                          (make-int-type))))
+           (elem-type (if (eq (type-kind tt) :tuple)
+                          (nth (1+ idx) tt)
+                          :int)))
       (values (format nil "~a._~d" tup idx) elem-type))))
 
 (define-accessor array-ref "~a[~a]"
-  (if (eq (sysp-type-kind tp) :array)
-      (first (sysp-type-params tp))
-      (make-int-type)))
+  (if (eq (type-kind tp) :array)
+      (second tp)
+      :int))
 
 (defun compile-array-set (form env)
   "(array-set! arr idx val)"
@@ -2051,9 +1830,9 @@
       (declare (ignore it))
       (multiple-value-bind (val vt) (compile-expr (fourth form) env)
         (declare (ignore vt))
-        (let ((elem-type (if (eq (sysp-type-kind at) :array)
-                             (first (sysp-type-params at))
-                             (make-int-type))))
+        (let ((elem-type (if (eq (type-kind at) :array)
+                             (second at)
+                             :int)))
           (values (format nil "(~a[~a] = ~a)" arr idx val) elem-type))))))
 
 (defun compile-make-array (form env)
@@ -2149,9 +1928,9 @@
 (defun compile-deref (form env)
   "(deref ptr)"
   (multiple-value-bind (code tp) (compile-expr (second form) env)
-    (let ((pointee (if (eq (sysp-type-kind tp) :ptr)
-                       (first (sysp-type-params tp))
-                       (make-int-type))))
+    (let ((pointee (if (eq (type-kind tp) :ptr)
+                       (second tp)
+                       :int)))
       (values (format nil "(*~a)" code) pointee))))
 
 (defun compile-cast (form env)
@@ -2167,9 +1946,9 @@
   (let ((arg (second form)))
     (if (keywordp arg)
         (values (format nil "sizeof(~a)" (type-to-c (parse-type-annotation arg)))
-                (make-int-type))
+                :int)
         (values (format nil "sizeof(~a)" (sanitize-name (string arg)))
-                (make-int-type)))))
+                :int))))
 
 ;;; === Union Type Ops ===
 
@@ -2177,7 +1956,7 @@
   "(runtype expr) → expr.tag (integer). For union types, returns the tag enum value."
   (multiple-value-bind (code tp) (compile-expr (second form) env)
     (declare (ignore tp))
-    (values (format nil "~a.tag" code) (make-int-type))))
+    (values (format nil "~a.tag" code) :int)))
 
 (defun compile-as (form env)
   "(as :type expr) → expr.as_type. Extract a specific variant from a union."
@@ -2192,7 +1971,7 @@
 (defun wrap-as-value (code tp)
   "Wrap a compiled C expression as a Value based on its type"
   (setf *uses-value-type* t)
-  (case (sysp-type-kind tp)
+  (case (type-kind tp)
     (:int (format nil "val_int(~a)" code))
     (:float (format nil "val_float(~a)" code))
     (:f32 (format nil "val_float((double)~a)" code))
@@ -2243,7 +2022,7 @@
         (when (needs-retain-for-storage-p (third form) env)
           (setf cdr-val (format nil "val_retain(~a)" cdr-val)))
         (values (format nil "val_cons(make_cons(~a, ~a))" car-val cdr-val)
-                (make-value-type))))))
+                :value)))))
 
 ;; car/cdr with constant folding for quoted literals
 (defun compile-car (form env)
@@ -2254,10 +2033,10 @@
     (if (and (listp arg) (symbolp (first arg))
              (string-equal (string (first arg)) "quote")
              (listp (second arg)))
-        (values (compile-quoted-datum (first (second arg))) (make-value-type))
+        (values (compile-quoted-datum (first (second arg))) :value)
         (multiple-value-bind (code tp) (compile-expr arg env)
           (declare (ignore tp))
-          (values (format nil "sysp_car(~a)" code) (make-value-type))))))
+          (values (format nil "sysp_car(~a)" code) :value)))))
 
 (defun compile-cdr (form env)
   "(cdr x) - with constant folding for (cdr 'literal)"
@@ -2267,17 +2046,17 @@
     (if (and (listp arg) (symbolp (first arg))
              (string-equal (string (first arg)) "quote")
              (listp (second arg)))
-        (values (compile-quoted-datum (rest (second arg))) (make-value-type))
+        (values (compile-quoted-datum (rest (second arg))) :value)
         (multiple-value-bind (code tp) (compile-expr arg env)
           (declare (ignore tp))
-          (values (format nil "sysp_cdr(~a)" code) (make-value-type))))))
-(define-value-accessor nilp "sysp_nilp" make-bool-type)
+          (values (format nil "sysp_cdr(~a)" code) :value)))))
+(define-value-accessor nilp "sysp_nilp" :bool)
 
 (defun compile-list-expr (form env)
   "(list x y z ...) -> nested cons"
   (setf *uses-value-type* t)
   (if (null (rest form))
-      (values "val_nil()" (make-value-type))
+      (values "val_nil()" :value)
       (let ((elems (rest form)))
         (labels ((build (items)
                    (if (null items)
@@ -2289,13 +2068,13 @@
                              (setf val (format nil "val_retain(~a)" val)))
                            (format nil "val_cons(make_cons(~a, ~a))"
                                    val (build (rest items))))))))
-          (values (build elems) (make-value-type))))))
+          (values (build elems) :value)))))
 
 (defun compile-quote (form env)
   "(quote datum) — compile quoted literal to runtime Value"
   (declare (ignore env))
   (setf *uses-value-type* t)
-  (values (compile-quoted-datum (second form)) (make-value-type)))
+  (values (compile-quoted-datum (second form)) :value))
 
 (defun compile-quoted-datum (datum)
   "Recursively compile a quoted datum to C code building Value cells"
@@ -2319,7 +2098,7 @@
 (defun compile-quasiquote (form env)
   "(quasiquote datum) — like quote but with ~unquote and ~@splice"
   (setf *uses-value-type* t)
-  (values (compile-qq (second form) env) (make-value-type)))
+  (values (compile-qq (second form) env) :value))
 
 (defun compile-qq (datum env)
   "Recursively compile a quasiquoted datum"
@@ -2346,7 +2125,7 @@
           ((and (listp first-item) (symbolp (first first-item))
                 (string-equal (symbol-name (first first-item)) "splice"))
            (multiple-value-bind (code tp) (compile-expr (second first-item) env)
-             (let ((val (if (member (sysp-type-kind tp) '(:value :cons))
+             (let ((val (if (member (type-kind tp) '(:value :cons))
                             code
                             (wrap-as-value code tp))))
                (format nil "sysp_append(~a, ~a)" val rest-code))))
@@ -2369,7 +2148,7 @@
   (setf *uses-value-type* t)
   (let* ((name (string (second form)))
          (id (intern-symbol name)))
-    (values (format nil "~d" id) (make-symbol-type))))
+    (values (format nil "~d" id) :symbol)))
 
 (defun compile-sym-eq (form env)
   "(sym-eq? a b) — compare two Values as symbols"
@@ -2378,13 +2157,13 @@
     (declare (ignore at))
     (multiple-value-bind (b-code bt) (compile-expr (third form) env)
       (declare (ignore bt))
-      (values (format nil "sysp_sym_eq(~a, ~a)" a-code b-code) (make-bool-type)))))
+      (values (format nil "sysp_sym_eq(~a, ~a)" a-code b-code) :bool))))
 
 (defun compile-gensym-expr (form env)
   "(gensym) — generate a unique symbol at runtime"
   (declare (ignore form env))
   (setf *uses-value-type* t)
-  (values "val_sym(_sysp_gensym++)" (make-value-type)))
+  (values "val_sym(_sysp_gensym++)" :value))
 
 (defun c-fn-name (fn-name)
   "Get the C name for a function, checking overrides first."
@@ -2398,11 +2177,11 @@
     (if (gethash fn-name *structs*)
         (compile-struct-construct fn-name args env)
         (let* ((fn-type (env-lookup env fn-name))
-               (fn-arg-types (when (and fn-type (eq (sysp-type-kind fn-type) :fn))
+               (fn-arg-types (when (and fn-type (eq (type-kind fn-type) :fn))
                                (fn-type-args fn-type)))
-               (ret-type (if fn-type (fn-type-ret fn-type) (make-int-type)))
+               (ret-type (if fn-type (fn-type-ret fn-type) :int))
                (variadic-p (and fn-arg-types (> (length fn-arg-types) 0)
-                                (eq (sysp-type-kind (car (last fn-arg-types))) :value)))
+                                (eq (type-kind (car (last fn-arg-types))) :value)))
                (fixed-count (if variadic-p (1- (length fn-arg-types)) (length fn-arg-types)))
                (compiled-args nil)
                (rest-list nil))
@@ -2523,11 +2302,11 @@
           ;; Track Value-typed locals for release at scope exit
           (when (and *uses-value-type* (value-type-p final-type))
             (env-add-release env c-name))
-          (let ((decl (if (eq (sysp-type-kind final-type) :array)
+          (let ((decl (if (eq (type-kind final-type) :array)
                           (list (format nil "  ~a ~a[~a] = ~a;"
-                                        (type-to-c (first (sysp-type-params final-type)))
+                                        (type-to-c (second final-type))
                                         c-name
-                                        (second (sysp-type-params final-type))
+                                        (third final-type)
                                         init-code))
                           (if needs-retain
                               (list (format nil "  ~a ~a = val_retain(~a);"
@@ -2539,7 +2318,7 @@
 (defun format-print-arg (val-code val-type)
   "Return format string and arg for a typed value (C99 format specifiers)
    Uses inttypes.h macros for portable fixed-width printing."
-  (case (sysp-type-kind val-type)
+  (case (type-kind val-type)
     ;; Signed integers
     (:char (values "%d" val-code))  ; %c for char, %d for numeric
     (:short (values "%hd" val-code))
@@ -2685,7 +2464,7 @@
          (var-name (string (first spec)))
          (body-forms (cddr form))
          (body-env (make-env :parent env)))
-    (env-bind body-env var-name (make-int-type))
+    (env-bind body-env var-name :int)
     (multiple-value-bind (start-code st) (compile-expr (second spec) body-env)
       (declare (ignore st))
       (multiple-value-bind (end-code et) (compile-expr (third spec) body-env)
@@ -2805,34 +2584,10 @@
       ;; Simple type
       (t (cons (parse-type-annotation sym) lst)))))
 
-(defun parse-params (param-list)
+(defun parse-params (param-list &optional inferred-arg-types)
   "Parse parameters, handling [a :int & rest] for variadic functions.
+   Uses inferred types for unannotated params when available.
    Returns (values fixed-params rest-param) where rest-param is nil or (name type)."
-  (let ((fixed nil)
-        (rest nil)
-        (lst (if (listp param-list) param-list nil))
-        (in-rest nil))
-    (loop while lst do
-      (let ((item (pop lst)))
-        (cond
-          ;; & indicates rest args follow
-          ((and (symbolp item) (string= (string item) "&"))
-           (setf in-rest t))
-          ;; Regular parameter
-          (t
-           (let* ((name (string item))
-                  (type (if (and lst (keywordp (first lst)))
-                            (let ((result (parse-type-from-list lst)))
-                              (setf lst (cdr result))
-                              (car result))
-                            (make-int-type))))
-             (if in-rest
-                 (setf rest (list name type))
-                 (push (list name type) fixed)))))))
-    (values (nreverse fixed) rest)))
-
-(defun parse-params-with-inference (param-list inferred-arg-types)
-  "Like parse-params but uses inferred types for unannotated parameters."
   (let ((fixed nil)
         (rest nil)
         (lst (if (listp param-list) (copy-list param-list) nil))
@@ -2852,10 +2607,9 @@
                             (if (and inferred-arg-types
                                      (< inf-idx (length inferred-arg-types)))
                                 (nth inf-idx inferred-arg-types)
-                                (make-int-type)))))
+                                :int))))
              (if in-rest
-                 ;; Rest params are always Value type (internal implementation detail)
-                 (setf rest (list name (make-value-type)))
+                 (setf rest (list name :value))
                  (push (list name type) fixed)))
            (incf inf-idx)))))
     (values (nreverse fixed) rest)))
@@ -2956,16 +2710,16 @@
          ;; Look up inferred function type (from pre-pass)
          (inferred-fn-type (infer-env-lookup name))
          (inferred-arg-types (when (and inferred-fn-type
-                                        (eq (sysp-type-kind inferred-fn-type) :fn))
+                                        (eq (type-kind inferred-fn-type) :fn))
                                (fn-type-args inferred-fn-type)))
          (inferred-ret-type (when (and inferred-fn-type
-                                       (eq (sysp-type-kind inferred-fn-type) :fn))
+                                       (eq (type-kind inferred-fn-type) :fn))
                               (fn-type-ret inferred-fn-type)))
          ;; Parse params, handling & for variadic
          (params-fixed nil)
          (params-rest nil)
          (_ (multiple-value-setq (params-fixed params-rest)
-              (parse-params-with-inference params-raw inferred-arg-types)))
+              (parse-params params-raw inferred-arg-types)))
          (params (if params-rest (append params-fixed (list params-rest)) params-fixed))
          (variadic-p (not (null params-rest)))
          (ret-annotation (when (keywordp (first rest-forms))
@@ -2978,7 +2732,7 @@
          (env (make-env :parent *global-env*)))
     ;; Register function in global env (use inferred ret type if no annotation)
     (let* ((arg-types (mapcar #'second params))
-           (ret-type (or ret-annotation inferred-ret-type (make-int-type)))
+           (ret-type (or ret-annotation inferred-ret-type :int))
            (fn-type (make-fn-type arg-types ret-type)))
       (env-bind *global-env* name fn-type))
     ;; Register for compile-time macro use (skip main)
@@ -2995,7 +2749,7 @@
            (last-form (car (last body-forms)))
            (stmts (when all-but-last (compile-body all-but-last env)))
            (uses-recur (form-uses-recur-p body-forms))
-           (ret-type (or ret-annotation inferred-ret-type (make-int-type)))
+           (ret-type (or ret-annotation inferred-ret-type :int))
            ;; For variadic: fixed params are C params, rest is Value list
            (c-params (if variadic-p params-fixed params))
            (param-str (format nil "~{~a~^, ~}"
@@ -3019,7 +2773,7 @@
                        (sanitize-name name))))
       ;; Handle void return or expression return
       (let (return-stmt)
-        (if (eq (sysp-type-kind ret-type) :void)
+        (if (eq (type-kind ret-type) :void)
             ;; Void: last form is just another statement, no return
             (progn
               (setf stmts (append stmts (compile-stmt last-form env)))
@@ -3099,7 +2853,7 @@
          (params (parse-params params-raw))
          (ret-annotation (when (keywordp (first rest-forms))
                            (parse-type-annotation (first rest-forms))))
-         (ret-type (or ret-annotation (make-int-type)))
+         (ret-type (or ret-annotation :int))
          (arg-types (mapcar #'second params))
          (fn-type (make-fn-type arg-types ret-type)))
     (env-bind *global-env* name fn-type)))
