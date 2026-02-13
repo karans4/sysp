@@ -260,6 +260,7 @@
   "Walk an expression form and return its inferred type."
   (cond
     ((null form) :nil)  ; nil is the empty list type
+    ((characterp form) :char)
     ((integerp form)
      ;; Infer integer type based on value range (C99 rules)
      (cond
@@ -443,6 +444,7 @@
 
       ;; Simple type returns
       ((sym= head "nil?") :bool)
+      ((sym= head "null?") :bool)
       ((sym= head "sym") :value)
       ((sym= head "sym-eq?") :bool)
       ((sym= head "gensym") :value)
@@ -573,8 +575,11 @@
 
         ;; set!: unify target with value
         ((sym= head "set!")
-         (let ((target-type (infer-env-lookup (string (second form))))
-               (val-type (infer-expr (third form))))
+         (let* ((target (second form))
+                (target-type (if (symbolp target)
+                                 (infer-env-lookup (string target))
+                                 (infer-expr target)))
+                (val-type (infer-expr (third form))))
            (when target-type
              (unify target-type val-type))))
 
@@ -586,6 +591,11 @@
         ;; print/println: just infer the expression
         ((or (sym= head "print") (sym= head "println"))
          (infer-expr (second form)))
+
+        ;; printf: infer all arg expressions
+        ((sym= head "printf")
+         (dolist (arg (cddr form))
+           (infer-expr arg)))
 
         ;; recur: infer arguments
         ((sym= head "recur")
@@ -1031,8 +1041,9 @@
       ((string= name "?") :poly)
       ;; Pointer shorthand: :ptr-int, :ptr-float, etc.
       ((and (> (length name) 4) (string= (subseq name 0 4) "ptr-"))
+       ;; Use original symbol-name suffix to preserve case for struct names
        (make-ptr-type (parse-type-annotation
-                       (intern (string-upcase (subseq name 4)) :keyword))))
+                       (intern (subseq (symbol-name sym) 4) :keyword))))
       (t (let ((sname (symbol-name sym)))
            (cond
              ((gethash sname *structs*) (make-struct-type sname))
@@ -1361,6 +1372,16 @@
   "Compile a non-statement-like expression"
   (cond
     ((null form) (values "0" :int))
+    ((characterp form)
+     ;; Character literal: \a → 'a', \+ → '+', \space → ' ', \newline → '\n', \tab → '\t'
+     (let ((c form))
+       (cond
+         ((char= c #\Newline) (values "'\\n'" :char))
+         ((char= c #\Tab) (values "'\\t'" :char))
+         ((char= c #\Space) (values "' '" :char))
+         ((char= c #\\) (values "'\\\\'" :char))
+         ((char= c #\') (values "'\\''" :char))
+         (t (values (format nil "'~a'" c) :char)))))
     ((integerp form)
      ;; Add suffix for large integers (C99)
      (cond
@@ -1467,7 +1488,8 @@
     ("match" . compile-match-expr)
     ("new" . compile-new-expr)
     ("ptr-alloc" . compile-ptr-alloc)
-    ("ptr-deref" . compile-ptr-deref)))
+    ("ptr-deref" . compile-ptr-deref)
+    ("null?" . compile-null-check)))
 
 (defun compile-list (form env)
   (let* ((head (first form))
@@ -2046,13 +2068,16 @@
   "(set! name expr) as expression"
   (let ((target (second form)))
     (cond
-      ;; (set! (get struct field) val) -> struct.field = val
+      ;; (set! (get struct field) val) -> struct.field = val (or ->data.field for RC)
       ((and (listp target) (sym= (first target) "get"))
        (multiple-value-bind (obj tp) (compile-expr (second target) env)
-         (declare (ignore tp))
-         (let ((field (string (third target))))
+         (let* ((field (string (third target)))
+                (is-rc (rc-type-p tp))
+                (accessor (if is-rc
+                              (format nil "~a->data.~a" obj (sanitize-name field))
+                              (format nil "~a.~a" obj (sanitize-name field)))))
            (multiple-value-bind (val-code val-type) (compile-expr (third form) env)
-             (values (format nil "(~a.~a = ~a)" obj (sanitize-name field) val-code)
+             (values (format nil "(~a = ~a)" accessor val-code)
                      val-type)))))
       ;; (set! (deref ptr) val) -> *ptr = val
       ((and (listp target) (sym= (first target) "deref"))
@@ -2089,6 +2114,12 @@
                        (second tp)
                        :int)))
       (values (format nil "(*~a)" code) pointee))))
+
+(defun compile-null-check (form env)
+  "(null? expr) → (expr == NULL), returns :bool"
+  (multiple-value-bind (code tp) (compile-expr (second form) env)
+    (declare (ignore tp))
+    (values (format nil "(~a == NULL)" code) :bool)))
 
 (defun compile-cast (form env)
   "(cast :type expr)"
@@ -2414,6 +2445,8 @@
      (compile-print-stmt form env))
     ((and (listp form) (sym= (first form) "println"))
      (compile-println-stmt form env))
+    ((and (listp form) (sym= (first form) "printf"))
+     (compile-printf-stmt form env))
     ((and (listp form) (sym= (first form) "if"))
      (compile-if-stmt form env))
     ((and (listp form) (sym= (first form) "when"))
@@ -2510,7 +2543,7 @@
    Uses inttypes.h macros for portable fixed-width printing."
   (case (type-kind val-type)
     ;; Signed integers
-    (:char (values "%d" val-code))  ; %c for char, %d for numeric
+    (:char (values "%c" val-code))
     (:short (values "%hd" val-code))
     (:int (values "%d" val-code))
     (:long (values "%ld" val-code))
@@ -2578,6 +2611,28 @@
              (list (format nil "  printf(\"%\" ~a \"\\n\", ~a);" arg val-code)))
             (t
              (list (format nil "  printf(\"~a\\n\", ~a);" fmt arg))))))))
+
+(defun c-escape-string (s)
+  "Escape a CL string for C string literal content.
+   Handles embedded quotes and actual newlines; backslash sequences from
+   user source (e.g., \\\\n in sysp → \\n in CL string) pass through as-is."
+  (with-output-to-string (out)
+    (loop for c across s do
+      (case c
+        (#\" (write-string "\\\"" out))
+        (#\Newline (write-string "\\n" out))
+        (#\Tab (write-string "\\t" out))
+        (#\Return (write-string "\\r" out))
+        (otherwise (write-char c out))))))
+
+(defun compile-printf-stmt (form env)
+  "(printf fmt-string args...) → printf(fmt, arg1, arg2, ...)"
+  (let* ((fmt-str (second form))
+         (args (cddr form))
+         (compiled-args (mapcar (lambda (a) (first (multiple-value-list (compile-expr a env)))) args)))
+    (if compiled-args
+        (list (format nil "  printf(\"~a\"~{, ~a~});" (c-escape-string fmt-str) compiled-args))
+        (list (format nil "  printf(\"~a\");" (c-escape-string fmt-str))))))
 
 (defun compile-if-stmt (form env)
   "(if cond then-body... [elif cond2 body2...]... [else else-body...])
@@ -3014,17 +3069,24 @@
 (defun compile-struct (form)
   "(struct Name [field :type, ...])"
   (let* ((name (string (second form)))
-         (fields-raw (third form))
-         (fields (multiple-value-bind (fixed rest) (parse-params fields-raw)
-                   (declare (ignore rest))
-                   fixed)))
-    (setf (gethash name *structs*)
-          (mapcar (lambda (f) (cons (first f) (second f))) fields))
-    (push (format nil "typedef struct {~%~{  ~a ~a;~%~}} ~a;~%"
-                  (loop for f in fields
-                        append (list (type-to-c (second f)) (sanitize-name (first f))))
-                  name)
-          *struct-defs*)))
+         ;; Register struct name early so fields can reference it (self-referential types)
+         (already-registered (gethash name *structs*)))
+    (unless already-registered
+      (setf (gethash name *structs*) :forward-declared)  ; placeholder
+      ;; Emit forward declaration
+      (push (format nil "typedef struct ~a ~a;~%" name name) *struct-defs*))
+    (let* ((fields-raw (third form))
+           (fields (multiple-value-bind (fixed rest) (parse-params fields-raw)
+                     (declare (ignore rest))
+                     fixed)))
+      (setf (gethash name *structs*)
+            (mapcar (lambda (f) (cons (first f) (second f))) fields))
+      (push (format nil "struct ~a {~%~{  ~a ~a;~%~}};~%"
+                    name
+                    (loop for f in fields
+                          append (list (type-to-c (second f)) (sanitize-name (first f))))
+                    )
+            *struct-defs*))))
 
 (defun compile-deftype (form)
   "(deftype Name TypeExpr) — register a named type alias and emit C typedef"

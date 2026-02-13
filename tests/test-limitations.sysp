@@ -1,0 +1,42 @@
+;;; Test file for limitation fixes
+
+;; Forward-declared recursive struct
+(struct Node [val :int, next :ptr-Node])
+
+(struct Point [x :float, y :float])
+
+(defn add-to-point [p :ptr-Point dx :float dy :float] :void
+  (set! (get (deref p) x) (+ (get (deref p) x) dx))
+  (set! (get (deref p) y) (+ (get (deref p) y) dy)))
+
+(defn test-char-literals [] :void
+  (printf "char + is: %c\\n" #\+)
+  (printf "char A is: %c\\n" #\A))
+
+(defn test-recursive-struct [] :void
+  ;; Build a 3-node linked list: 1 -> 2 -> 3 -> null
+  (let-mut n3 (Node 3 null))
+  (let-mut n2 (Node 2 (addr-of n3)))
+  (let-mut n1 (Node 1 (addr-of n2)))
+  ;; Walk the list
+  (let-mut cur :ptr-Node (addr-of n1))
+  (while (not (null? cur))
+    (printf "%d " (get (deref cur) val))
+    (set! cur (get (deref cur) next)))
+  (println))
+
+(defn test-struct-by-ref [] :void
+  (let-mut pt (Point 1.0 2.0))
+  (add-to-point (addr-of pt) 10.0 20.0)
+  (printf "%.1f %.1f\\n" (get pt x) (get pt y)))
+
+(defn test-printf [] :void
+  (printf "Hello %s, you are %d years old\\n" "world" 25)
+  (printf "Pi is approximately %.4f\\n" 3.14159))
+
+(defn main [] :int
+  (test-char-literals)
+  (test-recursive-struct)
+  (test-struct-by-ref)
+  (test-printf)
+  0)
