@@ -1,0 +1,22 @@
+;;; Test: ARC memory management and raw pointers
+
+(struct Point [x :float, y :float])
+
+(defn test-rc [] :void
+  (let p (new Point 1.0 2.0))
+  (println (get p x))
+  (let q p)
+  (println (get q y)))
+
+(defn test-raw [] :void
+  (let buf (ptr-alloc :int 3))
+  (ptr-set! buf 0 10)
+  (ptr-set! buf 1 20)
+  (ptr-set! buf 2 30)
+  (println (ptr-deref buf 1))
+  (ptr-free buf))
+
+(defn main [] :int
+  (test-rc)
+  (test-raw)
+  0)

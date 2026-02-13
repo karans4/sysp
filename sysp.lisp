@@ -25,6 +25,9 @@
 (defun make-vector-type (elem-type) `(:vector ,elem-type))
 (defun make-tuple-type (elem-types) `(:tuple ,@elem-types))
 (defun make-array-type (elem-type size) `(:array ,elem-type ,size))
+(defun make-rc-type (inner) `(:rc ,inner))
+(defun rc-type-p (tp) (and (consp tp) (eq (car tp) :rc)))
+(defun rc-inner-type (tp) (second tp))
 
 ;; Union types: (:union :int :str) — sorted, deduped, flattened
 (defun make-union-type (variants)
@@ -484,6 +487,19 @@
                  (unify body-type (infer-expr clause-body))))))
          body-type))
 
+      ;; new: RC-managed heap allocation → (:rc (:struct T))
+      ((sym= head "new")
+       (let ((struct-name (string (second form))))
+         (dolist (a (cddr form)) (infer-expr a))
+         (make-rc-type (make-struct-type struct-name))))
+
+      ;; ptr-alloc: raw pointer allocation → (:ptr T)
+      ((sym= head "ptr-alloc")
+       (make-ptr-type (parse-type-annotation (second form))))
+
+      ;; ptr-deref: dereference → element type
+      ((sym= head "ptr-deref") (make-tvar))
+
       ;; Function call: look up function type, unify args, return ret type
       (t (let* ((fn-name (string head))
                 (fn-type (infer-env-lookup fn-name)))
@@ -690,7 +706,8 @@
   (bindings nil)  ; alist of (name . type)
   (parent nil)
   (releases nil)  ; list of C variable names needing val_release at scope exit
-  (mutables nil)) ; list of mutable variable names (from let-mut)
+  (mutables nil)  ; list of mutable variable names (from let-mut)
+  (rc-releases nil)) ; list of (c-name . inner-type) for RC release at scope exit
 
 (defun env-lookup (env name)
   (if (null env) nil
@@ -724,6 +741,18 @@
   "Generate release statements for all Value locals in this scope"
   (mapcar (lambda (name) (format nil "  val_release(~a);" name))
           (env-releases env)))
+
+(defun env-add-rc-release (env c-name inner-type)
+  "Record an RC variable for release at scope exit"
+  (push (cons c-name inner-type) (env-rc-releases env)))
+
+(defun emit-rc-releases (env)
+  "Generate RC release statements for all RC locals in this scope"
+  (mapcar (lambda (entry)
+            (let ((c-name (car entry))
+                  (inner-type (cdr entry)))
+              (format nil "  _rc_~a_release(&~a);" (mangle-type-name inner-type) c-name)))
+          (env-rc-releases env)))
 
 ;;; === Global State ===
 
@@ -1067,6 +1096,7 @@
     (:list "Value")  ; lists are also Values (tagged cons chain)
     (:variadic "Value")  ; variadic rest compiles to Value at runtime
     (:union (union-type-c-name tp))
+    (:rc (format nil "_RC_~a*" (type-to-c (rc-inner-type tp))))
     (otherwise "int")))
 
 (defun mangle-type-name (tp)
@@ -1110,6 +1140,8 @@
     (:variadic (format nil "var_~a" (mangle-type-name (second tp))))
     ;; Union types
     (:union (format nil "Union_~{~a~^_~}" (mapcar #'mangle-type-name (cdr tp))))
+    ;; RC-managed types
+    (:rc (format nil "rc_~a" (mangle-type-name (rc-inner-type tp))))
     (otherwise (warn "mangle-type-name: unhandled type ~a" tp) "unknown")))
 
 (defun vector-type-c-name (tp)
@@ -1196,6 +1228,30 @@
         (push struct-def *type-decls*)
         (dolist (ctor (reverse ctors))
           (push ctor *type-decls*))))
+    name))
+
+(defun ensure-rc-type (inner-type)
+  "Ensure the RC wrapper struct and helpers for a type are generated.
+   Returns the C struct name (e.g. _RC_Point)."
+  (let* ((c-inner (type-to-c inner-type))
+         (name (format nil "_RC_~a" c-inner)))
+    (unless (gethash name *generated-types*)
+      (setf (gethash name *generated-types*) t)
+      ;; typedef struct { int _rc; T data; } _RC_T;
+      (push (format nil "typedef struct { int _rc; ~a data; } ~a;~%" c-inner name)
+            *type-decls*)
+      ;; _RC_T* _rc_T_new(T val) { _RC_T* p = malloc(sizeof(_RC_T)); p->_rc = 1; p->data = val; return p; }
+      (push (format nil "static ~a* _rc_~a_new(~a val) { ~a* p = malloc(sizeof(~a)); p->_rc = 1; p->data = val; return p; }~%"
+                    name (mangle-type-name inner-type) c-inner name name)
+            *type-decls*)
+      ;; void _rc_T_retain(_RC_T* p) { p->_rc++; }
+      (push (format nil "static void _rc_~a_retain(~a* p) { if (p) p->_rc++; }~%"
+                    (mangle-type-name inner-type) name)
+            *type-decls*)
+      ;; void _rc_T_release(_RC_T** p) { if (*p && --(*p)->_rc == 0) { free(*p); *p = NULL; } }
+      (push (format nil "static void _rc_~a_release(~a** p) { if (*p && --(*p)->_rc == 0) { free(*p); *p = NULL; } }~%"
+                    (mangle-type-name inner-type) name)
+            *type-decls*))
     name))
 
 (defun union-type-c-name (tp)
@@ -1408,7 +1464,10 @@
     ("sym" . compile-sym-literal) ("sym-eq?" . compile-sym-eq)
     ("gensym" . compile-gensym-expr)
     ("not" . compile-not) ("bit-not" . compile-bit-not)
-    ("match" . compile-match-expr)))
+    ("match" . compile-match-expr)
+    ("new" . compile-new-expr)
+    ("ptr-alloc" . compile-ptr-alloc)
+    ("ptr-deref" . compile-ptr-deref)))
 
 (defun compile-list (form env)
   (let* ((head (first form))
@@ -1616,6 +1675,67 @@
                             last-code)
                     last-type))))))
 
+;;; === ARC Memory Model & Raw Pointers ===
+
+(defun compile-new-expr (form env)
+  "(new StructName args...) → RC-managed heap allocation.
+   Returns (:rc (:struct Name))."
+  (let* ((struct-name (string (second form)))
+         (args (cddr form))
+         (inner-type (make-struct-type struct-name))
+         (rc-type (make-rc-type inner-type))
+         (compiled-args (mapcar (lambda (a) (first (multiple-value-list (compile-expr a env)))) args))
+         (rc-c-name (ensure-rc-type inner-type))
+         (mname (mangle-type-name inner-type)))
+    (values (format nil "_rc_~a_new((~a){~{~a~^, ~}})"
+                    mname struct-name compiled-args)
+            rc-type)))
+
+(defun compile-ptr-alloc (form env)
+  "(ptr-alloc :type n) → malloc(n * sizeof(T)), returns (:ptr :T)"
+  (let* ((type-keyword (second form))
+         (alloc-type (parse-type-annotation type-keyword))
+         (n-form (third form)))
+    (multiple-value-bind (n-code nt) (compile-expr n-form env)
+      (declare (ignore nt))
+      (values (format nil "malloc(~a * sizeof(~a))" n-code (type-to-c alloc-type))
+              (make-ptr-type alloc-type)))))
+
+(defun compile-ptr-free-stmt (form env)
+  "(ptr-free p) → free(p);"
+  (multiple-value-bind (p-code pt) (compile-expr (second form) env)
+    (declare (ignore pt))
+    (list (format nil "  free(~a);" p-code))))
+
+(defun compile-ptr-deref (form env)
+  "(ptr-deref p) → *p, or (ptr-deref p i) → p[i]"
+  (multiple-value-bind (p-code pt) (compile-expr (second form) env)
+    (let ((elem-type (if (and (consp pt) (eq (car pt) :ptr)) (second pt) :int)))
+      (if (third form)
+          (multiple-value-bind (i-code it) (compile-expr (third form) env)
+            (declare (ignore it))
+            (values (format nil "~a[~a]" p-code i-code) elem-type))
+          (values (format nil "(*~a)" p-code) elem-type)))))
+
+(defun compile-ptr-set-stmt (form env)
+  "(ptr-set! p val) → *p = val; or (ptr-set! p i val) → p[i] = val;"
+  (let ((args (rest form)))
+    (if (= (length args) 3)
+        ;; (ptr-set! p i val)
+        (multiple-value-bind (p-code pt) (compile-expr (first args) env)
+          (declare (ignore pt))
+          (multiple-value-bind (i-code it) (compile-expr (second args) env)
+            (declare (ignore it))
+            (multiple-value-bind (v-code vt) (compile-expr (third args) env)
+              (declare (ignore vt))
+              (list (format nil "  ~a[~a] = ~a;" p-code i-code v-code)))))
+        ;; (ptr-set! p val)
+        (multiple-value-bind (p-code pt) (compile-expr (first args) env)
+          (declare (ignore pt))
+          (multiple-value-bind (v-code vt) (compile-expr (second args) env)
+            (declare (ignore vt))
+            (list (format nil "  *~a = ~a;" p-code v-code)))))))
+
 (defun compile-cond-expr (form env)
   "(cond [test1 expr1] [test2 expr2] ... [else exprN]) -> nested ternary"
   (let ((clauses (rest form)))
@@ -1765,16 +1885,22 @@
             (values type (append let-stmts (or body-stmts nil) last-stmts)))))))
 
 (defun compile-get (form env)
-  "(get struct field)"
+  "(get struct field) — auto-derefs through RC wrapper"
   (multiple-value-bind (obj tp) (compile-expr (second form) env)
     (let* ((field-name (string (third form)))
-           (field-type (if (and (eq (type-kind tp) :struct)
-                                (gethash (second tp) *structs*))
-                           (let ((fields (gethash (second tp) *structs*)))
+           ;; For RC types, look up the inner struct
+           (is-rc (rc-type-p tp))
+           (struct-type (if is-rc (rc-inner-type tp) tp))
+           (struct-name (when (eq (type-kind struct-type) :struct) (second struct-type)))
+           (field-type (if (and struct-name (gethash struct-name *structs*))
+                           (let ((fields (gethash struct-name *structs*)))
                              (cdr (assoc field-name fields :test #'equal)))
                            :int)))
-      (values (format nil "~a.~a" obj (sanitize-name field-name))
-              (or field-type :int)))))
+      (if is-rc
+          (values (format nil "~a->data.~a" obj (sanitize-name field-name))
+                  (or field-type :int))
+          (values (format nil "~a.~a" obj (sanitize-name field-name))
+                  (or field-type :int))))))
 
 (defun compile-vector (form env)
   "(vector elem ...) - C99 compound literal with malloc helper"
@@ -2318,6 +2444,10 @@
      ;; do as block: compile all sub-forms as statements
      ;; Use (for [var start end] body...) for loops
      (compile-body (rest form) env))
+    ((and (listp form) (sym= (first form) "ptr-free"))
+     (compile-ptr-free-stmt form env))
+    ((and (listp form) (sym= (first form) "ptr-set!"))
+     (compile-ptr-set-stmt form env))
     (t (let ((*pending-stmts* nil))
          (multiple-value-bind (code tp) (compile-expr form env)
            (declare (ignore tp))
@@ -2348,17 +2478,31 @@
           ;; Track Value-typed locals for release at scope exit
           (when (and *uses-value-type* (value-type-p final-type))
             (env-add-release env c-name))
-          (let ((decl (if (eq (type-kind final-type) :array)
+          ;; Track RC-typed locals for release at scope exit
+          (when (rc-type-p final-type)
+            (env-add-rc-release env c-name (rc-inner-type final-type)))
+          ;; Determine if this is an RC copy (variable → variable, needs retain)
+          (let* ((rc-copy-p (and (rc-type-p final-type)
+                                 (symbolp init-form)
+                                 (not (null init-form))))
+                 (decl (cond
+                         ((eq (type-kind final-type) :array)
                           (list (format nil "  ~a ~a[~a] = ~a;"
                                         (type-to-c (second final-type))
                                         c-name
                                         (third final-type)
-                                        init-code))
-                          (if needs-retain
-                              (list (format nil "  ~a ~a = val_retain(~a);"
-                                            (type-to-c final-type) c-name init-code))
-                              (list (format nil "  ~a ~a = ~a;"
-                                            (type-to-c final-type) c-name init-code))))))
+                                        init-code)))
+                         (rc-copy-p
+                          ;; RC copy: retain the source
+                          (list (format nil "  ~a ~a = ~a; _rc_~a_retain(~a);"
+                                        (type-to-c final-type) c-name init-code
+                                        (mangle-type-name (rc-inner-type final-type)) c-name)))
+                         (needs-retain
+                          (list (format nil "  ~a ~a = val_retain(~a);"
+                                        (type-to-c final-type) c-name init-code)))
+                         (t
+                          (list (format nil "  ~a ~a = ~a;"
+                                        (type-to-c final-type) c-name init-code))))))
             (append lifted-stmts decl)))))))
 
 (defun format-print-arg (val-code val-type)
@@ -3107,7 +3251,8 @@
             ;; Void: last form is just another statement, no return
             (progn
               (setf stmts (append stmts (compile-stmt last-form env)))
-              (let ((releases (when *uses-value-type* (emit-releases env))))
+              (let ((releases (append (when *uses-value-type* (emit-releases env))
+                                      (emit-rc-releases env))))
                 (when releases
                   (setf return-stmt (format nil "~{~a~%~}" releases)))))
             ;; Non-void: last form is return value
@@ -3115,14 +3260,14 @@
             ;; use compile-expr-returning to handle branches that recur (goto)
             ;; vs branches that produce values (assign to temp).
             (cond
-              ;; Return unlifting: statement-like, no Value cleanup needed
+              ;; Return unlifting: statement-like, no Value/RC cleanup needed
               ;; Branches emit "return expr;" directly, no temp variable
-              ((and (statement-like-p last-form) (not *uses-value-type*))
+              ((and (statement-like-p last-form) (not *uses-value-type*) (null (env-rc-releases env)))
                (multiple-value-bind (type ret-stmts)
                    (compile-expr-returning last-form env ":return")
                  (declare (ignore type))
                  (setf stmts (append stmts ret-stmts))))
-              ;; Statement-like with Value cleanup: need temp for releases before return
+              ;; Statement-like with Value/RC cleanup: need temp for releases before return
               ((statement-like-p last-form)
                (let* ((tmp (fresh-tmp))
                       (tmp-decl (format nil "  ~a ~a;" (type-to-c ret-type) tmp)))
@@ -3130,9 +3275,10 @@
                      (compile-expr-returning last-form env tmp)
                    (declare (ignore type))
                    (setf stmts (append stmts (list tmp-decl) ret-stmts))
-                   (let ((releases (when *uses-value-type* (emit-releases env))))
+                   (let ((releases (append (when *uses-value-type* (emit-releases env))
+                                           (emit-rc-releases env))))
                      (setf return-stmt
-                           (if (and *uses-value-type* releases)
+                           (if releases
                                (format nil "~{~a~%~}  return ~a;~%" releases tmp)
                                (format nil "  return ~a;~%" tmp)))))))
               ;; Normal: compile last form as expression
@@ -3142,7 +3288,8 @@
                    (declare (ignore lt))
                    (when *pending-stmts*
                      (setf stmts (append stmts *pending-stmts*)))
-                   (let* ((releases (when *uses-value-type* (emit-releases env)))
+                   (let* ((releases (append (when *uses-value-type* (emit-releases env))
+                                            (emit-rc-releases env)))
                           (ret-var (and (symbolp last-form)
                                         (member (sanitize-name (string last-form))
                                                 (env-releases env) :test #'equal))))
@@ -3152,7 +3299,7 @@
                                        (sanitize-name (string last-form))
                                        releases
                                        last-code)
-                               (if (and *uses-value-type* releases)
+                               (if releases
                                    (format nil "~{~a~%~}  return ~a;~%" releases last-code)
                                    (format nil "  return ~a;~%" last-code))))))))))
           (let ((body-stmts (if uses-recur
