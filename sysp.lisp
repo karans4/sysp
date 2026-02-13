@@ -588,6 +588,11 @@
 (defun infer-defn (form)
   "Run type inference on a defn form. Updates *infer-env* with the function's type.
    Returns the inferred function type (with resolved tvars)."
+  ;; Skip inference for polymorphic functions — they'll be inferred per instantiation
+  (when (defn-is-poly-p form)
+    (let ((name (string (second form))))
+      (infer-env-bind name :poly)
+      (return-from infer-defn :poly)))
   (let* ((name (string (second form)))
          (params-raw (third form))
          (rest-forms (cdddr form))
@@ -745,6 +750,9 @@
 (defvar *type-aliases* (make-hash-table :test 'equal))  ; name -> type s-expr (deftype)
 (defvar *name-overrides* (make-hash-table :test 'equal))  ; sysp name -> C name override
 (defvar *uses-value-type* nil)  ; emit Value/Cons preamble if true
+;; Monomorphization state
+(defvar *poly-fns* (make-hash-table :test #'equal))       ; name -> (params-raw ret-ann body-forms)
+(defvar *mono-instances* (make-hash-table :test #'equal))  ; mangled-name -> t (already generated)
 (defvar *macro-fns* (make-hash-table :test 'equal))  ; name -> (params body) for compile-time eval
 (defvar *interp-gensym-counter* 0)
 
@@ -990,6 +998,8 @@
          (prim (gethash name *primitive-type-map*)))
     (cond
       (prim prim)
+      ;; Polymorphic type variable: :? means "infer at call site"
+      ((string= name "?") :poly)
       ;; Pointer shorthand: :ptr-int, :ptr-float, etc.
       ((and (> (length name) 4) (string= (subseq name 0 4) "ptr-"))
        (make-ptr-type (parse-type-annotation
@@ -2192,9 +2202,22 @@
       (sanitize-name fn-name)))
 
 (defun compile-call (form env)
-  "Compile a function call, handling variadic functions."
+  "Compile a function call, handling variadic and polymorphic functions."
   (let* ((fn-name (string (first form)))
          (args (rest form)))
+    ;; Check for polymorphic function — instantiate with concrete types
+    (when (gethash fn-name *poly-fns*)
+      (let* ((compiled-args-data (mapcar (lambda (a) (multiple-value-list (compile-expr a env))) args))
+             (arg-codes (mapcar #'first compiled-args-data))
+             (arg-types (mapcar #'second compiled-args-data))
+             (mangled (instantiate-poly-fn fn-name arg-types))
+             ;; Look up the instantiated function's return type
+             (inst-fn-type (env-lookup *global-env* mangled))
+             (ret-type (if (and inst-fn-type (eq (type-kind inst-fn-type) :fn))
+                           (fn-type-ret inst-fn-type)
+                           (first arg-types))))  ; fallback for identity-like
+        (return-from compile-call
+          (values (format nil "~a(~{~a~^, ~})" mangled arg-codes) ret-type))))
     (if (gethash fn-name *structs*)
         (compile-struct-construct fn-name args env)
         (let* ((fn-type (env-lookup env fn-name))
@@ -2928,8 +2951,89 @@
     (setf (gethash name *structs*)
           (mapcar (lambda (f) (cons (first f) (second f))) fields))))
 
+(defun defn-is-poly-p (form)
+  "Check if a defn form has any :? type annotations (polymorphic)."
+  (let ((params-raw (third form))
+        (rest-forms (cdddr form)))
+    (or ;; Check params for :?
+        (and (listp params-raw)
+             (some (lambda (x) (and (keywordp x) (string-equal (symbol-name x) "?")))
+                   params-raw))
+        ;; Check return type annotation for :?
+        (and (keywordp (first rest-forms))
+             (string-equal (symbol-name (first rest-forms)) "?")))))
+
+(defun mangle-poly-name (base-name concrete-types)
+  "Generate a mangled name for a monomorphized instance."
+  (format nil "~a_~{~a~^_~}" (sanitize-name base-name)
+          (mapcar #'mangle-type-name concrete-types)))
+
+(defun instantiate-poly-fn (name concrete-arg-types)
+  "Instantiate a polymorphic function with concrete types.
+   Returns the mangled C name."
+  (let* ((poly-entry (gethash name *poly-fns*))
+         (params-raw (first poly-entry))
+         (ret-ann (second poly-entry))
+         (body-forms (third poly-entry))
+         (mangled (mangle-poly-name name concrete-arg-types)))
+    (unless (gethash mangled *mono-instances*)
+      (setf (gethash mangled *mono-instances*) t)
+      ;; Build a concrete defn form with substituted types
+      ;; Parse the original params to find which positions are :?
+      (let ((new-params nil)
+            (lst (if (listp params-raw) (copy-list params-raw) nil))
+            (type-idx 0))
+        (loop while lst do
+          (let ((item (pop lst)))
+            (push item new-params)
+            (cond
+              ;; :? annotation — substitute with concrete type
+              ((and (keywordp item) (string-equal (symbol-name item) "?"))
+               (pop new-params)  ; remove the :?
+               ;; Push the concrete type keyword
+               (let ((concrete (nth type-idx concrete-arg-types)))
+                 (push (intern (string-upcase (mangle-type-name concrete)) :keyword) new-params))
+               (incf type-idx))
+              ;; Other type annotation — skip it for counting
+              ((keywordp item)
+               (incf type-idx))
+              ;; Symbol (param name) — just keep
+              (t nil))))
+        (setf new-params (nreverse new-params))
+        ;; Determine concrete return type
+        (let* ((concrete-ret (if (eq ret-ann :poly)
+                                 ;; For :? return, use the first concrete arg type as heuristic
+                                 ;; (works for identity-like functions)
+                                 (or (first concrete-arg-types) :int)
+                                 ret-ann))
+               (ret-keyword (if concrete-ret
+                                (intern (string-upcase (mangle-type-name concrete-ret)) :keyword)
+                                nil))
+               ;; Build the synthetic defn form
+               (synthetic-form `(,(intern "defn" :sysp)
+                                 ,(intern mangled :sysp)
+                                 ,new-params
+                                 ,@(when ret-keyword (list ret-keyword))
+                                 ,@body-forms)))
+          ;; Compile it
+          (compile-defn synthetic-form))))
+    mangled))
+
 (defun compile-defn (form)
   "(defn name [params] :ret-type body...) - supports variadic [& rest]"
+  ;; Check for polymorphic function — store template, don't compile
+  (when (defn-is-poly-p form)
+    (let* ((name (string (second form)))
+           (params-raw (third form))
+           (rest-forms (cdddr form))
+           (ret-ann (when (keywordp (first rest-forms))
+                      (prog1 (parse-type-annotation (first rest-forms))
+                        (setf rest-forms (cdr rest-forms)))))
+           (body-forms rest-forms))
+      (setf (gethash name *poly-fns*) (list params-raw ret-ann body-forms))
+      ;; Register a poly marker in global env so compile-call knows
+      (env-bind *global-env* name :poly)
+      (return-from compile-defn nil)))
   (let* ((name (string (second form)))
          (params-raw (third form))
          (rest-forms (cdddr form))
@@ -3693,7 +3797,9 @@
   (setf *struct-comments* nil)
   (setf *var-comments* nil)
   (setf *type-aliases* (make-hash-table :test 'equal))
-  (setf *name-overrides* (make-hash-table :test 'equal)))
+  (setf *name-overrides* (make-hash-table :test 'equal))
+  (setf *poly-fns* (make-hash-table :test #'equal))
+  (setf *mono-instances* (make-hash-table :test #'equal)))
 
 (defun compile-file-to-c (in-path out-path)
   (reset-state)

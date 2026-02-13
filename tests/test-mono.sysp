@@ -1,0 +1,14 @@
+;;; Test: Monomorphization — polymorphic functions stamped per type
+
+(defn identity [x :?] :?
+  x)
+
+(defn add-one [x :?] :?
+  (+ x 1))
+
+(defn main [] :int
+  (println (identity 42))
+  (println (identity "hello"))
+  (println (add-one 10))
+  (println (add-one 99))
+  0)
