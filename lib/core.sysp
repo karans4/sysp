@@ -1,0 +1,14 @@
+;; core.sysp — standard predicates and utilities
+
+(defn identity [x :?] :? x)
+(defn zero? [x :int] :bool (== x 0))
+(defn pos? [x :int] :bool (> x 0))
+(defn neg? [x :int] :bool (< x 0))
+(defn even? [x :int] :bool (== (% x 2) 0))
+(defn odd? [x :int] :bool (!= (% x 2) 0))
+(defn inc [x :int] :int (+ x 1))
+(defn dec [x :int] :int (- x 1))
+(defn abs [x :int] :int (if (< x 0) (- x) x))
+(defn min [a :? b :?] :? (if (< a b) a b))
+(defn max [a :? b :?] :? (if (> a b) a b))
+(defn clamp [x :? lo :? hi :?] :? (if (< x lo) lo (if (> x hi) hi x)))

@@ -1,0 +1,29 @@
+;; test-modules — test the (use ...) module system
+
+(use core)
+
+(include "stdio.h")
+(include "stdlib.h")
+
+(defn main [] :int
+  (do
+    ;; Test predicates
+    (printf "zero?(0)=%d zero?(1)=%d\\n" (zero? 0) (zero? 1))
+    (printf "pos?(5)=%d pos?(-1)=%d\\n" (pos? 5) (pos? -1))
+    (printf "neg?(-3)=%d neg?(0)=%d\\n" (neg? -3) (neg? 0))
+    (printf "even?(4)=%d even?(7)=%d\\n" (even? 4) (even? 7))
+    (printf "odd?(3)=%d odd?(8)=%d\\n" (odd? 3) (odd? 8))
+
+    ;; Test arithmetic
+    (printf "inc(5)=%d dec(5)=%d\\n" (inc 5) (dec 5))
+    (printf "abs(-7)=%d abs(3)=%d\\n" (abs -7) (abs 3))
+
+    ;; Test min/max/clamp
+    (printf "min(3,7)=%d max(3,7)=%d\\n" (min 3 7) (max 3 7))
+    (printf "clamp(10,0,5)=%d clamp(-1,0,5)=%d clamp(3,0,5)=%d\\n"
+            (clamp 10 0 5) (clamp -1 0 5) (clamp 3 0 5))
+
+    ;; Test identity
+    (printf "identity(42)=%d\\n" (identity 42))
+
+    0))

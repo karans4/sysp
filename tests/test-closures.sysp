@@ -1,0 +1,64 @@
+;; Test closures — lambdas that capture variables from enclosing scope
+
+;; Test 1: basic capture
+(defn test-basic-capture [] :int
+  (let-mut y 10)
+  (let add-y (lambda [x :int] :int (+ x y)))
+  (add-y 5))
+
+;; Test 2: capture multiple variables
+(defn test-multi-capture [] :int
+  (let a 3)
+  (let b 7)
+  (let sum-ab (lambda [x :int] :int (+ (+ x a) b)))
+  (sum-ab 10))
+
+;; Test 3: HOF — pass closure to function
+(defn apply-fn [f :fn(:int):int, x :int] :int
+  (f x))
+
+(defn test-hof [] :int
+  (let offset 100)
+  (let add-offset (lambda [x :int] :int (+ x offset)))
+  (apply-fn add-offset 42))
+
+;; Test 4: non-capturing lambda through HOF
+(defn test-hof-plain [] :int
+  (let double (lambda [x :int] :int (* x 2)))
+  (apply-fn double 21))
+
+;; Test 5: closure over loop variable (capture by value)
+(defn test-capture-value [] :int
+  (let-mut result 0)
+  (let y 5)
+  (let add-y (lambda [x :int] :int (+ x y)))
+  (set! result (add-y 10))
+  result)
+
+(defn sysp_main [] :int
+  ;; Test 1: basic capture
+  (if (== (test-basic-capture) 15)
+    (println "PASS test-basic-capture")
+    (println "FAIL test-basic-capture"))
+
+  ;; Test 2: capture multiple variables
+  (if (== (test-multi-capture) 20)
+    (println "PASS test-multi-capture")
+    (println "FAIL test-multi-capture"))
+
+  ;; Test 3: HOF with closure
+  (if (== (test-hof) 142)
+    (println "PASS test-hof")
+    (println "FAIL test-hof"))
+
+  ;; Test 4: HOF with non-capturing lambda
+  (if (== (test-hof-plain) 42)
+    (println "PASS test-hof-plain")
+    (println "FAIL test-hof-plain"))
+
+  ;; Test 5: capture by value
+  (if (== (test-capture-value) 15)
+    (println "PASS test-capture-value")
+    (println "FAIL test-capture-value"))
+
+  0)

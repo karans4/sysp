@@ -12,7 +12,7 @@
 ;;;              (:struct "Point"), (:enum "Color"), (:list :int)
 ;;;              (:cons :int :str), (:vector :float), (:tuple :int :str)
 ;;;              (:variadic :int)
-;;;   Type vars:  (:tvar 1), (:tvar 2), ...
+;;;   Type vars:  (:? 1), (:? 2), ...
 
 ;; Compound type constructors
 (defun make-ptr-type (pointee) `(:ptr ,pointee))
@@ -79,13 +79,13 @@
 ;; Type variable bindings: hash table from tvar-id -> type
 (defvar *tvar-bindings* (make-hash-table))
 
-;; Create a fresh type variable: (:tvar 1), (:tvar 2), ...
+;; Create a fresh type variable: (:? 1), (:? 2), ...
 (defun make-tvar ()
   (let ((id (incf *tvar-counter*)))
-    `(:tvar ,id)))
+    `(:? ,id)))
 
 (defun tvar-p (tp)
-  (and (consp tp) (eq (car tp) :tvar)))
+  (and (consp tp) (eq (car tp) :?)))
 
 (defun tvar-id (tv) (second tv))
 
@@ -788,11 +788,14 @@
 (defvar *sysp-gensym-counter* #x80000000)  ; gensyms start high to avoid collision
 (defvar *type-aliases* (make-hash-table :test 'equal))  ; name -> type s-expr (deftype)
 (defvar *name-overrides* (make-hash-table :test 'equal))  ; sysp name -> C name override
+(defvar *included-files* (make-hash-table :test 'equal))  ; absolute path -> t (dedup for use)
 (defvar *uses-value-type* nil)  ; emit Value/Cons preamble if true
 ;; Monomorphization state
 (defvar *poly-fns* (make-hash-table :test #'equal))       ; name -> (params-raw ret-ann body-forms)
 (defvar *mono-instances* (make-hash-table :test #'equal))  ; mangled-name -> t (already generated)
 (defvar *macro-fns* (make-hash-table :test 'equal))  ; name -> (params body) for compile-time eval
+(defvar *direct-fns* (make-hash-table :test 'equal))  ; names of defn/extern functions (direct call, not Fn)
+(defvar *env-counter* 0)  ; counter for closure env structs
 (defvar *interp-gensym-counter* 0)
 
 (defun intern-symbol (name)
@@ -829,90 +832,268 @@
 
 ;;; === Parsing ===
 
-(defun make-sysp-readtable ()
-  (let ((rt (copy-readtable nil)))
-    (setf (readtable-case rt) :preserve)
-    (set-syntax-from-char #\, #\Space rt)
-    (set-macro-character #\[
-      (lambda (stream char)
-        (declare (ignore char))
-        (read-delimited-list #\] stream t))
-      nil rt)
-    (set-syntax-from-char #\] #\) rt)
-    ;; Backquote → (quasiquote ...)
-    (set-macro-character #\`
-      (lambda (stream char)
-        (declare (ignore char))
-        (list (intern "quasiquote" :sysp) (let ((*readtable* rt)) (read stream t nil t))))
-      nil rt)
-    ;; Tilde → (unquote ...) or (splice ...) if followed by @
-    (set-macro-character #\~
-      (lambda (stream char)
-        (declare (ignore char))
-        (let ((next (peek-char nil stream t nil t)))
-          (if (char= next #\@)
-              (progn (read-char stream t nil t)  ; consume @
-                     (list (intern "splice" :sysp) (let ((*readtable* rt)) (read stream t nil t))))
-              (list (intern "unquote" :sysp) (let ((*readtable* rt)) (read stream t nil t))))))
-      nil rt)
-    rt))
-
-(defvar *sysp-readtable* (make-sysp-readtable))
+;;; === Custom Parser (tokenizer + recursive descent) ===
+;;; Replaces CL's read for sysp source. Handles string escapes properly,
+;;; preserves comments, tracks source locations.
 
 ;; Comments associated with top-level forms (form-index -> list of comment strings)
 (defvar *form-comments* (make-hash-table))
 
-(defun extract-comments-from-file (path)
-  "Read file and extract comment lines with their line numbers.
-   Returns list of (line-number . comment-text) pairs."
-  (with-open-file (in path :direction :input)
-    (loop for line = (read-line in nil nil)
-          for line-num from 1
-          while line
-          when (and (> (length line) 0)
-                    (let ((trimmed (string-left-trim '(#\Space #\Tab) line)))
-                      (and (> (length trimmed) 0)
-                           (char= (char trimmed 0) #\;))))
-          collect (cons line-num (string-left-trim '(#\Space #\Tab) line)))))
+;; Source locations: eq hash from form cons cells → (file line col)
+(defvar *source-locations* (make-hash-table :test 'eq))
+
+;; Comments to emit with functions/structs/vars
+(defvar *function-comments* nil)  ; alist (name . (comment-strings...))
+(defvar *struct-comments* nil)
+(defvar *var-comments* nil)
+
+;; Parser state
+(defstruct pstate
+  (source "" :type string)
+  (pos 0 :type fixnum)
+  (line 1 :type fixnum)
+  (col 1 :type fixnum)
+  (file "" :type string)
+  (comments nil))  ; list of (line . text) for pending comments
+
+(defun ps-eof-p (ps)
+  (>= (pstate-pos ps) (length (pstate-source ps))))
+
+(defun ps-peek (ps)
+  (if (ps-eof-p ps) nil
+      (char (pstate-source ps) (pstate-pos ps))))
+
+(defun ps-advance (ps)
+  "Advance one character, updating line/col."
+  (let ((c (char (pstate-source ps) (pstate-pos ps))))
+    (incf (pstate-pos ps))
+    (if (char= c #\Newline)
+        (progn (incf (pstate-line ps)) (setf (pstate-col ps) 1))
+        (incf (pstate-col ps)))
+    c))
+
+(defun ps-skip-whitespace (ps)
+  "Skip whitespace and commas (commas are whitespace in sysp). Collect comments."
+  (loop while (not (ps-eof-p ps)) do
+    (let ((c (ps-peek ps)))
+      (cond
+        ((member c '(#\Space #\Tab #\Newline #\Return #\,))
+         (ps-advance ps))
+        ((char= c #\;)
+         ;; Comment: collect text until end of line
+         (let ((line (pstate-line ps))
+               (text (make-array 0 :element-type 'character :adjustable t :fill-pointer 0)))
+           (loop while (and (not (ps-eof-p ps)) (not (char= (ps-peek ps) #\Newline)))
+                 do (vector-push-extend (ps-advance ps) text))
+           (push (cons line (coerce text 'string)) (pstate-comments ps))))
+        (t (return))))))
+
+(defun ps-read-string (ps)
+  "Read a double-quoted string with proper escape handling."
+  (ps-advance ps)  ; consume opening "
+  (let ((buf (make-array 0 :element-type 'character :adjustable t :fill-pointer 0)))
+    (loop
+      (when (ps-eof-p ps) (error "sysp parser: unterminated string at line ~d" (pstate-line ps)))
+      (let ((c (ps-advance ps)))
+        (cond
+          ((char= c #\") (return (coerce buf 'string)))
+          ((char= c #\\)
+           (when (ps-eof-p ps) (error "sysp parser: unterminated escape in string"))
+           (let ((esc (ps-advance ps)))
+             (vector-push-extend
+              (case esc
+                (#\n #\Newline)
+                (#\t #\Tab)
+                (#\\ #\\)
+                (#\" #\")
+                (#\0 (code-char 0))
+                (#\r #\Return)
+                (otherwise esc))
+              buf)))
+          (t (vector-push-extend c buf)))))))
+
+(defun ps-symbol-char-p (c)
+  "Is c a valid sysp symbol character?"
+  (and c (not (member c '(#\( #\) #\[ #\] #\" #\; #\Space #\Tab #\Newline #\Return #\,)))))
+
+(defun ps-read-atom (ps)
+  "Read a symbol, keyword, or number."
+  (let ((buf (make-array 0 :element-type 'character :adjustable t :fill-pointer 0)))
+    (loop while (and (not (ps-eof-p ps)) (ps-symbol-char-p (ps-peek ps)))
+          do (vector-push-extend (ps-advance ps) buf))
+    (let ((s (coerce buf 'string)))
+      (cond
+        ;; Keyword: starts with :
+        ((and (> (length s) 1) (char= (char s 0) #\:))
+         (intern (subseq s 1) :keyword))
+        ;; Number: try integer then float
+        ((and (> (length s) 0)
+              (or (digit-char-p (char s 0))
+                  (and (> (length s) 1) (char= (char s 0) #\-) (digit-char-p (char s 1)))))
+         (cond
+           ;; Hex: 0x...
+           ((and (> (length s) 2) (string-equal s "0x" :end1 2))
+            (parse-integer s :start 2 :radix 16))
+           ;; Float
+           ((find #\. s)
+            (read-from-string s))
+           ;; Integer
+           (t (parse-integer s :junk-allowed nil))))
+        ;; Symbol
+        (t (intern s :sysp))))))
+
+(defun ps-read-char-literal (ps)
+  "Read a #\\c character literal."
+  (ps-advance ps)  ; consume #
+  (ps-advance ps)  ; consume backslash
+  (when (ps-eof-p ps) (error "sysp parser: unterminated character literal"))
+  ;; Check for named chars like #\newline, #\space, #\tab
+  (let ((first-char (ps-advance ps)))
+    (if (and (not (ps-eof-p ps)) (alpha-char-p first-char) (alpha-char-p (ps-peek ps)))
+        ;; Multi-char name
+        (let ((buf (make-array 1 :element-type 'character :adjustable t :fill-pointer 1
+                               :initial-element first-char)))
+          (loop while (and (not (ps-eof-p ps)) (alpha-char-p (ps-peek ps)))
+                do (vector-push-extend (ps-advance ps) buf))
+          (let ((name (coerce buf 'string)))
+            (cond
+              ((string-equal name "newline") #\Newline)
+              ((string-equal name "space") #\Space)
+              ((string-equal name "tab") #\Tab)
+              ((string-equal name "return") #\Return)
+              (t (error "sysp parser: unknown character name #\\~a" name)))))
+        first-char)))
+
+(defun ps-read-form (ps)
+  "Read one form from parser state. Returns (values form has-form-p)."
+  (ps-skip-whitespace ps)
+  (when (ps-eof-p ps) (return-from ps-read-form (values nil nil)))
+  (let ((line (pstate-line ps))
+        (col (pstate-col ps))
+        (c (ps-peek ps)))
+    (let ((form
+            (cond
+              ;; List: ( or [
+              ((or (char= c #\() (char= c #\[))
+               (ps-read-list ps))
+              ;; String
+              ((char= c #\")
+               (ps-read-string ps))
+              ;; Quote
+              ((char= c #\')
+               (ps-advance ps)
+               (multiple-value-bind (inner has) (ps-read-form ps)
+                 (declare (ignore has))
+                 (list (intern "quote" :sysp) inner)))
+              ;; Quasiquote
+              ((char= c #\`)
+               (ps-advance ps)
+               (multiple-value-bind (inner has) (ps-read-form ps)
+                 (declare (ignore has))
+                 (list (intern "quasiquote" :sysp) inner)))
+              ;; Unquote
+              ((char= c #\~)
+               (ps-advance ps)
+               (if (and (not (ps-eof-p ps)) (char= (ps-peek ps) #\@))
+                   (progn (ps-advance ps)
+                          (multiple-value-bind (inner has) (ps-read-form ps)
+                            (declare (ignore has))
+                            (list (intern "splice" :sysp) inner)))
+                   (multiple-value-bind (inner has) (ps-read-form ps)
+                     (declare (ignore has))
+                     (list (intern "unquote" :sysp) inner))))
+              ;; Character literal
+              ((and (char= c #\#) (not (ps-eof-p ps))
+                    (< (1+ (pstate-pos ps)) (length (pstate-source ps)))
+                    (char= (char (pstate-source ps) (1+ (pstate-pos ps))) #\\))
+               (ps-read-char-literal ps))
+              ;; Atom (symbol, keyword, number)
+              (t (ps-read-atom ps)))))
+      ;; Store source location for lists
+      (when (consp form)
+        (setf (gethash form *source-locations*) (list (pstate-file ps) line col)))
+      (values form t))))
+
+(defun ps-read-list (ps)
+  "Read a list delimited by ( ) or [ ]."
+  (let ((open-char (ps-advance ps))
+        (close-char (if (char= (char (pstate-source ps) (1- (pstate-pos ps))) #\() #\) #\]))
+        (elements nil))
+    (declare (ignore open-char))
+    (loop
+      (ps-skip-whitespace ps)
+      (when (ps-eof-p ps)
+        (error "sysp parser: unterminated list at line ~d" (pstate-line ps)))
+      (when (char= (ps-peek ps) close-char)
+        (ps-advance ps)  ; consume closing delimiter
+        (return (nreverse elements)))
+      ;; Check for wrong delimiter
+      (when (member (ps-peek ps) '(#\) #\]))
+        (error "sysp parser: mismatched delimiter '~c' at line ~d col ~d"
+               (ps-peek ps) (pstate-line ps) (pstate-col ps)))
+      (multiple-value-bind (form has) (ps-read-form ps)
+        (when has (push form elements))))))
+
+(defun parse-sysp-source (source &optional (file "<string>"))
+  "Parse sysp source string into list of forms with comment tracking."
+  (let ((ps (make-pstate :source source :file file)))
+    (let ((forms nil)
+          (form-idx 0))
+      (loop
+        (ps-skip-whitespace ps)
+        ;; Attach pending comments to next form
+        (let ((pending-comments (nreverse (pstate-comments ps))))
+          (setf (pstate-comments ps) nil)
+          (multiple-value-bind (form has) (ps-read-form ps)
+            (unless has (return))
+            (when pending-comments
+              (setf (gethash form-idx *form-comments*)
+                    (mapcar #'cdr pending-comments)))
+            (push form forms)
+            (incf form-idx))))
+      ;; Handle trailing comments
+      (nreverse forms))))
 
 (defun read-sysp-file (path)
-  "Read sysp file and capture associated comments for each top-level form."
+  "Read sysp file using custom parser. Preserves comments, handles string escapes."
   (clrhash *form-comments*)
-  (let ((comments (extract-comments-from-file path))
-        (forms nil)
-        (form-positions nil))  ; list of (form . start-line)
-    ;; Read forms and track their positions
-    (let ((*readtable* *sysp-readtable*))
-      (with-open-file (in path :direction :input)
-        (let ((eof (gensym)))
-          (loop for form = (let ((start-line (file-position in)))
-                            (let ((f (read in nil eof)))
-                              (unless (eq f eof)
-                                (push (cons f start-line) form-positions))
-                              f))
-                until (eq form eof)
-                do (push form forms)))))
-    (setf forms (nreverse forms))
-    (setf form-positions (nreverse form-positions))
-    ;; Associate comments with forms
-    ;; Comments before a form belong to that form
-    (loop for (form . pos) in form-positions
-          for form-idx from 0
-          do (let ((form-comments nil))
-               ;; Collect comments that appear before this form's position
-               ;; and haven't been claimed by a previous form
-               (loop for (line-num . text) in comments
-                     while (< line-num (or (and (< form-idx (1- (length form-positions)))
-                                               (cdr (nth (1+ form-idx) form-positions)))
-                                           most-positive-fixnum))
-                     when (or (null form-positions)
-                             (>= line-num (if (> form-idx 0)
-                                             (cdr (nth (1- form-idx) form-positions))
-                                             0)))
-                     do (push text form-comments))
-               (when form-comments
-                 (setf (gethash form-idx *form-comments*) (nreverse form-comments)))))
-    forms))
+  (let ((source (with-open-file (in path :direction :input)
+                  (let ((s (make-string (file-length in))))
+                    (read-sequence s in)
+                    s))))
+    (parse-sysp-source source (namestring path))))
+
+(defun read-sysp-forms (path)
+  "Read a .sysp file and return its top-level forms (no comment tracking)."
+  (let ((source (with-open-file (in path :direction :input)
+                  (let ((s (make-string (file-length in))))
+                    (read-sequence s in)
+                    s))))
+    (parse-sysp-source source (namestring path))))
+
+(defun expand-uses (forms base-dir)
+  "Walk FORMS, replacing (use ...) with the included file's forms. Deduplicates by absolute path."
+  (loop for form in forms
+        if (and (listp form)
+                (symbolp (first form))
+                (string-equal (symbol-name (first form)) "use"))
+          nconc (let* ((arg (second form))
+                       (resolved (cond
+                                   ((stringp arg) (merge-pathnames arg base-dir))
+                                   ((symbolp arg)
+                                    ;; Bare symbol: look in lib/ relative to CWD
+                                    (merge-pathnames
+                                     (format nil "lib/~a.sysp" (string-downcase (symbol-name arg)))))
+                                   (t (error "use: argument must be a string or symbol, got ~s" arg))))
+                       (abs-path (namestring (truename resolved))))
+                  (if (gethash abs-path *included-files*)
+                      nil  ; already included — skip
+                      (progn
+                        (setf (gethash abs-path *included-files*) t)
+                        (let* ((child-forms (read-sysp-forms abs-path))
+                               (child-dir (make-pathname :directory (pathname-directory abs-path))))
+                          (expand-uses child-forms child-dir)))))
+        else collect form))
 
 ;;; === Macro System ===
 
@@ -1197,11 +1378,10 @@
 (defun ensure-fn-type (name arg-types ret-type)
   (unless (gethash name *generated-types*)
     (setf (gethash name *generated-types*) t)
-    (let ((arg-str (if arg-types
-                       (format nil "~{~a~^, ~}" (mapcar #'type-to-c arg-types))
-                       "void")))
-      (push (format nil "typedef ~a (*~a)(~a);~%"
-                    (type-to-c ret-type) name arg-str)
+    ;; Fn struct: { ret_type (*fn)(void* _ctx, arg_types...); void* env; }
+    (let ((arg-str (format nil "void*~{, ~a~}" (mapcar #'type-to-c arg-types))))
+      (push (format nil "typedef struct { ~a (*fn)(~a); void* env; } ~a;~%"
+                    (type-to-c ret-type) arg-str name)
             *type-decls*))))
 
 (defun ensure-union-type (tp)
@@ -1255,12 +1435,12 @@
       (push (format nil "static ~a* _rc_~a_new(~a val) { ~a* p = malloc(sizeof(~a)); p->_rc = 1; p->data = val; return p; }~%"
                     name (mangle-type-name inner-type) c-inner name name)
             *type-decls*)
-      ;; void _rc_T_retain(_RC_T* p) { p->_rc++; }
-      (push (format nil "static void _rc_~a_retain(~a* p) { if (p) p->_rc++; }~%"
+      ;; void _rc_T_retain(_RC_T* p) { RC_INC(p->_rc); }
+      (push (format nil "static void _rc_~a_retain(~a* p) { if (p) RC_INC(p->_rc); }~%"
                     (mangle-type-name inner-type) name)
             *type-decls*)
-      ;; void _rc_T_release(_RC_T** p) { if (*p && --(*p)->_rc == 0) { free(*p); *p = NULL; } }
-      (push (format nil "static void _rc_~a_release(~a** p) { if (*p && --(*p)->_rc == 0) { free(*p); *p = NULL; } }~%"
+      ;; void _rc_T_release(_RC_T** p) { if (*p && RC_DEC((*p)->_rc) == 1) { free(*p); *p = NULL; } }
+      (push (format nil "static void _rc_~a_release(~a** p) { if (*p && RC_DEC((*p)->_rc) == 1) { free(*p); *p = NULL; } }~%"
                     (mangle-type-name inner-type) name)
             *type-decls*))
     name))
@@ -1420,7 +1600,13 @@
     (t (values (format nil "~a" form) :unknown))))
 
 (defun sanitize-name (name)
-  (let ((result (substitute #\_ #\- name)))
+  (let* ((result (substitute #\_ #\- name))
+         (result (with-output-to-string (s)
+                   (loop for ch across result do
+                     (case ch
+                       (#\? (write-string "_p" s))
+                       (#\! (write-string "_bang" s))
+                       (otherwise (write-char ch s)))))))
     ;; Handle names that are C keywords
     (if (member result '("int" "float" "double" "char" "void" "struct"
                          "if" "else" "while" "for" "return" "break"
@@ -2022,8 +2208,44 @@
          (arr-type (make-array-type elem-type size)))
     (values (format nil "{0}" ) arr-type)))
 
+;;; === Closures ===
+
+(defun free-vars (body-forms params env)
+  "Find free variables in a lambda body: names referenced but not in params or *global-env*.
+   Returns list of (name . type) pairs."
+  (let ((free nil)
+        (param-names (mapcar (lambda (p) (if (consp p) (first p) (string p))) params)))
+    (labels
+        ((collect-if-free (name shadows)
+           (let ((tp (env-lookup env name)))
+             (when (and tp
+                        (not (member name param-names :test #'equal))
+                        (not (member name shadows :test #'equal))
+                        (not (env-lookup *global-env* name))
+                        (not (assoc name free :test #'equal)))
+               (push (cons name tp) free))))
+         (walk (f shadows)
+           (cond
+             ((null f) nil)
+             ((symbolp f) (collect-if-free (string f) shadows))
+             ((not (listp f)) nil)
+             ((and (symbolp (first f)) (sym= (first f) "lambda"))
+              ;; Nested lambda: add its params to shadows, walk body
+              (let* ((inner-params (second f))
+                     (new-shadows (append shadows
+                                         (loop for x in (if (listp inner-params) inner-params nil)
+                                               when (symbolp x) collect (string x))))
+                     (rest (cddr f))
+                     (bodies (if (keywordp (first rest)) (cdr rest) rest)))
+                (dolist (b bodies) (walk b new-shadows))))
+             (t (dolist (sub f) (walk sub shadows))))))
+      (dolist (bf body-forms)
+        (walk bf nil))
+      (nreverse free))))
+
 (defun compile-lambda (form env)
-  "(lambda [params...] :ret-type body...)"
+  "(lambda [params...] :ret-type body...) — compiles to Fn struct (fat pointer).
+   All lambdas get void* _ctx as first C param. Capturing lambdas use env struct."
   (let* ((params-raw (second form))
          (rest-forms (cddr form))
          (params (parse-params params-raw))
@@ -2032,36 +2254,132 @@
                              (setf rest-forms (cdr rest-forms)))))
          (body-forms rest-forms)
          (lambda-name (format nil "_lambda_~d" (incf *lambda-counter*)))
+         ;; Free variable analysis
+         (captures (free-vars body-forms params env))
+         (capturing-p (not (null captures)))
+         (env-struct-name (when capturing-p
+                            (format nil "_env_~d" (incf *env-counter*))))
          (fn-env (make-env :parent env)))
+    ;; Bind params in function env
     (dolist (p params)
       (env-bind fn-env (first p) (second p)))
-    ;; Multi-expression body: all but last are statements, last is return value
+    ;; For capturing lambdas, bind captures to _env->name in function env
+    (when capturing-p
+      (dolist (cap captures)
+        (env-bind fn-env (car cap) (cdr cap))))
+    ;; Compile body — use inner *pending-stmts* for lambda body, save results
     (let* ((all-but-last (butlast body-forms))
-           (last-form (car (last body-forms))))
+           (last-form (car (last body-forms)))
+           (result-code nil)
+           (result-type nil)
+           (env-decl-stmt nil))
       (let ((*pending-stmts* nil))
         (multiple-value-bind (last-code last-type) (compile-expr last-form fn-env)
           (let* ((ret-type (or ret-annotation last-type))
                  (arg-types (mapcar #'second params))
                  (fn-type (make-fn-type arg-types ret-type))
-                 (param-str (format nil "~{~a~^, ~}"
-                                   (mapcar (lambda (p)
-                                             (format nil "~a ~a"
-                                                     (type-to-c (second p))
-                                                     (sanitize-name (first p))))
-                                           params)))
-                 (body-stmts (append (or (when all-but-last (compile-body all-but-last fn-env)) nil)
-                                     *pending-stmts*)))
+                 (fn-c-type (fn-type-c-name fn-type))
+                 ;; C params: void* _ctx, then user params
+                 (user-param-str (format nil "~{~a~^, ~}"
+                                        (mapcar (lambda (p)
+                                                  (format nil "~a ~a"
+                                                          (type-to-c (second p))
+                                                          (sanitize-name (first p))))
+                                                params)))
+                 (c-param-str (if (string= user-param-str "")
+                                  "void* _ctx"
+                                  (format nil "void* _ctx, ~a" user-param-str)))
+                 ;; Env cast + capture access at function start
+                 (env-stmts (when capturing-p
+                              (list (format nil "  ~a* _env = (~a*)_ctx;"
+                                            env-struct-name env-struct-name))))
+                 (body-stmts-raw (append (or (when all-but-last (compile-body all-but-last fn-env)) nil)
+                                         *pending-stmts*))
+                 ;; Fix captured var references in body stmts and last-code
+                 (body-stmts (if capturing-p
+                                 (mapcar (lambda (s) (fix-capture-refs s captures)) body-stmts-raw)
+                                 body-stmts-raw))
+                 (last-code-fixed (if capturing-p
+                                      (fix-capture-refs last-code captures)
+                                      last-code))
+                 (all-body (append env-stmts body-stmts)))
+            ;; Generate env struct typedef if capturing
+            (when capturing-p
+              (let ((fields (format nil "~{~a~^~%~}"
+                                   (mapcar (lambda (cap)
+                                             (format nil "  ~a ~a;"
+                                                     (type-to-c (cdr cap))
+                                                     (sanitize-name (car cap))))
+                                           captures))))
+                (push (format nil "typedef struct {~%~a~%} ~a;~%"
+                              fields env-struct-name)
+                      *struct-defs*)))
+            ;; Forward decl
             (push (format nil "static ~a ~a(~a);"
-                          (type-to-c ret-type) lambda-name
-                          (if params param-str "void"))
+                          (type-to-c ret-type) lambda-name c-param-str)
                   *lambda-forward-decls*)
+            ;; Function body
             (push (format nil "static ~a ~a(~a) {~%~{~a~%~}  return ~a;~%}~%"
-                          (type-to-c ret-type) lambda-name
-                          (if params param-str "void")
-                          (or body-stmts nil)
-                          last-code)
+                          (type-to-c ret-type) lambda-name c-param-str
+                          (or all-body nil)
+                          last-code-fixed)
                   *functions*)
-            (values lambda-name fn-type)))))))
+            ;; Prepare result
+            (setf result-type fn-type)
+            (if capturing-p
+                (let ((env-var (format nil "_ctx_~d" *env-counter*)))
+                  (setf env-decl-stmt
+                        (format nil "  ~a ~a = {~{~a~^, ~}};"
+                                env-struct-name env-var
+                                (mapcar (lambda (cap) (sanitize-name (car cap))) captures)))
+                  (setf result-code
+                        (format nil "(~a){~a, &~a}" fn-c-type lambda-name env-var)))
+                (setf result-code
+                      (format nil "(~a){~a, NULL}" fn-c-type lambda-name))))))
+      ;; Now back in outer scope — push env decl to OUTER *pending-stmts*
+      (when env-decl-stmt
+        (push env-decl-stmt *pending-stmts*))
+      (values result-code result-type))))
+
+(defun fix-capture-refs (code captures)
+  "Replace captured variable names with _env->name in generated C code.
+   Simple string replacement — works because sanitize-name produces unique C identifiers."
+  (let ((result code))
+    (dolist (cap captures)
+      (let* ((c-name (sanitize-name (car cap)))
+             (replacement (format nil "_env->~a" c-name)))
+        ;; Replace standalone occurrences (word boundary)
+        ;; Use a simple approach: replace with regex-like word boundaries
+        (setf result (replace-c-identifier result c-name replacement))))
+    result))
+
+(defun replace-c-identifier (str old new)
+  "Replace occurrences of C identifier `old` with `new` in `str`,
+   only at word boundaries (not inside longer identifiers)."
+  (let ((old-len (length old))
+        (result (make-array 0 :element-type 'character :adjustable t :fill-pointer 0))
+        (i 0)
+        (len (length str)))
+    (loop while (< i len) do
+      (if (and (<= (+ i old-len) len)
+               (string= str old :start1 i :end1 (+ i old-len))
+               ;; Check left boundary: start of string or non-identifier char
+               (or (= i 0)
+                   (not (c-ident-char-p (char str (1- i)))))
+               ;; Check right boundary: end of string or non-identifier char
+               (or (= (+ i old-len) len)
+                   (not (c-ident-char-p (char str (+ i old-len))))))
+          (progn
+            (loop for c across new do (vector-push-extend c result))
+            (incf i old-len))
+          (progn
+            (vector-push-extend (char str i) result)
+            (incf i))))
+    (coerce result 'string)))
+
+(defun c-ident-char-p (c)
+  "Is c a valid C identifier character?"
+  (or (alphanumericp c) (char= c #\_)))
 
 
 (defun compile-set-expr (form env)
@@ -2410,9 +2728,19 @@
                   (values (format nil "~a(~{~a~^, ~})" (c-fn-name fn-name) all-args)
                           ret-type)))
               ;; Non-variadic: compile all args directly
-              (let ((compiled-args (mapcar (lambda (a) (first (multiple-value-list (compile-expr a env)))) args)))
-                (values (format nil "~a(~{~a~^, ~})" (c-fn-name fn-name) compiled-args)
-                        ret-type)))))))
+              (let ((compiled-args (mapcar (lambda (a) (first (multiple-value-list (compile-expr a env)))) args))
+                    (is-fn-var (and (not (gethash fn-name *direct-fns*))
+                                    fn-type
+                                    (eq (type-kind fn-type) :fn))))
+                (if is-fn-var
+                    ;; Call through Fn struct: f.fn(f.env, args...)
+                    (let ((c-name (sanitize-name fn-name)))
+                      (values (format nil "~a.fn(~a.env~{, ~a~})"
+                                      c-name c-name compiled-args)
+                              ret-type))
+                    ;; Direct function call
+                    (values (format nil "~a(~{~a~^, ~})" (c-fn-name fn-name) compiled-args)
+                            ret-type))))))))
 
 (defun compile-struct-construct (name args env)
   (let ((compiled-args (mapcar (lambda (a) (first (multiple-value-list (compile-expr a env)))) args)))
@@ -3109,6 +3437,7 @@
                (c-name (format nil "~a_from_~a" (ensure-union-type type-expr) mname))
                (fn-type (make-fn-type (list variant) type-expr)))
           (env-bind *global-env* fn-name fn-type)
+          (setf (gethash fn-name *direct-fns*) t)
           ;; Register name mapping so compile-call emits the right C name
           (setf (gethash fn-name *name-overrides*) c-name))))))
 
@@ -3239,6 +3568,7 @@
       (setf (gethash name *poly-fns*) (list params-raw ret-ann body-forms))
       ;; Register a poly marker in global env so compile-call knows
       (env-bind *global-env* name :poly)
+      (setf (gethash name *direct-fns*) t)
       (return-from compile-defn nil)))
   (let* ((name (string (second form)))
          (params-raw (third form))
@@ -3270,7 +3600,8 @@
     (let* ((arg-types (mapcar #'second params))
            (ret-type (or ret-annotation inferred-ret-type :int))
            (fn-type (make-fn-type arg-types ret-type)))
-      (env-bind *global-env* name fn-type))
+      (env-bind *global-env* name fn-type)
+      (setf (gethash name *direct-fns*) t))
     ;; Register for compile-time macro use (skip main)
     (unless (string-equal name "main")
       (setf (gethash name *macro-fns*) (list params-raw raw-body)))
@@ -3395,7 +3726,8 @@
          (ret-type (or ret-annotation :int))
          (arg-types (mapcar #'second params))
          (fn-type (make-fn-type arg-types ret-type)))
-    (env-bind *global-env* name fn-type)))
+    (env-bind *global-env* name fn-type)
+    (setf (gethash name *direct-fns*) t)))
 
 (defun compile-include (form)
   "(include \"header.h\")"
@@ -3701,11 +4033,6 @@
          (raw-body (if (keywordp (first rest-forms)) (cdr rest-forms) rest-forms)))
     (setf (gethash name *macro-fns*) (list params-raw raw-body))))
 
-;; Comments to emit with functions/structs/vars
-(defvar *function-comments* nil)  ; alist (name . (comment-strings...))
-(defvar *struct-comments* nil)
-(defvar *var-comments* nil)
-
 (defun sysp-comment-to-c (comment)
   "Convert a sysp comment (;; ...) to C comment (// ...)"
   (let ((text (string-left-trim '(#\;) comment)))
@@ -3836,12 +4163,12 @@
   (format out "/* Reference counting */~%")
   (format out "static Value val_retain(Value v) {~%")
   (format out "    if (v.tag == VAL_CONS && v.as_cons)~%")
-  (format out "        v.as_cons->refcount++;~%")
+  (format out "        RC_INC(v.as_cons->refcount);~%")
   (format out "    return v;~%")
   (format out "}~%~%")
 
   (format out "static void val_release(Value v) {~%")
-  (format out "    if (v.tag == VAL_CONS && v.as_cons && --v.as_cons->refcount == 0) {~%")
+  (format out "    if (v.tag == VAL_CONS && v.as_cons && RC_DEC(v.as_cons->refcount) == 1) {~%")
   (format out "        val_release(v.as_cons->car);~%")
   (format out "        val_release(v.as_cons->cdr);~%")
   (format out "        free(v.as_cons);~%")
@@ -3881,7 +4208,7 @@
   (format out "    return result;~%")
   (format out "}~%~%")
 
-  (format out "static uint32_t _sysp_gensym = 0x80000000;~%~%")
+  (format out "static SYSP_TLS uint32_t _sysp_gensym = 0x80000000;~%~%")
 
   ;; Symbol table for printing
   (let ((max-id *symbol-counter*))
@@ -3953,6 +4280,34 @@
     (dolist (inc *includes*)
       (format out "#include <~a>~%" inc))
     (format out "~%")
+    ;; Thread safety macros (always emitted — zero cost if single-threaded)
+    (format out "/* Thread safety macros */~%")
+    (format out "#ifndef SYSP_NO_THREADS~%")
+    (format out "  #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__)~%")
+    (format out "    #include <stdatomic.h>~%")
+    (format out "    #define RC_INC(x) atomic_fetch_add_explicit(&(x), 1, memory_order_relaxed)~%")
+    (format out "    #define RC_DEC(x) atomic_fetch_sub_explicit(&(x), 1, memory_order_acq_rel)~%")
+    (format out "    #define SYSP_TLS _Thread_local~%")
+    (format out "  #elif defined(__GNUC__) || defined(__clang__)~%")
+    (format out "    #define RC_INC(x) __sync_fetch_and_add(&(x), 1)~%")
+    (format out "    #define RC_DEC(x) __sync_fetch_and_sub(&(x), 1)~%")
+    (format out "    #define SYSP_TLS __thread~%")
+    (format out "  #elif defined(_MSC_VER)~%")
+    (format out "    #include <intrin.h>~%")
+    (format out "    #define RC_INC(x) _InterlockedIncrement((long*)&(x))~%")
+    (format out "    #define RC_DEC(x) _InterlockedDecrement((long*)&(x))~%")
+    (format out "    #define SYSP_TLS __declspec(thread)~%")
+    (format out "  #else~%")
+    (format out "    #warning \"Unknown compiler: define RC_INC/RC_DEC or -DSYSP_NO_THREADS\"~%")
+    (format out "    #define RC_INC(x) (++(x))~%")
+    (format out "    #define RC_DEC(x) (--(x))~%")
+    (format out "    #define SYSP_TLS~%")
+    (format out "  #endif~%")
+    (format out "#else~%")
+    (format out "  #define RC_INC(x) (++(x))~%")
+    (format out "  #define RC_DEC(x) (--(x))~%")
+    (format out "  #define SYSP_TLS~%")
+    (format out "#endif~%~%")
     ;; Value type preamble (if needed)
     (when *uses-value-type*
       (emit-value-preamble out))
@@ -4008,11 +4363,20 @@
   (setf *type-aliases* (make-hash-table :test 'equal))
   (setf *name-overrides* (make-hash-table :test 'equal))
   (setf *poly-fns* (make-hash-table :test #'equal))
-  (setf *mono-instances* (make-hash-table :test #'equal)))
+  (setf *mono-instances* (make-hash-table :test #'equal))
+  (setf *included-files* (make-hash-table :test 'equal))
+  (setf *direct-fns* (make-hash-table :test 'equal))
+  (setf *env-counter* 0))
 
 (defun compile-file-to-c (in-path out-path)
   (reset-state)
-  (let ((forms (read-sysp-file in-path)))
+  (let* ((forms (read-sysp-file in-path))
+         (abs-in (namestring (truename in-path)))
+         (base-dir (make-pathname :directory (pathname-directory (truename in-path)))))
+    ;; Mark main file as included so it won't be re-included
+    (setf (gethash abs-in *included-files*) t)
+    ;; Expand (use ...) forms before inference
+    (setf forms (expand-uses forms base-dir))
     ;; Phase 1: Type inference (constraint generation + solving)
     (infer-toplevel forms)
     ;; Phase 2: Compilation (uses inferred types from *infer-env*)

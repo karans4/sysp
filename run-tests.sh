@@ -3,7 +3,7 @@
 
 set -e
 
-TESTS="test-cons test-refcount test-qq test-macros test-macros2 test-infer test-nesting test-numerics test-types test-recur test-union test-deftype test-branch-union test-inline test-match test-mono test-arc test-limitations"
+TESTS="test-cons test-refcount test-qq test-macros test-macros2 test-infer test-nesting test-numerics test-types test-recur test-union test-deftype test-branch-union test-inline test-match test-mono test-arc test-limitations test-modules test-closures"
 CFLAGS="-std=c99 -pedantic -Wall -Wextra"
 SYSP="sbcl --script sysp.lisp"
 TEST_DIR="tests"
