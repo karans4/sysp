@@ -1,11 +1,7 @@
 ;;; Tic Tac Toe in sysp — proof of concept
 ;;; Compiles to C, uses raylib for graphics
 
-(include "raylib.h")
-
-;; Foreign structs from raylib (don't emit typedefs, just register fields)
-(foreign-struct Color [r :u8, g :u8, b :u8, a :u8])
-(foreign-struct Vector2 [x :f32, y :f32])
+(use raylib)
 
 ;; Game enums
 (enum Square [EMPTY 0] [X_PIECE 1] [O_PIECE 2])
@@ -18,24 +14,6 @@
 (let LINE_THICK :int 4)
 (let LEFT_CLICK :int 0)
 (let FLAG_MSAA :int 32)
-
-;; Raylib externs
-(extern SetConfigFlags [flags :int] :void)
-(extern InitWindow [width :int, height :int, title :str] :void)
-(extern CloseWindow [] :void)
-(extern WindowShouldClose [] :int)
-(extern SetTargetFPS [fps :int] :void)
-(extern BeginDrawing [] :void)
-(extern EndDrawing [] :void)
-(extern ClearBackground [color :Color] :void)
-(extern DrawLine [x1 :int, y1 :int, x2 :int, y2 :int, color :Color] :void)
-(extern DrawLineEx [start :Vector2, end :Vector2, thick :f32, color :Color] :void)
-(extern DrawCircle [cx :int, cy :int, radius :f32, color :Color] :void)
-(extern DrawRing [center :Vector2, innerRadius :f32, outerRadius :f32, startAngle :f32, endAngle :f32, segments :int, color :Color] :void)
-(extern DrawRectangle [x :int, y :int, w :int, h :int, color :Color] :void)
-(extern DrawText [text :str, x :int, y :int, size :int, color :Color] :void)
-(extern GetMousePosition [] :Vector2)
-(extern IsMouseButtonPressed [button :int] :int)
 
 ;; Check if a player has won. Returns the winning Square or EMPTY.
 (defn check-winner [board :ptr-int] :int

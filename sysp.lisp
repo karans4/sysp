@@ -1093,9 +1093,13 @@
                        (resolved (cond
                                    ((stringp arg) (merge-pathnames arg base-dir))
                                    ((symbolp arg)
-                                    ;; Bare symbol: look in lib/ relative to CWD
-                                    (merge-pathnames
-                                     (format nil "lib/~a.sysp" (string-downcase (symbol-name arg)))))
+                                    ;; Bare symbol: try lib/X.sysp first, fall back to lib/X.sysph
+                                    ;; (.sysph used when only header bindings exist, e.g. imported C libs)
+                                    (let ((sname (string-downcase (symbol-name arg))))
+                                      (let ((sysp (merge-pathnames (format nil "lib/~a.sysp" sname))))
+                                        (if (probe-file sysp)
+                                            sysp
+                                            (merge-pathnames (format nil "lib/~a.sysph" sname))))))
                                    (t (error "use: argument must be a string or symbol, got ~s" arg))))
                        (abs-path (namestring (truename resolved))))
                   (if (gethash abs-path *included-files*)
@@ -1106,6 +1110,177 @@
                                (child-dir (make-pathname :directory (pathname-directory abs-path))))
                           (expand-uses child-forms child-dir)))))
         else collect form))
+
+;;; === Header Emission (.sysph) ===
+
+(defun serialize-atom (x)
+  "Serialize a single atom to sysp source string."
+  (cond
+    ((null x) "nil")
+    ((keywordp x) (format nil ":~a" (string-downcase (symbol-name x))))
+    ((symbolp x) (let ((n (symbol-name x)))
+                   ;; Preserve case from parser (sysp package is case-sensitive)
+                   n))
+    ((stringp x) (format nil "~s" x))  ; CL ~s gives quoted string with escapes
+    ((characterp x)
+     (cond
+       ((char= x #\Newline) "#\\newline")
+       ((char= x #\Space) "#\\space")
+       ((char= x #\Tab) "#\\tab")
+       (t (format nil "#\\~c" x))))
+    ((integerp x) (format nil "~d" x))
+    ((floatp x) (format nil "~f" x))
+    (t (format nil "~a" x))))
+
+(defun serialize-list (items &optional (brackets nil))
+  "Serialize a list of forms. If BRACKETS, use [...], else (...)."
+  (let ((open (if brackets "[" "("))
+        (close (if brackets "]" ")")))
+    (format nil "~a~{~a~^ ~}~a" open (mapcar #'serialize-atom-or-form items) close)))
+
+(defun serialize-atom-or-form (x)
+  "Serialize any value — atom or list."
+  (if (listp x)
+      (serialize-list x)
+      (serialize-atom x)))
+
+(defun serialize-params (params-raw)
+  "Serialize a parameter vector [name :type, name :type, ...]."
+  (let ((parts nil))
+    (let ((items (if (listp params-raw) params-raw nil)))
+      (loop for rest on items
+            for x = (car rest)
+            do (push (serialize-atom x) parts)
+            ;; Add comma before next param name if next item is a symbol (not keyword)
+            ;; Pattern: name :type, name :type — comma separates pairs
+            when (and (cdr rest) (cddr rest)
+                      (keywordp x)
+                      (not (keywordp (cadr rest))))
+              do (push "," parts)))
+    (format nil "[~{~a~^ ~}]" (nreverse parts))))
+
+(defun serialize-form (form)
+  "Serialize a top-level sysp form back to source."
+  (when (not (listp form)) (return-from serialize-form (serialize-atom form)))
+  (let ((head (first form)))
+    (cond
+      ;; (defn name [params] :ret body...)
+      ;; (extern name [params] :ret)
+      ((or (sym= head "defn") (sym= head "extern"))
+       (let* ((name (second form))
+              (params (third form))
+              (rest (cdddr form)))
+         (format nil "(~a ~a ~a~{ ~a~})"
+                 (serialize-atom head)
+                 (serialize-atom name)
+                 (serialize-params params)
+                 (mapcar #'serialize-atom-or-form rest))))
+      ;; (defn-ct name [params] body...)
+      ((sym= head "defn-ct")
+       (let* ((name (second form))
+              (params (third form))
+              (body (cdddr form)))
+         (format nil "(~a ~a ~a~{ ~a~})"
+                 (serialize-atom head)
+                 (serialize-atom name)
+                 (serialize-params params)
+                 (mapcar #'serialize-atom-or-form body))))
+      ;; (defmacro name [params] body...)
+      ((sym= head "defmacro")
+       (let* ((name (second form))
+              (params (third form))
+              (body (cdddr form)))
+         (format nil "(~a ~a ~a~{ ~a~})"
+                 (serialize-atom head)
+                 (serialize-atom name)
+                 (serialize-params params)
+                 (mapcar #'serialize-atom-or-form body))))
+      ;; (struct Name [fields...])
+      ((sym= head "struct")
+       (format nil "(~a ~a ~a)"
+               (serialize-atom head)
+               (serialize-atom (second form))
+               (serialize-params (third form))))
+      ;; (enum Name [Variant val] ...)
+      ((sym= head "enum")
+       (format nil "(~a ~a~{ ~a~})"
+               (serialize-atom head)
+               (serialize-atom (second form))
+               (mapcar (lambda (v)
+                         (if (listp v)
+                             (serialize-list v t)
+                             (serialize-atom v)))
+                       (cddr form))))
+      ;; (deftype Name type-expr)
+      ((sym= head "deftype")
+       (format nil "(~a ~a ~a)"
+               (serialize-atom head)
+               (serialize-atom (second form))
+               (serialize-atom-or-form (third form))))
+      ;; (include "header.h")
+      ((sym= head "include")
+       (format nil "(include ~s)" (second form)))
+      ;; (const name :type expr) / (let name :type expr)
+      ((or (sym= head "const") (sym= head "let"))
+       (format nil "(~a~{ ~a~})"
+               (serialize-atom head)
+               (mapcar #'serialize-atom-or-form (cdr form))))
+      ;; Fallback: generic list
+      (t (serialize-list form)))))
+
+(defun emit-header (in-path out-path)
+  "Read a .sysp file and emit a .sysph header with public API only."
+  (let* ((forms (read-sysp-forms in-path))
+         (abs-in (namestring (truename in-path)))
+         (base-dir (make-pathname :directory (pathname-directory (truename in-path)))))
+    ;; Reset included-files for use expansion
+    (setf *included-files* (make-hash-table :test 'equal))
+    (setf (gethash abs-in *included-files*) t)
+    (setf forms (expand-uses forms base-dir))
+    (with-open-file (out out-path :direction :output :if-exists :supersede)
+      (format out ";; ~a — auto-generated header~%" (file-namestring out-path))
+      (format out ";; Source: ~a~%~%" (file-namestring in-path))
+      (dolist (form forms)
+        (when (listp form)
+          (let ((head (first form)))
+            (cond
+              ;; struct/deftype/enum — verbatim
+              ((or (sym= head "struct") (sym= head "deftype") (sym= head "enum"))
+               (format out "~a~%" (serialize-form form)))
+              ;; include — verbatim
+              ((sym= head "include")
+               (format out "~a~%" (serialize-form form)))
+              ;; const / let at top level — verbatim
+              ((or (sym= head "const") (sym= head "let"))
+               (format out "~a~%" (serialize-form form)))
+              ;; defmacro / defn-ct — verbatim (compile-time)
+              ((or (sym= head "defmacro") (sym= head "defn-ct"))
+               (format out "~a~%" (serialize-form form)))
+              ;; extern — verbatim
+              ((sym= head "extern")
+               (format out "~a~%" (serialize-form form)))
+              ;; defn — check if private (starts with _), poly, or normal
+              ((sym= head "defn")
+               (let ((name (string (second form))))
+                 (unless (and (> (length name) 0) (char= (char name 0) #\_))
+                   ;; Private functions skipped
+                   (if (defn-is-poly-p form)
+                       ;; Poly: emit verbatim (needs body for monomorphization)
+                       (format out "~a~%" (serialize-form form))
+                       ;; Mono: strip body → extern
+                       (let* ((params (third form))
+                              (rest (cdddr form))
+                              (ret-kw (when (keywordp (first rest)) (first rest))))
+                         (format out "(extern ~a ~a~a)~%"
+                                 (serialize-atom (second form))
+                                 (serialize-params params)
+                                 (if ret-kw
+                                     (format nil " ~a" (serialize-atom ret-kw))
+                                     "")))))))
+              ;; c-decl — skip (raw C, not part of sysp API)
+              ((sym= head "c-decl") nil)
+              ;; use — skip (already expanded)
+              ((sym= head "use") nil))))))))
 
 ;;; === Macro System ===
 
@@ -4926,14 +5101,27 @@
 
 (defun main ()
   (let ((args (cdr sb-ext:*posix-argv*)))
-    (when (< (length args) 1)
-      (format *error-output* "Usage: sysp <input.sysp> [output.c]~%")
-      (sb-ext:exit :code 1))
-    (let* ((input (first args))
-           (output (or (second args)
-                       (concatenate 'string
-                                    (subseq input 0 (position #\. input :from-end t))
-                                    ".c"))))
-      (compile-file-to-c input output))))
+    (cond
+      ;; --emit-header mode: sysp --emit-header input.sysp [output.sysph]
+      ((and (>= (length args) 2) (string= (first args) "--emit-header"))
+       (let* ((input (second args))
+              (output (or (third args)
+                          (concatenate 'string
+                                       (subseq input 0 (position #\. input :from-end t))
+                                       ".sysph"))))
+         (emit-header input output)
+         (format t "Header ~a -> ~a~%" input output)))
+      ;; Normal compilation
+      ((>= (length args) 1)
+       (let* ((input (first args))
+              (output (or (second args)
+                          (concatenate 'string
+                                       (subseq input 0 (position #\. input :from-end t))
+                                       ".c"))))
+         (compile-file-to-c input output)))
+      (t
+       (format *error-output* "Usage: sysp <input.sysp> [output.c]~%")
+       (format *error-output* "       sysp --emit-header <input.sysp> [output.sysph]~%")
+       (sb-ext:exit :code 1)))))
 
 (main)

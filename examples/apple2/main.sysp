@@ -1,0 +1,177 @@
+;; main.sysp — Apple II emulator entry point
+;; Demonstrates sysp module system: 6 files, SDL2 FFI, 6502 CPU
+
+(use "lib/sdl2.sysp")
+(use "mem.sysp")
+(use "cpu.sysp")
+(use "video.sysp")
+(use "input.sysp")
+
+(include "stdio.h")
+
+;; SDL constants — prefixed to avoid collision with SDL2 header enums
+(let SYSP_INIT_VIDEO :u32 32)
+(let SYSP_WINDOW_SHOWN :u32 4)
+(let SYSP_RENDERER_ACCEL :u32 2)
+(let SYSP_RENDERER_VSYNC :u32 4)
+(let SYSP_PIXFMT_ARGB :u32 372645892)
+(let SYSP_TEXACCESS_STREAM :int 1)
+
+;; Display scaling: 280x192 native -> 840x576 window (3x)
+(let SCALE :int 3)
+(let WIN_W :int 840)
+(let WIN_H :int 576)
+
+;; Cycles per frame at ~1MHz, 60fps
+(let CYCLES_PER_FRAME :int 16667)
+
+;; Embedded test program: writes "HELLO, WORLD!" to Apple II screen memory
+;; then spins forever. Loaded at $0800.
+;;
+;; Assembly:
+;;   LDX #$00           ; A2 00
+;;   LDA $0820,X        ; BD 20 08
+;;   BEQ done           ; F0 06
+;;   STA $0400,X        ; 9D 00 04
+;;   INX                ; E8
+;;   JMP $0800+2        ; 4C 02 08
+;;   done: JMP done     ; 4C 09 08
+;;   .ascii "HELLO, WORLD!\0"
+;;   (13 chars + null = 14 bytes, starting at $0820... wait let me recalculate)
+;;
+;; Actually, simpler layout at $0600:
+;;   $0600: LDX #$00        -> 162 0
+;;   $0602: LDA $0620,X     -> 189 32 6
+;;   $0605: BEQ +6          -> 240 6
+;;   $0607: STA $0400,X     -> 157 0 4
+;;   $060A: INX             -> 232
+;;   $060B: JMP $0602       -> 76 2 6
+;;   $060E: JMP $060E       -> 76 14 6
+;;   ...padding to $0620...
+;;   $0620: "HELLO, WORLD!" + 0
+
+(defn load-test-program [mem :ptr-u8] :void
+  (do
+    ;; Code at $0600
+    (mem-write mem 1536 162)   ;; LDX #$00
+    (mem-write mem 1537 0)
+    (mem-write mem 1538 189)   ;; LDA $0620,X (absolute,X)
+    (mem-write mem 1539 32)    ;; low byte of $0620
+    (mem-write mem 1540 6)     ;; high byte of $0620
+    (mem-write mem 1541 240)   ;; BEQ +6
+    (mem-write mem 1542 6)
+    (mem-write mem 1543 157)   ;; STA $0400,X (absolute,X)
+    (mem-write mem 1544 0)     ;; low byte of $0400
+    (mem-write mem 1545 4)     ;; high byte of $0400
+    (mem-write mem 1546 232)   ;; INX
+    (mem-write mem 1547 76)    ;; JMP $0602
+    (mem-write mem 1548 2)
+    (mem-write mem 1549 6)
+    (mem-write mem 1550 76)    ;; JMP $060E (spin)
+    (mem-write mem 1551 14)
+    (mem-write mem 1552 6)
+
+    ;; String data at $0620 = 1568
+    ;; "HELLO, WORLD!" as Apple II screen codes (add 128 for "normal" display)
+    (mem-write mem 1568 (+ 72 128))   ;; H
+    (mem-write mem 1569 (+ 69 128))   ;; E
+    (mem-write mem 1570 (+ 76 128))   ;; L
+    (mem-write mem 1571 (+ 76 128))   ;; L
+    (mem-write mem 1572 (+ 79 128))   ;; O
+    (mem-write mem 1573 (+ 44 128))   ;; ,
+    (mem-write mem 1574 (+ 32 128))   ;; space
+    (mem-write mem 1575 (+ 87 128))   ;; W
+    (mem-write mem 1576 (+ 79 128))   ;; O
+    (mem-write mem 1577 (+ 82 128))   ;; R
+    (mem-write mem 1578 (+ 76 128))   ;; L
+    (mem-write mem 1579 (+ 68 128))   ;; D
+    (mem-write mem 1580 (+ 33 128))   ;; !
+    (mem-write mem 1581 0)            ;; null terminator
+
+    ;; Set reset vector ($FFFC-$FFFD) to $0600
+    (mem-write mem 65532 0)    ;; low byte
+    (mem-write mem 65533 6)))  ;; high byte
+
+(defn main [] :int
+  (do
+    ;; Init SDL2
+    (when (!= (SDL_Init SYSP_INIT_VIDEO) 0)
+      (printf "SDL_Init failed\\n")
+      (return 1))
+
+    (let window (SDL_CreateWindow "sysp Apple II" 100 100 WIN_W WIN_H SYSP_WINDOW_SHOWN))
+    (when (null? window)
+      (printf "Window creation failed\\n")
+      (return 1))
+
+    (let renderer (SDL_CreateRenderer window -1
+                    (bit-or SYSP_RENDERER_ACCEL SYSP_RENDERER_VSYNC)))
+    (when (null? renderer)
+      (printf "Renderer creation failed\\n")
+      (return 1))
+
+    (let texture (SDL_CreateTexture renderer SYSP_PIXFMT_ARGB
+                    SYSP_TEXACCESS_STREAM SCREEN_W SCREEN_H))
+
+    ;; Allocate memory
+    (let mem (cast :ptr-u8 (malloc (cast :size 65536))))
+    (memset (cast :ptr-void mem) 0 (cast :size 65536))
+
+    ;; Allocate pixel buffer (280 * 192 * 4 bytes)
+    (let pixels (cast :ptr-u32 (malloc (cast :size (* (* SCREEN_W SCREEN_H) 4)))))
+
+    ;; Allocate font
+    (let font (cast :ptr-u8 (malloc (cast :size 768))))
+    (memset (cast :ptr-void font) 0 (cast :size 768))
+    (font-init font)
+
+    ;; Allocate SDL event buffer (64 bytes is enough for any SDL_Event)
+    (let event-buf (cast :ptr-u8 (malloc (cast :size 64))))
+
+    ;; Load test program and init CPU
+    (load-test-program mem)
+    (let-mut cpu (CPU (cast :u8 0) (cast :u8 0) (cast :u8 0) (cast :u8 253)
+                      0 (cast :u8 36)))
+    (cpu-reset (addr-of cpu) mem)
+
+    (printf "Apple II emulator started. Reset vector -> PC=$%04X\\n" (get cpu pc))
+
+    ;; Main loop
+    (let-mut running 1)
+    (while running
+      (do
+        ;; Poll input
+        (when (input-poll mem event-buf)
+          (set! running 0))
+
+        ;; Execute cycles for one frame
+        (let-mut cycles 0)
+        (while (< cycles CYCLES_PER_FRAME)
+          (let c (cpu-step (addr-of cpu) mem))
+          (if (> c 0)
+            (set! cycles (+ cycles c))
+          else
+            (do
+              ;; Bad opcode — stop
+              (printf "Unknown opcode at PC=$%04X\\n" (get cpu pc))
+              (set! running 0)
+              (set! cycles CYCLES_PER_FRAME))))
+
+        ;; Render
+        (video-update mem font pixels)
+        (SDL_UpdateTexture texture (cast :ptr-void 0) (cast :ptr-void pixels)
+                           (* SCREEN_W 4))
+        (SDL_RenderClear renderer)
+        (SDL_RenderCopy renderer texture (cast :ptr-void 0) (cast :ptr-void 0))
+        (SDL_RenderPresent renderer)))
+
+    ;; Cleanup
+    (free (cast :ptr-void event-buf))
+    (free (cast :ptr-void font))
+    (free (cast :ptr-void pixels))
+    (free (cast :ptr-void mem))
+    (SDL_DestroyTexture texture)
+    (SDL_DestroyRenderer renderer)
+    (SDL_DestroyWindow window)
+    (SDL_Quit)
+    0))

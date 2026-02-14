@@ -1,0 +1,83 @@
+;; test-cpu.sysp — Run Klaus Dormann's 6502 functional test (headless)
+;; Loads a 64KB binary, executes until PC loops, reports pass/fail
+
+(use "lib/sdl2.sysp")
+(use "mem.sysp")
+(use "cpu.sysp")
+
+(include "stdio.h")
+
+;; The test succeeds when PC reaches the success trap (a JMP to itself)
+;; In Klaus' test, success is at the end — PC will loop on the same address
+
+(defn main [] :int
+  (do
+    ;; Allocate 64KB memory
+    (let mem (cast :ptr-u8 (malloc (cast :size 65536))))
+    (memset (cast :ptr-void mem) 0 (cast :size 65536))
+
+    ;; Load the binary
+    (let fp (fopen "apple2/6502_functional_test.bin" "rb"))
+    (when (null? fp)
+      (printf "Failed to open 6502_functional_test.bin\\n")
+      (return 1))
+    (let bytes-read (fread (cast :ptr-void mem) (cast :size 1) (cast :size 65536) fp))
+    (fclose fp)
+    (printf "Loaded %d bytes\\n" (cast :int bytes-read))
+
+    ;; Init CPU — reset vector is embedded in the binary at $FFFC
+    (let-mut cpu (CPU (cast :u8 0) (cast :u8 0) (cast :u8 0) (cast :u8 253)
+                      0 (cast :u8 36)))
+    ;; Klaus' test starts at $0400, not from the reset vector
+    (set! (get (deref (addr-of cpu)) pc) 1024)
+    (printf "Starting test at PC=$%04X\\n" (get cpu pc))
+
+    ;; Execute until PC loops (same address twice in a row)
+    (let-mut prev-pc -1)
+    (let-mut steps 0)
+    (let-mut stuck-count 0)
+    (let-mut done 0)
+
+    (while (== done 0)
+      (do
+        (let old-pc (get cpu pc))
+        ;; Debug trace first 20 steps
+        (when (< steps 20)
+          (printf "  step %d: PC=$%04X op=%d A=%d X=%d Y=%d SP=%d P=%d\\n"
+                  steps (get cpu pc)
+                  (mem-read mem (get cpu pc))
+                  (cast :int (get cpu a))
+                  (cast :int (get cpu x))
+                  (cast :int (get cpu y))
+                  (cast :int (get cpu sp))
+                  (cast :int (get cpu status))))
+        (cpu-step (addr-of cpu) mem)
+        (set! steps (+ steps 1))
+
+        ;; Check if PC is stuck (looping on same instruction)
+        (if (== (get cpu pc) old-pc)
+          (do
+            (set! stuck-count (+ stuck-count 1))
+            (when (> stuck-count 2)
+              (printf "PC stuck at $%04X after %d steps\\n" (get cpu pc) steps)
+              (set! done 1)))
+          (set! stuck-count 0))
+
+        ;; Progress report every 10M steps
+        (when (== (% steps 10000000) 0)
+          (printf "  ... %dM steps, PC=$%04X\\n" (/ steps 1000000) (get cpu pc)))
+
+        ;; Safety limit
+        (when (> steps 500000000)
+          (printf "Timeout after %d steps, PC=$%04X\\n" steps (get cpu pc))
+          (set! done 1))))
+
+    ;; The test succeeds if it reaches $3469 (the success trap in Klaus' test)
+    ;; Success trap is: JMP $3469 at address $3469
+    (if (== (get cpu pc) 13417)
+      (printf "PASSED! All 6502 tests passed (%d steps)\\n" steps)
+    else
+      (printf "FAILED at PC=$%04X after %d steps\\n" (get cpu pc) steps))
+
+    (free (cast :ptr-void mem))
+    0))

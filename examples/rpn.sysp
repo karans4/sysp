@@ -1,0 +1,60 @@
+;;; RPN calculator — exercises unions, pattern matching, structs, vectors, raw pointers
+
+;; Token types: number or operator
+(deftype Token (:union :int :char))
+
+;; Stack is a raw pointer + length (manual vector)
+(struct Stack [data :ptr-int, len :int, cap :int])
+
+(defn stack-new [] :Stack
+  (Stack (ptr-alloc :int 16) 0 16))
+
+(defn stack-push [s :Stack val :int] :Stack
+  ;; Return new stack with val pushed
+  ;; TODO: no realloc yet, just use fixed cap
+  (ptr-set! (get s data) (get s len) val)
+  (Stack (get s data) (+ (get s len) 1) (get s cap)))
+
+(defn stack-pop [s :Stack] :int
+  (ptr-deref (get s data) (- (get s len) 1)))
+
+(defn stack-drop [s :Stack] :Stack
+  (Stack (get s data) (- (get s len) 1) (get s cap)))
+
+(defn stack-free [s :Stack] :void
+  (ptr-free (get s data)))
+
+;; Evaluate an RPN expression given as array of tokens
+;; Operators: + - * / encoded as char
+(defn eval-op [a :int b :int op :char] :int
+  (if (== op 43) (+ a b)       ;; '+'
+      (== op 45) (- a b)       ;; '-'
+      (== op 42) (* a b)       ;; '*'
+      (== op 47) (/ a b)       ;; '/'
+      0))
+
+(defn main [] :int
+  ;; Compute: (3 + 4) * 2 = 14
+  ;; RPN: 3 4 + 2 *
+  (let-mut s (stack-new))
+  (set! s (stack-push s 3))
+  (set! s (stack-push s 4))
+  ;; pop two, add, push result
+  (let b1 (stack-pop s))
+  (set! s (stack-drop s))
+  (let a1 (stack-pop s))
+  (set! s (stack-drop s))
+  (set! s (stack-push s (+ a1 b1)))
+  ;; push 2
+  (set! s (stack-push s 2))
+  ;; pop two, multiply, push result
+  (let b2 (stack-pop s))
+  (set! s (stack-drop s))
+  (let a2 (stack-pop s))
+  (set! s (stack-drop s))
+  (set! s (stack-push s (* a2 b2)))
+  ;; result
+  (print "Result: ")
+  (println (stack-pop s))
+  (stack-free s)
+  0)

@@ -1,0 +1,17 @@
+;; io.sysp — C file I/O functions
+
+(include "stdio.h")
+
+(extern fopen [path :ptr-char mode :ptr-char] :ptr-void)
+(extern fclose [fp :ptr-void] :int)
+(extern fread [buf :ptr-void size :u64 count :u64 fp :ptr-void] :u64)
+(extern fwrite [buf :ptr-void size :u64 count :u64 fp :ptr-void] :u64)
+(extern fgets [buf :ptr-char size :int fp :ptr-void] :ptr-char)
+(extern fputs [s :ptr-char fp :ptr-void] :int)
+(extern fseek [fp :ptr-void offset :long whence :int] :int)
+(extern ftell [fp :ptr-void] :long)
+(extern fflush [fp :ptr-void] :int)
+(extern feof [fp :ptr-void] :int)
+(extern ferror [fp :ptr-void] :int)
+(extern remove [path :ptr-char] :int)
+(extern rename [old :ptr-char new :ptr-char] :int)

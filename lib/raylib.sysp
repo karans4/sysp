@@ -1,0 +1,35 @@
+;; raylib.sysp — raylib graphics library bindings
+
+(include "raylib.h")
+
+;; Foreign structs (register fields without emitting typedefs)
+(foreign-struct Color [r :u8, g :u8, b :u8, a :u8])
+(foreign-struct Vector2 [x :f32, y :f32])
+
+;; Window management
+(extern SetConfigFlags [flags :int] :void)
+(extern InitWindow [width :int, height :int, title :str] :void)
+(extern CloseWindow [] :void)
+(extern WindowShouldClose [] :int)
+(extern SetTargetFPS [fps :int] :void)
+
+;; Drawing
+(extern BeginDrawing [] :void)
+(extern EndDrawing [] :void)
+(extern ClearBackground [color :Color] :void)
+
+;; Shapes
+(extern DrawLine [x1 :int, y1 :int, x2 :int, y2 :int, color :Color] :void)
+(extern DrawLineEx [start :Vector2, end :Vector2, thick :f32, color :Color] :void)
+(extern DrawCircle [cx :int, cy :int, radius :f32, color :Color] :void)
+(extern DrawRing [center :Vector2, innerRadius :f32, outerRadius :f32, startAngle :f32, endAngle :f32, segments :int, color :Color] :void)
+(extern DrawRectangle [x :int, y :int, w :int, h :int, color :Color] :void)
+
+;; Text
+(extern DrawText [text :str, x :int, y :int, size :int, color :Color] :void)
+
+;; Input
+(extern GetMousePosition [] :Vector2)
+(extern IsMouseButtonPressed [button :int] :int)
+(extern GetKeyPressed [] :int)
+(extern IsKeyPressed [key :int] :int)

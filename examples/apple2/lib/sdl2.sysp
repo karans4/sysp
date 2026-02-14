@@ -1,0 +1,39 @@
+;; sdl2.sysp — SDL2 bindings for sysp
+
+(include "SDL2/SDL.h")
+
+;; Init/quit
+(extern SDL_Init [flags :u32] :int)
+(extern SDL_Quit [] :void)
+
+;; Window
+(extern SDL_CreateWindow [title :str, x :int, y :int, w :int, h :int, flags :u32] :ptr-void)
+(extern SDL_DestroyWindow [w :ptr-void] :void)
+
+;; Renderer
+(extern SDL_CreateRenderer [window :ptr-void, index :int, flags :u32] :ptr-void)
+(extern SDL_DestroyRenderer [r :ptr-void] :void)
+(extern SDL_RenderClear [r :ptr-void] :int)
+(extern SDL_RenderPresent [r :ptr-void] :void)
+(extern SDL_RenderCopy [r :ptr-void, tex :ptr-void, src :ptr-void, dst :ptr-void] :int)
+(extern SDL_SetRenderDrawColor [r :ptr-void, red :u8, g :u8, b :u8, a :u8] :int)
+
+;; Texture
+(extern SDL_CreateTexture [r :ptr-void, format :u32, access :int, w :int, h :int] :ptr-void)
+(extern SDL_DestroyTexture [tex :ptr-void] :void)
+(extern SDL_UpdateTexture [tex :ptr-void, rect :ptr-void, pixels :ptr-void, pitch :int] :int)
+
+;; Events/timing
+(extern SDL_PollEvent [event :ptr-void] :int)
+(extern SDL_Delay [ms :u32] :void)
+(extern SDL_GetTicks [] :u32)
+
+;; C stdlib
+(extern malloc [size :size] :ptr-void)
+(extern free [ptr :ptr-void] :void)
+(extern memset [ptr :ptr-void, val :int, len :size] :ptr-void)
+(extern memcpy [dst :ptr-void, src :ptr-void, len :size] :ptr-void)
+(extern printf [fmt :str] :int)
+(extern fopen [path :str, mode :str] :ptr-void)
+(extern fread [buf :ptr-void, size :size, count :size, fp :ptr-void] :size)
+(extern fclose [fp :ptr-void] :int)

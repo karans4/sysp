@@ -1,0 +1,8 @@
+;; mem.sysp — C memory allocation functions
+
+(include "stdlib.h")
+
+(extern malloc [size :u64] :ptr-void)
+(extern free [ptr :ptr-void] :void)
+(extern realloc [ptr :ptr-void size :u64] :ptr-void)
+(extern calloc [count :u64 size :u64] :ptr-void)

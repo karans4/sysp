@@ -1,0 +1,58 @@
+;;; Linked list using ARC — test recursive-ish structures
+
+;; Problem: Node needs a "next" field that points to another Node
+;; But we can't express (:rc (:struct "Node")) as a field type
+;; because the struct must be defined before the RC type
+;; and the field type annotation system doesn't support (:rc ...)
+;;
+;; LIMITATION: no recursive types / self-referential structs
+;; LIMITATION: no nullable pointers (Option type / nil for pointers)
+;;
+;; Let's try what we CAN do: a flat array-based "list"
+
+(struct IntArray [data :ptr-int, len :int, cap :int])
+
+(defn ia-new [cap :int] :IntArray
+  (IntArray (ptr-alloc :int cap) 0 cap))
+
+(defn ia-push [a :IntArray val :int] :IntArray
+  (ptr-set! (get a data) (get a len) val)
+  (IntArray (get a data) (+ (get a len) 1) (get a cap)))
+
+(defn ia-get [a :IntArray i :int] :int
+  (ptr-deref (get a data) i))
+
+(defn ia-free [a :IntArray] :void
+  (ptr-free (get a data)))
+
+;; Insertion sort on IntArray
+(defn ia-sort [a :IntArray] :void
+  (for [i 1 (get a len)]
+    (let key (ia-get a i))
+    (let-mut j (- i 1))
+    (while (and (>= j 0) (> (ia-get a j) key))
+      (ptr-set! (get a data) (+ j 1) (ia-get a j))
+      (set! j (- j 1)))
+    (ptr-set! (get a data) (+ j 1) key)))
+
+(defn ia-print [a :IntArray] :void
+  (for [i 0 (get a len)]
+    (if (> i 0) (print " "))
+    (print (ia-get a i)))
+  (println))
+
+(defn main [] :int
+  (let-mut arr (ia-new 10))
+  (set! arr (ia-push arr 5))
+  (set! arr (ia-push arr 3))
+  (set! arr (ia-push arr 8))
+  (set! arr (ia-push arr 1))
+  (set! arr (ia-push arr 9))
+  (set! arr (ia-push arr 2))
+  (print "before: ")
+  (ia-print arr)
+  (ia-sort arr)
+  (print "after:  ")
+  (ia-print arr)
+  (ia-free arr)
+  0)
