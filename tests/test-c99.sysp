@@ -1,0 +1,75 @@
+;; Test C99 features: do-while, switch, named struct init, pragma, defn attrs
+
+(struct Point [x :int, y :int])
+
+;; Test do-while loop
+(defn test-do-while [] :int
+  (let-mut sum 0)
+  (let-mut i 0)
+  (do-while
+    (set! sum (+ sum i))
+    (set! i (+ i 1))
+    (< i 5))
+  sum)
+
+;; Test switch statement
+(defn test-switch [] :int
+  (let-mut result 0)
+  (switch 2
+    (1 (set! result 10))
+    (2 (set! result 20))
+    (3 (set! result 30))
+    (default (set! result -1)))
+  result)
+
+;; Test switch default branch
+(defn test-switch-default [] :int
+  (let-mut result 0)
+  (switch 99
+    (1 (set! result 10))
+    (default (set! result -1)))
+  result)
+
+;; Test named struct initialization (designated initializers)
+(defn test-named-struct [] :int
+  (let p (Point :x 42 :y 17))
+  (+ (get p x) (get p y)))
+
+;; Test pragma (just verify it compiles — pragma is a no-op at runtime)
+(defn test-pragma [] :int
+  (let-mut sum 0)
+  (pragma "GCC diagnostic push")
+  (let-mut i 0)
+  (while (< i 10)
+    (set! sum (+ sum i))
+    (set! i (+ i 1)))
+  (pragma "GCC diagnostic pop")
+  sum)
+
+;; Test defn with C qualifier — use "static" which gcc understands
+(defn "static" helper-add [a :int, b :int] :int
+  (+ a b))
+
+(defn test-defn-attr [] :int
+  (helper-add 30 12))
+
+(defn sysp_main [] :int
+  (if (== (test-do-while) 10)
+    (println "PASS test-do-while")
+    (println "FAIL test-do-while"))
+  (if (== (test-switch) 20)
+    (println "PASS test-switch")
+    (println "FAIL test-switch"))
+  (if (== (test-switch-default) -1)
+    (println "PASS test-switch-default")
+    (println "FAIL test-switch-default"))
+  (if (== (test-named-struct) 59)
+    (println "PASS test-named-struct")
+    (println "FAIL test-named-struct"))
+  (if (== (test-pragma) 45)
+    (println "PASS test-pragma")
+    (println "FAIL test-pragma"))
+  (if (== (test-defn-attr) 42)
+    (println "PASS test-defn-attr")
+    (println "FAIL test-defn-attr"))
+  0)

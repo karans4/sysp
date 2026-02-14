@@ -3112,9 +3112,26 @@
                             ret-type))))))))
 
 (defun compile-struct-construct (name args env)
-  (let ((compiled-args (mapcar (lambda (a) (first (multiple-value-list (compile-expr a env)))) args)))
-    (values (format nil "(~a){~{~a~^, ~}}" name compiled-args)
-            (make-struct-type name))))
+  "Compile struct construction — positional or named (designated initializer).
+   Positional: (Point 10 20) → (Point){10, 20}
+   Named: (Point :x 10 :y 20) → (Point){.x = 10, .y = 20}"
+  (if (and args (keywordp (first args)))
+      ;; Named initialization: (:field val :field val ...)
+      (let ((inits nil)
+            (remaining args))
+        (loop while remaining do
+          (let* ((field-kw (pop remaining))
+                 (field-name (string-downcase (symbol-name field-kw)))
+                 (val-form (pop remaining)))
+            (multiple-value-bind (code tp) (compile-expr val-form env)
+              (declare (ignore tp))
+              (push (format nil ".~a = ~a" (sanitize-name field-name) code) inits))))
+        (values (format nil "(~a){~{~a~^, ~}}" name (nreverse inits))
+                (make-struct-type name)))
+      ;; Positional initialization
+      (let ((compiled-args (mapcar (lambda (a) (first (multiple-value-list (compile-expr a env)))) args)))
+        (values (format nil "(~a){~{~a~^, ~}}" name compiled-args)
+                (make-struct-type name)))))
 
 ;;; === Statement Compilation ===
 
@@ -3180,6 +3197,14 @@
      (compile-ptr-set-stmt form env))
     ((and (listp form) (sym= (first form) "c-stmt"))
      (compile-c-stmt form env))
+    ((and (listp form) (sym= (first form) "do-while"))
+     (compile-do-while-stmt form env))
+    ((and (listp form) (sym= (first form) "switch"))
+     (compile-switch-stmt form env))
+    ((and (listp form) (sym= (first form) "pragma"))
+     (list (format nil "#pragma ~a" (second form))))
+    ((and (listp form) (sym= (first form) "kernel-launch"))
+     (compile-kernel-launch-stmt form env))
     (t (let ((*pending-stmts* nil))
          (multiple-value-bind (code tp) (compile-expr form env)
            (declare (ignore tp))
@@ -3428,6 +3453,59 @@
               (push (format nil "  ~a" r) result)))
           (push "  }" result)
           (nreverse result))))))
+
+(defun compile-do-while-stmt (form env)
+  "(do-while body... condition) — body always executes at least once."
+  (let* ((all-forms (rest form))
+         (body-forms (butlast all-forms))
+         (cond-form (car (last all-forms)))
+         (body-env (make-env :parent env))
+         (result (list "  do {")))
+    (dolist (s (compile-body body-forms body-env))
+      (push (format nil "  ~a" s) result))
+    (multiple-value-bind (cond-code ct) (compile-expr cond-form body-env)
+      (declare (ignore ct))
+      (push (format nil "  } while (~a);" cond-code) result))
+    (nreverse result)))
+
+(defun compile-switch-stmt (form env)
+  "(switch expr (val body...) ... (default body...)) — C switch statement."
+  (multiple-value-bind (expr-code et) (compile-expr (second form) env)
+    (declare (ignore et))
+    (let ((clauses (cddr form))
+          (result (list (format nil "  switch (~a) {" expr-code))))
+      (dolist (clause clauses)
+        (let* ((head (first clause))
+               (body-forms (rest clause))
+               (is-default (and (symbolp head) (sym= head "default"))))
+          (if is-default
+              (push "    default: {" result)
+              (let ((case-code (first (multiple-value-list (compile-expr head env)))))
+                (push (format nil "    case ~a: {" case-code) result)))
+          (dolist (s (compile-body body-forms env))
+            (push (format nil "    ~a" s) result))
+          (push "      break;" result)
+          (push "    }" result)))
+      (push "  }" result)
+      (nreverse result))))
+
+(defun compile-kernel-launch-stmt (form env)
+  "(kernel-launch name (grid block) args...) — emits name<<<grid,block>>>(args)"
+  (let* ((name (sanitize-name (string (second form))))
+         (config (third form))
+         (args (cdddr form)))
+    (multiple-value-bind (grid-code gt) (compile-expr (first config) env)
+      (declare (ignore gt))
+      (multiple-value-bind (block-code bt) (compile-expr (second config) env)
+        (declare (ignore bt))
+        (let ((arg-codes nil))
+          (dolist (a args)
+            (multiple-value-bind (ac at) (compile-expr a env)
+              (declare (ignore at))
+              (push ac arg-codes)))
+          (setf arg-codes (nreverse arg-codes))
+          (list (format nil "  ~a<<<~a, ~a>>>(~{~a~^, ~});"
+                        name grid-code block-code arg-codes)))))))
 
 (defun compile-set-stmt (form env)
   "(set! target val)"
@@ -3926,7 +4004,14 @@
     mangled))
 
 (defun compile-defn (form)
-  "(defn name [params] :ret-type body...) - supports variadic [& rest]"
+  "(defn name [params] :ret-type body...) or
+   (defn \"qualifier\" name [params] :ret-type body...) — with C function qualifier.
+   Supports variadic [& rest]."
+  ;; Extract optional C qualifier (e.g. \"__global__\", \"static inline\")
+  (let* ((has-attr (stringp (second form)))
+         (c-attr (when has-attr (second form)))
+         ;; Shift form if attribute present so rest of function sees normal structure
+         (form (if has-attr (cons (first form) (cddr form)) form)))
   ;; Check for polymorphic function — store template, don't compile
   (when (defn-is-poly-p form)
     (let* ((name (string (second form)))
@@ -4071,20 +4156,22 @@
                                   (or stmts nil)))
                 ;; Look up any comments for this function
                 (fn-comments (cdr (assoc name *function-comments* :test #'string-equal))))
-            (push (format nil "~@[~{~a~%~}~]~a ~a(~a) {~%~{~a~%~}~@[~a~]}~%"
+            (push (format nil "~@[~{~a~%~}~]~@[~a ~]~a ~a(~a) {~%~{~a~%~}~@[~a~]}~%"
                           fn-comments
+                          c-attr
                           (type-to-c ret-type)
                           c-name
                           (if (string= param-str "") "void" param-str)
                           body-stmts
                           return-stmt)
                   *functions*))
-          ;; Forward declaration (skip for main)
-          (unless (string= c-name "main")
+          ;; Forward declaration (skip for main, or for attributed functions — CUDA kernels etc.)
+          (unless (or (string= c-name "main") c-attr)
             (push (format nil "~a ~a(~a);"
                           (type-to-c ret-type) c-name
                           (if (string= param-str "") "void" param-str))
-                  *forward-decls*)))))))
+                  *forward-decls*))))))))
+
 
 (defun compile-extern (form)
   "(extern name [params] :ret-type) — declare external C function"
