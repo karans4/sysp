@@ -1,0 +1,45 @@
+;; cuda.sysp — CUDA runtime bindings
+
+(include "cuda_runtime.h")
+
+;; Device management
+(extern cudaSetDevice [device :int] :int)
+(extern cudaGetDeviceCount [count :ptr-int] :int)
+(extern cudaDeviceSynchronize [] :int)
+(extern cudaDeviceReset [] :int)
+
+;; Memory
+(extern cudaMalloc [devPtr :ptr-void size :u64] :int)
+(extern cudaFree [devPtr :ptr-void] :int)
+(extern cudaMemcpy [dst :ptr-void src :ptr-void count :u64 kind :int] :int)
+(extern cudaMemset [devPtr :ptr-void value :int count :u64] :int)
+
+;; cudaMemcpyKind constants
+(let cudaMemcpyHostToHost :int 0)
+(let cudaMemcpyHostToDevice :int 1)
+(let cudaMemcpyDeviceToHost :int 2)
+(let cudaMemcpyDeviceToDevice :int 3)
+
+;; Error handling
+(extern cudaGetLastError [] :int)
+(extern cudaGetErrorString [error :int] :ptr-char)
+
+;; Thread builtins — dim3 structs available in __global__ functions
+(foreign-struct dim3 [x :uint, y :uint, z :uint])
+(extern-var threadIdx :dim3)
+(extern-var blockIdx :dim3)
+(extern-var blockDim :dim3)
+(extern-var gridDim :dim3)
+
+;; Synchronization
+(extern __syncthreads [] :void)
+(extern __threadfence [] :void)
+(extern __threadfence_block [] :void)
+
+;; Atomics
+(extern atomicAdd [addr :ptr-int val :int] :int)
+(extern atomicSub [addr :ptr-int val :int] :int)
+(extern atomicMax [addr :ptr-int val :int] :int)
+(extern atomicMin [addr :ptr-int val :int] :int)
+(extern atomicExch [addr :ptr-int val :int] :int)
+(extern atomicCAS [addr :ptr-int compare :int val :int] :int)

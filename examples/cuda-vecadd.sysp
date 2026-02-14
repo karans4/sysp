@@ -1,0 +1,66 @@
+;;; cuda-vecadd.sysp — Vector addition on GPU
+;;; Compile: sbcl --script sysp.lisp examples/cuda-vecadd.sysp examples/cuda-vecadd.cu
+;;;          nvcc -o vecadd examples/cuda-vecadd.cu
+
+(use cuda)
+(use fmt)
+(use mem)
+
+(let N :int 1048576)  ;; 1M elements
+(let BLOCK_SIZE :int 256)
+
+;; GPU kernel — __global__ qualifier via string attribute
+(defn "__global__" vec_add [a :ptr-float b :ptr-float c :ptr-float n :int] :void
+  (let i (+ (* (get blockIdx x) (get blockDim x)) (get threadIdx x)))
+  (when (< i n)
+    (ptr-set! c i (+ (ptr-deref a i) (ptr-deref b i)))))
+
+(defn main [] :int
+  ;; Host arrays
+  (let h_a (cast :ptr-float (malloc (cast :u64 (* N 4)))))
+  (let h_b (cast :ptr-float (malloc (cast :u64 (* N 4)))))
+  (let h_c (cast :ptr-float (malloc (cast :u64 (* N 4)))))
+
+  ;; Init: a[i] = i, b[i] = 2*i
+  (for [i 0 N]
+    (ptr-set! h_a i (cast :float i))
+    (ptr-set! h_b i (cast :float (* i 2))))
+
+  ;; Device arrays
+  (let-mut d_a :ptr-void (cast :ptr-void 0))
+  (let-mut d_b :ptr-void (cast :ptr-void 0))
+  (let-mut d_c :ptr-void (cast :ptr-void 0))
+  (let bytes (cast :u64 (* N 4)))
+
+  (cudaMalloc (cast :ptr-void (addr-of d_a)) bytes)
+  (cudaMalloc (cast :ptr-void (addr-of d_b)) bytes)
+  (cudaMalloc (cast :ptr-void (addr-of d_c)) bytes)
+
+  ;; Copy host → device
+  (cudaMemcpy d_a (cast :ptr-void h_a) bytes cudaMemcpyHostToDevice)
+  (cudaMemcpy d_b (cast :ptr-void h_b) bytes cudaMemcpyHostToDevice)
+
+  ;; Launch kernel — c-tmpl interpolates sysp expressions into C scaffold
+  (let grid (/ (+ N (- BLOCK_SIZE 1)) BLOCK_SIZE))
+  (c-tmpl "vec_add<<<~, ~>>>(~, ~, ~, ~);"
+          grid BLOCK_SIZE
+          (cast :ptr-float d_a) (cast :ptr-float d_b) (cast :ptr-float d_c) N)
+  (cudaDeviceSynchronize)
+
+  ;; Copy device → host
+  (cudaMemcpy (cast :ptr-void h_c) d_c bytes cudaMemcpyDeviceToHost)
+
+  ;; Verify first 5 elements: c[i] = a[i] + b[i] = i + 2i = 3i
+  (for [i 0 5]
+    (printf "c[%d] = %f (expected %f)\\n" i
+            (cast :double (ptr-deref h_c i))
+            (cast :double (cast :float (* i 3)))))
+
+  ;; Cleanup
+  (cudaFree d_a)
+  (cudaFree d_b)
+  (cudaFree d_c)
+  (free (cast :ptr-void h_a))
+  (free (cast :ptr-void h_b))
+  (free (cast :ptr-void h_c))
+  0)

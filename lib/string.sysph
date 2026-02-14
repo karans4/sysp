@@ -1,0 +1,16 @@
+;; string.sysph — auto-generated header
+;; Source: string.sysp
+
+(include "string.h")
+(extern strlen [s :ptr-char] :u64)
+(extern strcmp [a :ptr-char , b :ptr-char] :int)
+(extern strncmp [a :ptr-char , b :ptr-char , n :u64] :int)
+(extern strncpy [dst :ptr-char , src :ptr-char , n :u64] :ptr-char)
+(extern strcat [dst :ptr-char , src :ptr-char] :ptr-char)
+(extern strncat [dst :ptr-char , src :ptr-char , n :u64] :ptr-char)
+(extern strstr [haystack :ptr-char , needle :ptr-char] :ptr-char)
+(extern strchr [s :ptr-char , c :int] :ptr-char)
+(extern strrchr [s :ptr-char , c :int] :ptr-char)
+(extern memcpy [dst :ptr-void , src :ptr-void , n :u64] :ptr-void)
+(extern memset [s :ptr-void , c :int , n :u64] :ptr-void)
+(extern memmove [dst :ptr-void , src :ptr-void , n :u64] :ptr-void)

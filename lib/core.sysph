@@ -1,0 +1,15 @@
+;; core.sysph — auto-generated header
+;; Source: core.sysp
+
+(defn identity [x :?] :? x)
+(extern zero? [x :int] :bool)
+(extern pos? [x :int] :bool)
+(extern neg? [x :int] :bool)
+(extern even? [x :int] :bool)
+(extern odd? [x :int] :bool)
+(extern inc [x :int] :int)
+(extern dec [x :int] :int)
+(extern abs [x :int] :int)
+(defn min [a :? , b :?] :? (if (< a b) a b))
+(defn max [a :? , b :?] :? (if (> a b) a b))
+(defn clamp [x :? , lo :? , hi :?] :? (if (< x lo) lo (if (> x hi) hi x)))

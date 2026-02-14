@@ -1,0 +1,22 @@
+;; raylib.sysph — auto-generated header
+;; Source: raylib.sysp
+
+(include "raylib.h")
+(extern SetConfigFlags [flags :int] :void)
+(extern InitWindow [width :int , height :int , title :str] :void)
+(extern CloseWindow [] :void)
+(extern WindowShouldClose [] :int)
+(extern SetTargetFPS [fps :int] :void)
+(extern BeginDrawing [] :void)
+(extern EndDrawing [] :void)
+(extern ClearBackground [color :color] :void)
+(extern DrawLine [x1 :int , y1 :int , x2 :int , y2 :int , color :color] :void)
+(extern DrawLineEx [start :vector2 , end :vector2 , thick :f32 , color :color] :void)
+(extern DrawCircle [cx :int , cy :int , radius :f32 , color :color] :void)
+(extern DrawRing [center :vector2 , innerRadius :f32 , outerRadius :f32 , startAngle :f32 , endAngle :f32 , segments :int , color :color] :void)
+(extern DrawRectangle [x :int , y :int , w :int , h :int , color :color] :void)
+(extern DrawText [text :str , x :int , y :int , size :int , color :color] :void)
+(extern GetMousePosition [] :vector2)
+(extern IsMouseButtonPressed [button :int] :int)
+(extern GetKeyPressed [] :int)
+(extern IsKeyPressed [key :int] :int)

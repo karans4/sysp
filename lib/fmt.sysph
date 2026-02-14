@@ -1,0 +1,9 @@
+;; fmt.sysph — auto-generated header
+;; Source: fmt.sysp
+
+(include "stdio.h")
+(extern printf [fmt :ptr-char] :int)
+(extern sprintf [buf :ptr-char , fmt :ptr-char] :int)
+(extern snprintf [buf :ptr-char , size :u64 , fmt :ptr-char] :int)
+(extern fprintf [fp :ptr-void , fmt :ptr-char] :int)
+(extern puts [s :ptr-char] :int)

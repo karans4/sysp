@@ -1,0 +1,107 @@
+;;; cuda-matmul.sysp — Tiled matrix multiply with compile-time tile size
+;;; The whole point: macros generate the unrolled inner loop at compile time.
+;;; Change TILE and recompile — zero runtime cost, no templates, no constexpr.
+;;;
+;;; Compile: sbcl --script sysp.lisp examples/cuda-matmul.sysp examples/cuda-matmul.cu
+;;;          nvcc -O2 -o matmul examples/cuda-matmul.cu
+
+(use cuda)
+(use fmt)
+(use mem)
+
+(let N :int 1024)
+(let TILE :int 16)
+
+;; Compile-time unrolled loop: (unroll-for k 0 16 body...) expands to 16 copies
+;; of body with k bound to 0, 1, 2, ... 15.
+;; This is the Lisp advantage — the macro IS the metaprogram.
+(defn-ct unroll-build [i limit var body]
+  (if (== i limit)
+    '(do)
+  else
+    `(do
+       (let ~var :int ~i)
+       ~body
+       ~(unroll-build (+ i 1) limit var body))))
+
+(defmacro unroll-for [bindings body]
+  (let var (car bindings))
+  (let start (car (cdr bindings)))
+  (let end (car (cdr (cdr bindings))))
+  (unroll-build start end var body))
+
+;; Tiled matmul kernel — shared memory tiles, unrolled inner loop
+(defn "__global__" matmul [A :ptr-float B :ptr-float C :ptr-float n :int] :void
+  (let-array "__shared__" As :float TILE TILE)
+  (let-array "__shared__" Bs :float TILE TILE)
+  (let row (+ (* (get blockIdx y) TILE) (get threadIdx y)))
+  (let col (+ (* (get blockIdx x) TILE) (get threadIdx x)))
+  (let ty (get threadIdx y))
+  (let tx (get threadIdx x))
+  (let-mut sum :float 0.0)
+
+  (for [t 0 (/ n TILE)]
+    ;; Load tile into shared memory — pure sysp, no c-tmpl needed
+    (array-set! As ty tx (array-ref A (+ (* row n) (+ (* t TILE) tx))))
+    (array-set! Bs ty tx (array-ref B (+ (* (+ (* t TILE) ty) n) col)))
+    (__syncthreads)
+
+    ;; Unrolled dot product — 16 iterations, zero loop overhead
+    (unroll-for [k 0 16]
+      (set! sum (+ sum (* (array-ref As ty k) (array-ref Bs k tx)))))
+
+    (__syncthreads))
+
+  ;; Write result
+  (when (and (< row n) (< col n))
+    (ptr-set! C (+ (* row n) col) sum)))
+
+(defn main [] :int
+  (let size (cast :u64 (* (* N N) 4)))
+
+  ;; Host
+  (let h_A (cast :ptr-float (malloc size)))
+  (let h_B (cast :ptr-float (malloc size)))
+  (let h_C (cast :ptr-float (malloc size)))
+
+  ;; Init: A = identity-ish, B = sequential
+  (for [i 0 N]
+    (for [j 0 N]
+      (let idx (+ (* i N) j))
+      (ptr-set! h_A idx (if (== i j) 1.0 0.0))
+      (ptr-set! h_B idx (cast :float (+ (* i N) j)))))
+
+  ;; Device
+  (let-mut d_A :ptr-void (cast :ptr-void 0))
+  (let-mut d_B :ptr-void (cast :ptr-void 0))
+  (let-mut d_C :ptr-void (cast :ptr-void 0))
+  (cudaMalloc (cast :ptr-void (addr-of d_A)) size)
+  (cudaMalloc (cast :ptr-void (addr-of d_B)) size)
+  (cudaMalloc (cast :ptr-void (addr-of d_C)) size)
+
+  (cudaMemcpy d_A (cast :ptr-void h_A) size cudaMemcpyHostToDevice)
+  (cudaMemcpy d_B (cast :ptr-void h_B) size cudaMemcpyHostToDevice)
+
+  ;; Launch: (N/TILE) x (N/TILE) grid, TILE x TILE blocks
+  (c-tmpl "dim3 grid(~/~, ~/~);" N TILE N TILE)
+  (c-tmpl "dim3 block(~, ~);" TILE TILE)
+  (c-tmpl "matmul<<<grid, block>>>(~, ~, ~, ~);"
+          (cast :ptr-float d_A) (cast :ptr-float d_B) (cast :ptr-float d_C) N)
+  (cudaDeviceSynchronize)
+
+  (cudaMemcpy (cast :ptr-void h_C) d_C size cudaMemcpyDeviceToHost)
+
+  ;; Verify: A=identity, so C should equal B
+  (printf "C[0][0] = %f (expected 0.0)\\n" (cast :double (ptr-deref h_C 0)))
+  (printf "C[0][1] = %f (expected 1.0)\\n" (cast :double (ptr-deref h_C 1)))
+  (printf "C[1][0] = %f (expected %d.0)\\n"
+          (cast :double (ptr-deref h_C N))
+          N)
+
+  (cudaFree d_A)
+  (cudaFree d_B)
+  (cudaFree d_C)
+  (free (cast :ptr-void h_A))
+  (free (cast :ptr-void h_B))
+  (free (cast :ptr-void h_C))
+  0)

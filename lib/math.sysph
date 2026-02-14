@@ -1,0 +1,11 @@
+;; math.sysph — auto-generated header
+;; Source: math.sysp
+
+(extern sqrt [x :double] :double)
+(extern sin [x :double] :double)
+(extern cos [x :double] :double)
+(extern pow [x :double , y :double] :double)
+(extern log [x :double] :double)
+(extern fabs [x :double] :double)
+(extern floor [x :double] :double)
+(extern ceil [x :double] :double)

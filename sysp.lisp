@@ -579,6 +579,15 @@
              (dolist (f (cdr clause))
                (infer-stmt f)))))
 
+        ;; let-array: register name as pointer type
+        ((sym= head "let-array")
+         (let* ((rest (cdr form))
+                (_ (when (stringp (first rest)) (setf rest (cdr rest))))
+                (name (string (first rest)))
+                (type-ann (parse-type-annotation (second rest))))
+           (declare (ignore _))
+           (infer-env-bind name (make-ptr-type type-ann))))
+
         ;; set!: unify target with value
         ((sym= head "set!")
          (let* ((target (second form))
@@ -714,7 +723,12 @@
                    (push (car result) param-types)
                    (setf lst (cdr result))))))
            (setf param-types (nreverse param-types))
-           (infer-env-bind name (make-fn-type param-types ret-type))))))))
+           (infer-env-bind name (make-fn-type param-types ret-type))))
+        ((sym= (first form) "extern-var")
+         ;; Register extern variable type
+         (let* ((name (string (second form)))
+                (tp (parse-type-annotation (third form))))
+           (infer-env-bind name tp)))))))
 
 ;;; === Environment ===
 
@@ -1256,8 +1270,8 @@
               ;; defmacro / defn-ct — verbatim (compile-time)
               ((or (sym= head "defmacro") (sym= head "defn-ct"))
                (format out "~a~%" (serialize-form form)))
-              ;; extern — verbatim
-              ((sym= head "extern")
+              ;; extern / extern-var — verbatim
+              ((or (sym= head "extern") (sym= head "extern-var"))
                (format out "~a~%" (serialize-form form)))
               ;; defn — check if private (starts with _), poly, or normal
               ((sym= head "defn")
@@ -1873,6 +1887,7 @@
     ("signal" . compile-signal)
     ("invoke-restart" . compile-invoke-restart)
     ("c-expr" . compile-c-expr)
+    ("c-tmpl" . compile-c-tmpl-expr)
     ("ptr+" . compile-ptr-add)
     ("ptr-to" . compile-ptr-to)))
 
@@ -2126,7 +2141,8 @@
 
 (defun compile-ptr-set-stmt (form env)
   "(ptr-set! p val) → *p = val; or (ptr-set! p i val) → p[i] = val;"
-  (let ((args (rest form)))
+  (let ((*pending-stmts* nil)
+        (args (rest form)))
     (if (= (length args) 3)
         ;; (ptr-set! p i val)
         (multiple-value-bind (p-code pt) (compile-expr (first args) env)
@@ -2135,13 +2151,15 @@
             (declare (ignore it))
             (multiple-value-bind (v-code vt) (compile-expr (third args) env)
               (declare (ignore vt))
-              (list (format nil "  ~a[~a] = ~a;" p-code i-code v-code)))))
+              (append *pending-stmts*
+                      (list (format nil "  ~a[~a] = ~a;" p-code i-code v-code))))))
         ;; (ptr-set! p val)
         (multiple-value-bind (p-code pt) (compile-expr (first args) env)
           (declare (ignore pt))
           (multiple-value-bind (v-code vt) (compile-expr (second args) env)
             (declare (ignore vt))
-            (list (format nil "  *~a = ~a;" p-code v-code)))))))
+            (append *pending-stmts*
+                    (list (format nil "  *~a = ~a;" p-code v-code))))))))
 
 (defun compile-ptr-add (form env)
   "(ptr+ ptr offset) — pointer arithmetic, returns same pointer type."
@@ -2397,22 +2415,36 @@
                           :int)))
       (values (format nil "~a._~d" tup idx) elem-type))))
 
-(define-accessor array-ref "~a[~a]"
-  (if (eq (type-kind tp) :array)
-      (second tp)
-      :int))
+(defun compile-array-ref (form env)
+  "(array-ref arr idx...) — multi-index: arr[i], arr[i][j], arr[i][j][k]"
+  (multiple-value-bind (arr tp) (compile-expr (second form) env)
+    (let* ((indices (cddr form))
+           (compiled-indices (mapcar (lambda (idx)
+                                      (multiple-value-bind (code it) (compile-expr idx env)
+                                        (declare (ignore it))
+                                        code))
+                                    indices))
+           (indexing (format nil "~{[~a]~}" compiled-indices))
+           (elem-type (if (eq (type-kind tp) :array) (second tp) :int)))
+      (values (format nil "~a~a" arr indexing) elem-type))))
 
 (defun compile-array-set (form env)
-  "(array-set! arr idx val)"
+  "(array-set! arr idx... val) — multi-index: arr[i] = v, arr[i][j] = v"
   (multiple-value-bind (arr at) (compile-expr (second form) env)
-    (multiple-value-bind (idx it) (compile-expr (third form) env)
-      (declare (ignore it))
-      (multiple-value-bind (val vt) (compile-expr (fourth form) env)
+    (let* ((rest-args (cddr form))
+           ;; Last arg is the value, everything before is indices
+           (indices (butlast rest-args))
+           (val-form (car (last rest-args)))
+           (compiled-indices (mapcar (lambda (idx)
+                                      (multiple-value-bind (code it) (compile-expr idx env)
+                                        (declare (ignore it))
+                                        code))
+                                    indices))
+           (indexing (format nil "~{[~a]~}" compiled-indices)))
+      (multiple-value-bind (val vt) (compile-expr val-form env)
         (declare (ignore vt))
-        (let ((elem-type (if (eq (type-kind at) :array)
-                             (second at)
-                             :int)))
-          (values (format nil "(~a[~a] = ~a)" arr idx val) elem-type))))))
+        (let ((elem-type (if (eq (type-kind at) :array) (second at) :int)))
+          (values (format nil "(~a~a = ~a)" arr indexing val) elem-type))))))
 
 (defun compile-make-array (form env)
   "(make-array :type size) — stack-allocated zero-init array"
@@ -3330,6 +3362,8 @@
      (compile-let-stmt form env))
     ((and (listp form) (sym= (first form) "let-mut"))
      (compile-let-stmt form env))  ; same as let for now, mut is future annotation
+    ((and (listp form) (sym= (first form) "let-array"))
+     (compile-let-array-stmt form env))
     ((and (listp form) (sym= (first form) "print"))
      (compile-print-stmt form env))
     ((and (listp form) (sym= (first form) "println"))
@@ -3372,6 +3406,8 @@
      (compile-ptr-set-stmt form env))
     ((and (listp form) (sym= (first form) "c-stmt"))
      (compile-c-stmt form env))
+    ((and (listp form) (sym= (first form) "c-tmpl"))
+     (compile-c-tmpl-stmt form env))
     ((and (listp form) (sym= (first form) "do-while"))
      (compile-do-while-stmt form env))
     ((and (listp form) (sym= (first form) "switch"))
@@ -4362,6 +4398,12 @@
     (env-bind *global-env* name fn-type)
     (setf (gethash name *direct-fns*) t)))
 
+(defun compile-extern-var (form)
+  "(extern-var name :type) — declare external C variable (no codegen, just type registration)"
+  (let* ((name (string (second form)))
+         (tp (parse-type-annotation (third form))))
+    (env-bind *global-env* name tp)))
+
 (defun compile-include (form)
   "(include \"header.h\")"
   (let ((header (second form)))
@@ -4386,6 +4428,75 @@
   (let ((code (second form))
         (tp (parse-type-annotation (third form))))
     (values code tp)))
+
+(defun c-tmpl-interpolate (template compiled-args)
+  "Replace each ~ in TEMPLATE with the next element of COMPILED-ARGS.
+   Returns the interpolated C string."
+  (let ((result (make-array 0 :element-type 'character :adjustable t :fill-pointer 0))
+        (arg-idx 0))
+    (loop for i from 0 below (length template)
+          for c = (char template i)
+          do (if (char= c #\~)
+                 (progn
+                   (when (>= arg-idx (length compiled-args))
+                     (error "c-tmpl: more ~ placeholders than arguments"))
+                   (loop for ch across (nth arg-idx compiled-args)
+                         do (vector-push-extend ch result))
+                   (incf arg-idx))
+                 (vector-push-extend c result)))
+    (coerce result 'string)))
+
+(defun compile-c-tmpl-stmt (form env)
+  "(c-tmpl \"pattern with ~ holes\" expr1 expr2 ...) — C statement with sysp interpolation."
+  (let* ((template (second form))
+         (args (cddr form))
+         (compiled (mapcar (lambda (a)
+                            (multiple-value-bind (code tp) (compile-expr a env)
+                              (declare (ignore tp))
+                              code))
+                          args))
+         (code (c-tmpl-interpolate template compiled)))
+    (list (format nil "  ~a" code))))
+
+(defun compile-c-tmpl-expr (form env)
+  "(c-tmpl \"pattern\" :type expr1 expr2 ...) — C expression with sysp interpolation and type."
+  (let* ((template (second form))
+         (rest (cddr form))
+         (tp (if (keywordp (first rest))
+                 (prog1 (parse-type-annotation (first rest))
+                   (setf rest (cdr rest)))
+                 :int))
+         (compiled (mapcar (lambda (a)
+                            (multiple-value-bind (code atp) (compile-expr a env)
+                              (declare (ignore atp))
+                              code))
+                          rest))
+         (code (c-tmpl-interpolate template compiled)))
+    (values code tp)))
+
+(defun compile-let-array-stmt (form env)
+  "(let-array name :type dim...) or (let-array \"qualifier\" name :type dim...)
+   Declares a local C array, registers name in env as :ptr-type.
+   Examples:
+     (let-array tiles :float 16 16) → float tiles[16][16];
+     (let-array \"__shared__\" As :float 16 16) → __shared__ float As[16][16];"
+  (let* ((rest (cdr form))
+         ;; Optional string qualifier
+         (qualifier (when (stringp (first rest))
+                      (prog1 (first rest)
+                        (setf rest (cdr rest)))))
+         (name (string (first rest)))
+         (type-ann (parse-type-annotation (second rest)))
+         (dims (cddr rest))
+         (c-type (type-to-c type-ann))
+         (c-name (sanitize-name name))
+         (dim-str (format nil "~{[~a]~}" dims)))
+    ;; Register in env as pointer to element type (for array-ref/set!)
+    (env-bind env name (make-ptr-type type-ann))
+    (list (format nil "  ~a~a ~a~a~a;"
+                  (if qualifier (format nil "~a " qualifier) "")
+                  c-type c-name dim-str
+                  (if qualifier "" " = {0}")))))
 
 (defun compile-enum (form)
   "(enum Name [Variant1] [Variant2] ...) or (enum Name [Variant1 0] [Variant2 1] ...)"
@@ -4723,6 +4834,7 @@
                    ((sym= (first expanded) "enum") (compile-enum expanded))
                    ((sym= (first expanded) "defn") (compile-defn expanded))
                    ((sym= (first expanded) "extern") (compile-extern expanded))
+                   ((sym= (first expanded) "extern-var") (compile-extern-var expanded))
                    ((sym= (first expanded) "include") (compile-include expanded))
                    ((sym= (first expanded) "c-decl") (compile-c-decl expanded))
                    ((sym= (first expanded) "let") (compile-toplevel-let expanded nil))
