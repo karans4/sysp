@@ -29,6 +29,12 @@
 (defun rc-type-p (tp) (and (consp tp) (eq (car tp) :rc)))
 (defun rc-inner-type (tp) (second tp))
 
+;; Future types: (:future T spawn-id) — typed future from spawn
+(defun make-future-type (inner spawn-id) `(:future ,inner ,spawn-id))
+(defun future-type-p (tp) (and (consp tp) (eq (car tp) :future)))
+(defun future-inner-type (tp) (second tp))
+(defun future-spawn-id (tp) (third tp))
+
 ;; Union types: (:union :int :str) — sorted, deduped, flattened
 (defun make-union-type (variants)
   "Create a normalized union type from a list of variant types.
@@ -797,6 +803,12 @@
 (defvar *direct-fns* (make-hash-table :test 'equal))  ; names of defn/extern functions (direct call, not Fn)
 (defvar *env-counter* 0)  ; counter for closure env structs
 (defvar *interp-gensym-counter* 0)
+(defvar *spawn-counter* 0)    ; counter for spawn sites
+(defvar *uses-threads* nil)   ; emit #include <pthread.h> if true
+(defvar *restart-counter* 0)  ; counter for restart-case sites
+(defvar *handler-counter* 0)  ; counter for handler-bind sites
+(defvar *handler-wrap-counter* 0) ; counter for handler wrapper functions
+(defvar *uses-conditions* nil) ; emit condition system preamble if true
 
 (defun intern-symbol (name)
   "Get or assign an integer ID for a named symbol"
@@ -1289,6 +1301,7 @@
     (:variadic "Value")  ; variadic rest compiles to Value at runtime
     (:union (union-type-c-name tp))
     (:rc (format nil "_RC_~a*" (type-to-c (rc-inner-type tp))))
+    (:future (format nil "_spawn_~a*" (third tp)))  ; (:future T spawn-id) → _spawn_N*
     (otherwise "int")))
 
 (defun mangle-type-name (tp)
@@ -1334,6 +1347,8 @@
     (:union (format nil "Union_~{~a~^_~}" (mapcar #'mangle-type-name (cdr tp))))
     ;; RC-managed types
     (:rc (format nil "rc_~a" (mangle-type-name (rc-inner-type tp))))
+    ;; Future types
+    (:future (format nil "future_~a" (mangle-type-name (second tp))))
     (otherwise (warn "mangle-type-name: unhandled type ~a" tp) "unknown")))
 
 (defun vector-type-c-name (tp)
@@ -1675,7 +1690,13 @@
     ("new" . compile-new-expr)
     ("ptr-alloc" . compile-ptr-alloc)
     ("ptr-deref" . compile-ptr-deref)
-    ("null?" . compile-null-check)))
+    ("null?" . compile-null-check)
+    ("spawn" . compile-spawn)
+    ("await" . compile-await)
+    ("restart-case" . compile-restart-case)
+    ("handler-bind" . compile-handler-bind)
+    ("signal" . compile-signal)
+    ("invoke-restart" . compile-invoke-restart)))
 
 (defun compile-list (form env)
   (let* ((head (first form))
@@ -2340,6 +2361,336 @@
       (when env-decl-stmt
         (push env-decl-stmt *pending-stmts*))
       (values result-code result-type))))
+
+(defun compile-spawn (form env)
+  "(spawn expr) — run expr in a new thread, return Future<T>.
+   Wraps expr as (lambda [] expr), compiles it, generates spawn struct + entry fn."
+  (let* ((expr (second form))
+         (spawn-id (incf *spawn-counter*))
+         (spawn-struct (format nil "_spawn_~d" spawn-id))
+         (spawn-run (format nil "_spawn_~d_run" spawn-id))
+         ;; Wrap as zero-arg lambda to reuse capture machinery
+         (lambda-form `(lambda nil ,expr)))
+    ;; Compile the lambda — this generates _lambda_N, env struct, etc.
+    (multiple-value-bind (lambda-code lambda-type) (compile-lambda lambda-form env)
+      ;; lambda-type is (:fn () T), extract return type
+      (let* ((ret-type (fn-type-ret lambda-type))
+             (ret-c (type-to-c ret-type))
+             (fut-type (make-future-type ret-type spawn-id))
+             (fut-var (format nil "_fut_~d" spawn-id))
+             ;; lambda-code is like (Fn_void_int){_lambda_N, &_ctx_M} or {_lambda_N, NULL}
+             ;; Parse fn pointer and env pointer from the Fn struct literal
+             (brace-start (position #\{ lambda-code))
+             (brace-end (position #\} lambda-code :from-end t))
+             (inner (subseq lambda-code (1+ brace-start) brace-end))
+             (comma-pos (position #\, inner))
+             (fn-ptr (string-trim " " (subseq inner 0 comma-pos)))
+             (env-ptr (string-trim " " (subseq inner (1+ comma-pos)))))
+        ;; Generate spawn struct typedef
+        (push (format nil "typedef struct {~%  pthread_t _thread;~%  ~a _result;~%  ~a (*_fn)(void*);~%  void* _env;~%} ~a;~%"
+                      ret-c ret-c spawn-struct)
+              *struct-defs*)
+        ;; Generate spawn entry function
+        (push (format nil "static void* ~a(void* arg);~%" spawn-run)
+              *lambda-forward-decls*)
+        (push (format nil "static void* ~a(void* arg) {~%  ~a* s = (~a*)arg;~%  s->_result = s->_fn(s->_env);~%  if (s->_env) free(s->_env);~%  s->_env = NULL;~%  return NULL;~%}~%"
+                      spawn-run spawn-struct spawn-struct)
+              *functions*)
+        ;; Build ordered list of statements, then push in reverse (LIFO stack)
+        (let ((stmts nil)
+              (heap-env-code nil))
+          ;; Check if lambda was capturing — env-ptr will be &_ctx_N (not NULL)
+          (when (and (not (string= env-ptr "NULL"))
+                     (> (length env-ptr) 1)
+                     (char= (char env-ptr 0) #\&))
+            (let* ((env-var-name (subseq env-ptr 1))  ; strip &
+                   (env-stmt (find-if (lambda (s) (search env-var-name s)) *pending-stmts*)))
+              (when env-stmt
+                (setf *pending-stmts* (remove env-stmt *pending-stmts* :count 1))
+                (let* ((trimmed (string-trim '(#\Space #\Tab) env-stmt))
+                       (space1 (position #\Space trimmed))
+                       (env-struct-type (subseq trimmed 0 space1))
+                       (eq-pos (position #\= trimmed))
+                       (init-part (string-trim '(#\Space #\Tab #\;) (subseq trimmed (1+ eq-pos)))))
+                  (push (format nil "  ~a* ~a = malloc(sizeof(~a));"
+                                env-struct-type env-var-name env-struct-type)
+                        stmts)
+                  (push (format nil "  *~a = (~a)~a;"
+                                env-var-name env-struct-type init-part)
+                        stmts)
+                  (setf heap-env-code env-var-name)))))
+          ;; Spawn struct alloc + field init + pthread_create (in execution order)
+          (push (format nil "  ~a* ~a = malloc(sizeof(~a));"
+                        spawn-struct fut-var spawn-struct)
+                stmts)
+          (push (format nil "  ~a->_fn = ~a;" fut-var fn-ptr)
+                stmts)
+          (push (format nil "  ~a->_env = ~a;"
+                        fut-var (or heap-env-code
+                                    (if (string= env-ptr "NULL") "NULL" env-ptr)))
+                stmts)
+          (push (format nil "  pthread_create(&~a->_thread, NULL, ~a, ~a);"
+                        fut-var spawn-run fut-var)
+                stmts)
+          ;; stmts is in reverse execution order; push in that order so *pending-stmts*
+          ;; (also LIFO) emits them in correct execution order
+          (dolist (s stmts)
+            (push s *pending-stmts*)))
+        (setf *uses-threads* t)
+        (values fut-var fut-type)))))
+
+(defun compile-await (form env)
+  "(await future-expr) — block until thread completes, extract result."
+  (multiple-value-bind (fut-code fut-type) (compile-expr (second form) env)
+    (unless (future-type-p fut-type)
+      (error "await: expected future type, got ~a" fut-type))
+    (let* ((inner-type (future-inner-type fut-type))
+           (result-var (format nil "_await_~d" (incf *temp-counter*)))
+           (inner-c (type-to-c inner-type)))
+      ;; Push in reverse execution order (LIFO stack)
+      (push (format nil "  free(~a);" fut-code)
+            *pending-stmts*)
+      (push (format nil "  ~a ~a = ~a->_result;" inner-c result-var fut-code)
+            *pending-stmts*)
+      (push (format nil "  pthread_join(~a->_thread, NULL);" fut-code)
+            *pending-stmts*)
+      (values result-var inner-type))))
+
+;;; === Condition System (CL-style) ===
+
+(defun compile-signal (form env)
+  "(signal :type) or (signal :type val) — signal a condition.
+   Walks handler stack; does NOT unwind. If unhandled, aborts."
+  (let* ((type-kw (second form))
+         (type-name (string-downcase (symbol-name type-kw)))
+         (has-val (>= (length form) 3))
+         (stmts nil))
+    (if has-val
+        (multiple-value-bind (val-code val-type) (compile-expr (third form) env)
+          (let ((tmp (format nil "_sig_~d" (incf *temp-counter*))))
+            (push (format nil "  ~a ~a = ~a;" (type-to-c val-type) tmp val-code) stmts)
+            (push (format nil "  _sysp_signal(\"~a\", &~a);" type-name tmp) stmts)))
+        (push (format nil "  _sysp_signal(\"~a\", NULL);" type-name) stmts))
+    ;; Push in reverse order (LIFO)
+    (dolist (s stmts) (push s *pending-stmts*))
+    (setf *uses-conditions* t)
+    (values "0" :int)))
+
+(defun compile-invoke-restart (form env)
+  "(invoke-restart :name) or (invoke-restart :name val) — longjmp to restart.
+   Never returns."
+  (let* ((name-kw (second form))
+         (restart-name (string-downcase (symbol-name name-kw)))
+         (has-val (>= (length form) 3))
+         (stmts nil))
+    (if has-val
+        (multiple-value-bind (val-code val-type) (compile-expr (third form) env)
+          (let ((tmp (format nil "_irv_~d" (incf *temp-counter*))))
+            (push (format nil "  ~a ~a = ~a;" (type-to-c val-type) tmp val-code) stmts)
+            (push (format nil "  _sysp_invoke_restart(\"~a\", &~a, sizeof(~a));" restart-name tmp tmp) stmts)))
+        (push (format nil "  _sysp_invoke_restart(\"~a\", NULL, 0);" restart-name) stmts))
+    (dolist (s stmts) (push s *pending-stmts*))
+    (setf *uses-conditions* t)
+    (values "0" :int)))
+
+(defun compile-restart-case (form env)
+  "(restart-case body (:name [v :type] expr) ...) — establish named restart points.
+   Each restart is a setjmp. Body runs normally; invoke-restart longjmps to matching restart."
+  (let* ((body (second form))
+         (clauses (cddr form))  ; list of (:name [params] body...)
+         (rc-id (incf *restart-counter*))
+         (result-var (format nil "_rc_res_~d" rc-id))
+         (result-type nil)
+         (restart-nodes nil)   ; list of (node-var name clause-params clause-body)
+         (stmts nil))          ; accumulated C statements (execution order)
+    ;; Parse restart clauses
+    (let ((node-id 0))
+      (dolist (clause clauses)
+        (let* ((kw (first clause))
+               (name (string-downcase (symbol-name kw)))
+               (params-vec (second clause))
+               (clause-body (cddr clause))
+               (node-var (format nil "_r_~d_~d" rc-id (incf node-id))))
+          (push (list node-var name params-vec clause-body) restart-nodes)))
+      (setf restart-nodes (nreverse restart-nodes)))
+    ;; Declare restart struct nodes and chain them
+    (let ((prev-next "_restart_stack"))
+      (dolist (rn restart-nodes)
+        (let ((node-var (first rn))
+              (name (second rn)))
+          (push (format nil "  _sysp_restart ~a;" node-var) stmts)
+          (push (format nil "  ~a.name = \"~a\";" node-var name) stmts)
+          (push (format nil "  ~a.next = ~a;" node-var prev-next) stmts)
+          (setf prev-next (format nil "&~a" node-var)))))
+    ;; Push all onto restart stack
+    (let ((last-node (first (last restart-nodes))))
+      (push (format nil "  _restart_stack = &~a;" (first last-node)) stmts))
+    ;; Generate the if/else if chain with setjmp
+    ;; First: each restart clause as "if (setjmp(...) != 0)"
+    ;; Last else: normal body
+    (let ((first-clause t))
+      (dolist (rn restart-nodes)
+        (let* ((node-var (first rn))
+               (name (second rn))
+               (params-vec (third rn))
+               (clause-body (fourth rn)))
+          (declare (ignore name))
+          ;; Parse params: [v :type] or []
+          (let ((has-param (and params-vec (> (length params-vec) 0))))
+            (if first-clause
+                (push (format nil "  if (setjmp(~a.buf) != 0) {" node-var) stmts)
+                (push (format nil "  } else if (setjmp(~a.buf) != 0) {" node-var) stmts))
+            (setf first-clause nil)
+            ;; Extract param and compile clause body
+            (let ((clause-env (make-env :parent env)))
+              (if has-param
+                  ;; Bind the param from restart value
+                  (let* ((parsed-params (parse-params params-vec))
+                         (param-name (first (first parsed-params)))
+                         (param-type (second (first parsed-params)))
+                         (param-c (sanitize-name param-name)))
+                    (env-bind clause-env param-name param-type)
+                    (push (format nil "    ~a ~a = *(~a*)~a.value;"
+                                  (type-to-c param-type) param-c (type-to-c param-type) node-var)
+                          stmts)
+                    ;; Compile clause body (may be multiple forms)
+                    (let ((*pending-stmts* nil))
+                      (if (= (length clause-body) 1)
+                          (multiple-value-bind (code tp) (compile-expr (first clause-body) clause-env)
+                            (dolist (ps *pending-stmts*) (push ps stmts))
+                            (push (format nil "    ~a = ~a;" result-var code) stmts)
+                            (when (null result-type) (setf result-type tp)))
+                          ;; Multiple body forms
+                          (let* ((all-but-last (butlast clause-body))
+                                 (last-form (car (last clause-body))))
+                            (dolist (bf all-but-last)
+                              (dolist (s (compile-stmt bf clause-env))
+                                (push s stmts)))
+                            (multiple-value-bind (code tp) (compile-expr last-form clause-env)
+                              (dolist (ps *pending-stmts*) (push ps stmts))
+                              (push (format nil "    ~a = ~a;" result-var code) stmts)
+                              (when (null result-type) (setf result-type tp)))))))
+                  ;; No params
+                  (let ((*pending-stmts* nil))
+                    (if (= (length clause-body) 1)
+                        (multiple-value-bind (code tp) (compile-expr (first clause-body) clause-env)
+                          (dolist (ps *pending-stmts*) (push ps stmts))
+                          (push (format nil "    ~a = ~a;" result-var code) stmts)
+                          (when (null result-type) (setf result-type tp)))
+                        (let* ((all-but-last (butlast clause-body))
+                               (last-form (car (last clause-body))))
+                          (dolist (bf all-but-last)
+                            (dolist (s (compile-stmt bf clause-env))
+                              (push s stmts)))
+                          (multiple-value-bind (code tp) (compile-expr last-form clause-env)
+                            (dolist (ps *pending-stmts*) (push ps stmts))
+                            (push (format nil "    ~a = ~a;" result-var code) stmts)
+                            (when (null result-type) (setf result-type tp)))))))))))
+    ;; else: normal body
+    (push "  } else {" stmts)
+    (let ((*pending-stmts* nil))
+      (multiple-value-bind (code tp) (compile-expr body env)
+        (dolist (ps *pending-stmts*) (push ps stmts))
+        (push (format nil "    ~a = ~a;" result-var code) stmts)
+        (when (null result-type) (setf result-type tp))))
+    (push "  }" stmts)
+    ;; Pop restart stack — restore from outermost restart's .next
+    (let ((outermost (first restart-nodes)))
+      (push (format nil "  _restart_stack = ~a.next;" (first outermost)) stmts))
+    ;; Reverse stmts (we pushed in reverse) and prepend result var decl
+    (setf stmts (nreverse stmts))
+    (push (format nil "  volatile ~a ~a;" (type-to-c result-type) result-var) stmts)
+    ;; Push all to *pending-stmts*
+    (dolist (s (nreverse stmts)) (push s *pending-stmts*))
+    (setf *uses-conditions* t)
+    (values result-var result-type))))
+
+(defun compile-handler-bind (form env)
+  "(handler-bind ((:type [params] body...) ...) body...) — bind condition handlers.
+   Handlers run in signaler's frame without unwinding.
+   Each binding is (:condition-type [param :type] handler-body-forms...)."
+  (let* ((bindings (second form))
+         (body-forms (cddr form))
+         (hb-id (incf *handler-counter*))
+         (handler-nodes nil)  ; list of (node-var type-name)
+         (stmts nil))
+    ;; Process each binding: (:type [param :type] body...)
+    (let ((binding-id 0))
+      (dolist (binding bindings)
+        (let* ((type-kw (first binding))
+               (type-name (string-downcase (symbol-name type-kw)))
+               (params-vec (second binding))
+               (handler-body (cddr binding))
+               (node-var (format nil "_h_~d_~d" hb-id (incf binding-id)))
+               (wrap-id (incf *handler-wrap-counter*))
+               (wrap-name (format nil "_handler_wrap_~d" wrap-id))
+               (params (parse-params params-vec))
+               (cond-param-name (first (first params)))
+               (cond-param-type (second (first params)))
+               (lambda-name (format nil "_lambda_~d" (incf *lambda-counter*)))
+               (fn-env (make-env :parent env)))
+          ;; Bind param in function env
+          (env-bind fn-env cond-param-name cond-param-type)
+          ;; Compile handler body
+          (let ((*pending-stmts* nil))
+            (let* ((all-but-last (butlast handler-body))
+                   (last-form (car (last handler-body)))
+                   (body-stmts (when all-but-last (compile-body all-but-last fn-env))))
+              (multiple-value-bind (last-code last-type) (compile-expr last-form fn-env)
+                (declare (ignore last-type))
+                (let ((all-body (append body-stmts *pending-stmts*)))
+                  ;; Generate the handler function (void return)
+                  (push (format nil "static void ~a(void* _ctx, ~a ~a);"
+                                lambda-name (type-to-c cond-param-type) (sanitize-name cond-param-name))
+                        *lambda-forward-decls*)
+                  (push (format nil "static void ~a(void* _ctx, ~a ~a) {~%~{~a~%~}  ~a;~%}~%"
+                                lambda-name (type-to-c cond-param-type) (sanitize-name cond-param-name)
+                                (or all-body nil) last-code)
+                        *functions*)
+                  ;; Generate void(*)(void*,void*) wrapper that casts void* → typed param
+                  (push (format nil "static void ~a(void* _ctx, void* _cval);"
+                                wrap-name)
+                        *lambda-forward-decls*)
+                  (push (format nil "static void ~a(void* _ctx, void* _cval) {~%  ~a(_ctx, *(~a*)_cval);~%}~%"
+                                wrap-name lambda-name (type-to-c cond-param-type))
+                        *functions*)))))
+          ;; Generate handler struct node setup
+          (push (format nil "  _sysp_handler ~a;" node-var) stmts)
+          (push (format nil "  ~a.type = \"~a\";" node-var type-name) stmts)
+          (push (format nil "  ~a.fn = ~a;" node-var wrap-name) stmts)
+          (push (format nil "  ~a.env = NULL;" node-var) stmts)
+          (push (format nil "  ~a.next = _handler_stack;" node-var) stmts)
+          (push (format nil "  _handler_stack = &~a;" node-var) stmts)
+          (push (list node-var type-name) handler-nodes))))
+    ;; Compile body
+    (let ((result-var (format nil "_hb_res_~d" hb-id))
+          (result-type nil))
+      ;; Compile body forms
+      (let ((*pending-stmts* nil))
+        (if (= (length body-forms) 1)
+            (multiple-value-bind (code tp) (compile-expr (first body-forms) env)
+              (dolist (ps *pending-stmts*) (push ps stmts))
+              (push (format nil "  ~a = ~a;" result-var code) stmts)
+              (setf result-type tp))
+            (let* ((all-but-last (butlast body-forms))
+                   (last-form (car (last body-forms))))
+              (dolist (bf all-but-last)
+                (dolist (s (compile-stmt bf env))
+                  (push s stmts)))
+              (multiple-value-bind (code tp) (compile-expr last-form env)
+                (dolist (ps *pending-stmts*) (push ps stmts))
+                (push (format nil "  ~a = ~a;" result-var code) stmts)
+                (setf result-type tp)))))
+      ;; Pop handler stack — restore from first node's .next
+      (let ((first-node (first handler-nodes)))
+        (push (format nil "  _handler_stack = ~a.next;" (first first-node)) stmts))
+      ;; Reverse and prepend result decl
+      (setf stmts (nreverse stmts))
+      (push (format nil "  ~a ~a;" (type-to-c result-type) result-var) stmts)
+      ;; Push all to *pending-stmts*
+      (dolist (s (nreverse stmts)) (push s *pending-stmts*))
+      (setf *uses-conditions* t)
+      (values result-var result-type))))
 
 (defun fix-capture-refs (code captures)
   "Replace captured variable names with _env->name in generated C code.
@@ -4078,6 +4429,55 @@
                    (t (warn "Unknown top-level form: ~a" (first expanded))))))))))
       (incf form-idx))))
 
+(defun emit-condition-preamble (out)
+  "Emit the condition system runtime (restart/handler stacks, signal, invoke-restart)."
+  (format out "/* Condition system runtime */~%")
+  (format out "#include <setjmp.h>~%")
+  (format out "#include <string.h>~%~%")
+  (format out "typedef struct _sysp_restart {~%")
+  (format out "    const char* name;~%")
+  (format out "    jmp_buf buf;~%")
+  (format out "    void* value;~%")
+  (format out "    char _vbuf[16];~%")
+  (format out "    struct _sysp_restart* next;~%")
+  (format out "} _sysp_restart;~%~%")
+  (format out "typedef struct _sysp_handler {~%")
+  (format out "    const char* type;~%")
+  (format out "    void (*fn)(void*, void*);~%")
+  (format out "    void* env;~%")
+  (format out "    struct _sysp_handler* next;~%")
+  (format out "} _sysp_handler;~%~%")
+  (format out "static SYSP_TLS _sysp_restart* _restart_stack = NULL;~%")
+  (format out "static SYSP_TLS _sysp_handler* _handler_stack = NULL;~%~%")
+  (format out "static void _sysp_signal(const char* type, void* val) {~%")
+  (format out "    _sysp_handler* h = _handler_stack;~%")
+  (format out "    while (h) {~%")
+  (format out "        if (strcmp(h->type, type) == 0) {~%")
+  (format out "            h->fn(h->env, val);~%")
+  (format out "        }~%")
+  (format out "        h = h->next;~%")
+  (format out "    }~%")
+  (format out "    fprintf(stderr, \"Unhandled condition: %s\\n\", type);~%")
+  (format out "    abort();~%")
+  (format out "}~%~%")
+  (format out "static void _sysp_invoke_restart(const char* name, void* val, size_t vsize) {~%")
+  (format out "    _sysp_restart* r = _restart_stack;~%")
+  (format out "    while (r) {~%")
+  (format out "        if (strcmp(r->name, name) == 0) {~%")
+  (format out "            if (val && vsize <= sizeof(r->_vbuf)) {~%")
+  (format out "                memcpy(r->_vbuf, val, vsize);~%")
+  (format out "                r->value = r->_vbuf;~%")
+  (format out "            } else {~%")
+  (format out "                r->value = val;~%")
+  (format out "            }~%")
+  (format out "            longjmp(r->buf, 1);~%")
+  (format out "        }~%")
+  (format out "        r = r->next;~%")
+  (format out "    }~%")
+  (format out "    fprintf(stderr, \"No restart: %s\\n\", name);~%")
+  (format out "    abort();~%")
+  (format out "}~%~%"))
+
 (defun emit-value-preamble (out)
   "Emit the Value/Cons/Symbol type system preamble with readable formatting"
   ;; Type definitions
@@ -4277,6 +4677,8 @@
     (format out "#include <stddef.h>~%")   ; size_t, ptrdiff_t
     (when *uses-value-type*
       (format out "#include <stdarg.h>~%"))
+    (when *uses-threads*
+      (format out "#include <pthread.h>~%"))
     (dolist (inc *includes*)
       (format out "#include <~a>~%" inc))
     (format out "~%")
@@ -4308,6 +4710,9 @@
     (format out "  #define RC_DEC(x) (--(x))~%")
     (format out "  #define SYSP_TLS~%")
     (format out "#endif~%~%")
+    ;; Condition system preamble (if needed)
+    (when *uses-conditions*
+      (emit-condition-preamble out))
     ;; Value type preamble (if needed)
     (when *uses-value-type*
       (emit-value-preamble out))
@@ -4366,7 +4771,13 @@
   (setf *mono-instances* (make-hash-table :test #'equal))
   (setf *included-files* (make-hash-table :test 'equal))
   (setf *direct-fns* (make-hash-table :test 'equal))
-  (setf *env-counter* 0))
+  (setf *env-counter* 0)
+  (setf *spawn-counter* 0)
+  (setf *uses-threads* nil)
+  (setf *restart-counter* 0)
+  (setf *handler-counter* 0)
+  (setf *handler-wrap-counter* 0)
+  (setf *uses-conditions* nil))
 
 (defun compile-file-to-c (in-path out-path)
   (reset-state)

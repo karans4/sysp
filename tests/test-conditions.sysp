@@ -1,0 +1,46 @@
+;; Test CL-style condition system: restart-case, handler-bind, signal, invoke-restart
+
+;; Basic restart-case + invoke-restart
+(defn test-restart-basic [] :int
+  (restart-case (do (invoke-restart :use-value 42) 0)
+    (:use-value [v :int] v)))
+
+;; Handler-bind catches signal, invokes restart
+(defn safe-div [a :int, b :int] :int
+  (restart-case
+    (do (if (== b 0) (signal :div-by-zero a) 0)
+        (/ a b))
+    (:use-value [v :int] v)
+    (:abort [] -1)))
+
+(defn test-handler-signal [] :int
+  (handler-bind ((:div-by-zero [c :int] (invoke-restart :use-value c)))
+    (safe-div 10 0)))
+
+;; No signal — normal execution
+(defn test-no-signal [] :int
+  (handler-bind ((:div-by-zero [c :int] (invoke-restart :abort)))
+    (safe-div 10 2)))
+
+;; Nested restart-case
+(defn test-nested [] :int
+  (restart-case
+    (restart-case
+      (do (invoke-restart :inner 10) 0)
+      (:inner [v :int] (+ v 5)))
+    (:outer [v :int] v)))
+
+(defn sysp_main [] :int
+  (if (== (test-restart-basic) 42)
+    (println "PASS test-restart-basic")
+    (println "FAIL test-restart-basic"))
+  (if (== (test-handler-signal) 10)
+    (println "PASS test-handler-signal")
+    (println "FAIL test-handler-signal"))
+  (if (== (test-no-signal) 5)
+    (println "PASS test-no-signal")
+    (println "FAIL test-no-signal"))
+  (if (== (test-nested) 15)
+    (println "PASS test-nested")
+    (println "FAIL test-nested"))
+  0)
