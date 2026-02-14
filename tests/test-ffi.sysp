@@ -1,0 +1,67 @@
+;; Test C interop primitives: c-decl, c-stmt, c-expr, ptr+, ptr-to
+
+(include "string.h")
+
+;; c-decl: emit raw C at top level
+(c-decl "static int _square(int x) { return x * x; }")
+(c-decl "static void _fill_array(int* arr, int n, int val) { for(int i=0;i<n;i++) arr[i]=val; }")
+
+;; extern the c-decl'd functions so sysp knows their types
+(extern _square [x :int] :int)
+(extern _fill_array [arr :ptr-int, n :int, val :int] :void)
+
+;; Test c-expr: inline C expression with type
+(defn test-c-expr [] :int
+  (c-expr "(2 + 3) * 7" :int))
+
+;; Test c-stmt: raw C statement
+(defn test-c-stmt [] :int
+  (let-mut x 0)
+  (c-stmt "x = 100;")
+  x)
+
+;; Test calling c-decl'd function
+(defn test-c-decl [] :int
+  (_square 9))
+
+;; Test ptr+ arithmetic
+(defn test-ptr-arith [] :int
+  (let buf (ptr-alloc :int 4))
+  (_fill_array buf 4 0)
+  (ptr-set! buf 0 10)
+  (ptr-set! buf 1 20)
+  (ptr-set! buf 2 30)
+  (ptr-set! buf 3 40)
+  (let p2 (ptr+ buf 2))
+  (let result (ptr-deref p2))
+  (ptr-free buf)
+  result)
+
+;; Test ptr-to (pointer cast)
+(defn test-ptr-cast [] :int
+  (let buf (ptr-alloc :char 4))
+  (ptr-set! buf 0 (cast :char 65))
+  (ptr-set! buf 1 (cast :char 66))
+  (ptr-set! buf 2 (cast :char 0))
+  (let str (ptr-to :char buf))
+  (let result (c-expr "(int)strlen((const char*)str)" :int))
+  (ptr-free buf)
+  result)
+
+(defn sysp_main [] :int
+  (if (== (test-c-expr) 35)
+    (println "PASS test-c-expr")
+    (println "FAIL test-c-expr"))
+  (if (== (test-c-stmt) 100)
+    (println "PASS test-c-stmt")
+    (println "FAIL test-c-stmt"))
+  (if (== (test-c-decl) 81)
+    (println "PASS test-c-decl")
+    (println "FAIL test-c-decl"))
+  (if (== (test-ptr-arith) 30)
+    (println "PASS test-ptr-arith")
+    (println "FAIL test-ptr-arith"))
+  (if (== (test-ptr-cast) 2)
+    (println "PASS test-ptr-cast")
+    (println "FAIL test-ptr-cast"))
+  0)

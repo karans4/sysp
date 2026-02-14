@@ -1696,7 +1696,10 @@
     ("restart-case" . compile-restart-case)
     ("handler-bind" . compile-handler-bind)
     ("signal" . compile-signal)
-    ("invoke-restart" . compile-invoke-restart)))
+    ("invoke-restart" . compile-invoke-restart)
+    ("c-expr" . compile-c-expr)
+    ("ptr+" . compile-ptr-add)
+    ("ptr-to" . compile-ptr-to)))
 
 (defun compile-list (form env)
   (let* ((head (first form))
@@ -1964,6 +1967,21 @@
           (multiple-value-bind (v-code vt) (compile-expr (second args) env)
             (declare (ignore vt))
             (list (format nil "  *~a = ~a;" p-code v-code)))))))
+
+(defun compile-ptr-add (form env)
+  "(ptr+ ptr offset) — pointer arithmetic, returns same pointer type."
+  (multiple-value-bind (p-code pt) (compile-expr (second form) env)
+    (multiple-value-bind (n-code nt) (compile-expr (third form) env)
+      (declare (ignore nt))
+      (values (format nil "(~a + ~a)" p-code n-code) pt))))
+
+(defun compile-ptr-to (form env)
+  "(ptr-to :type expr) — cast expression to (:ptr type)."
+  (let ((target-type (parse-type-annotation (second form))))
+    (multiple-value-bind (code ct) (compile-expr (third form) env)
+      (declare (ignore ct))
+      (values (format nil "((~a*)~a)" (type-to-c target-type) code)
+              (make-ptr-type target-type)))))
 
 (defun compile-cond-expr (form env)
   "(cond [test1 expr1] [test2 expr2] ... [else exprN]) -> nested ternary"
@@ -3160,6 +3178,8 @@
      (compile-ptr-free-stmt form env))
     ((and (listp form) (sym= (first form) "ptr-set!"))
      (compile-ptr-set-stmt form env))
+    ((and (listp form) (sym= (first form) "c-stmt"))
+     (compile-c-stmt form env))
     (t (let ((*pending-stmts* nil))
          (multiple-value-bind (code tp) (compile-expr form env)
            (declare (ignore tp))
@@ -4086,6 +4106,25 @@
     (pushnew (if (stringp header) header (string header))
              *includes* :test #'string=)))
 
+(defun compile-c-decl (form)
+  "(c-decl \"raw C code\") — emit raw C at top level (after structs, before functions).
+   Use for __global__ kernels, typedefs, inline functions, etc."
+  (let ((code (second form)))
+    (push (format nil "~a~%" code) *functions*)))
+
+(defun compile-c-stmt (form env)
+  "(c-stmt \"raw C;\") — emit raw C statement in function body."
+  (declare (ignore env))
+  (let ((code (second form)))
+    (list (format nil "  ~a" code))))
+
+(defun compile-c-expr (form env)
+  "(c-expr \"raw C\" :type) — raw C expression with type annotation."
+  (declare (ignore env))
+  (let ((code (second form))
+        (tp (parse-type-annotation (third form))))
+    (values code tp)))
+
 (defun compile-enum (form)
   "(enum Name [Variant1] [Variant2] ...) or (enum Name [Variant1 0] [Variant2 1] ...)"
   (let* ((name (string (second form)))
@@ -4423,6 +4462,7 @@
                    ((sym= (first expanded) "defn") (compile-defn expanded))
                    ((sym= (first expanded) "extern") (compile-extern expanded))
                    ((sym= (first expanded) "include") (compile-include expanded))
+                   ((sym= (first expanded) "c-decl") (compile-c-decl expanded))
                    ((sym= (first expanded) "let") (compile-toplevel-let expanded nil))
                    ((sym= (first expanded) "let-mut") (compile-toplevel-let expanded t))
                    ((sym= (first expanded) "const") (compile-toplevel-let expanded nil)) ; legacy alias
