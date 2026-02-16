@@ -294,21 +294,23 @@
       (return-from infer-list (make-tvar)))
     (cond
       ;; Arithmetic: operands must unify, result = operand type
+      ;; Variadic: (+ a b c d) folds left to (+ (+ (+ a b) c) d)
       ((member (string head) '("+" "-" "*" "/" "%" "mod") :test #'string-equal)
        (if (and (= (length form) 2) (string-equal (string head) "-"))
            ;; Unary minus
            (infer-expr (second form))
-           ;; Binary op: infer both sides, try to unify, return result
-           (let ((lt (infer-expr (second form)))
-                 (rt (infer-expr (third form))))
-             (unify lt rt)
-             lt)))
+           ;; Fold left over all args
+           (let ((result-type (infer-expr (second form))))
+             (dolist (arg (cddr form))
+               (let ((rt (infer-expr arg)))
+                 (unify result-type rt)))
+             result-type)))
 
-      ;; Comparison: operands unify, result is bool
+      ;; Comparison: operands unify, result is bool. Chained: (< a b c) all unify.
       ((member (string head) '("<" ">" "<=" ">=" "==" "!=") :test #'string-equal)
-       (let ((lt (infer-expr (second form)))
-             (rt (infer-expr (third form))))
-         (unify lt rt)
+       (let ((first-type (infer-expr (second form))))
+         (dolist (arg (cddr form))
+           (unify first-type (infer-expr arg)))
          :bool))
 
       ;; Logical: result is bool
@@ -512,6 +514,11 @@
       ((sym= head "str-split") (infer-expr (second form)) (infer-expr (third form)) (make-vector-type :str))
       ((sym= head "str-from-int") (infer-expr (second form)) :str)
       ((sym= head "str-from-float") (infer-expr (second form)) :str)
+      ((sym= head "str-join") (infer-expr (second form)) (infer-expr (third form)) :str)
+      ((sym= head "str-starts?") (infer-expr (second form)) (infer-expr (third form)) :bool)
+      ((sym= head "str-ends?") (infer-expr (second form)) (infer-expr (third form)) :bool)
+      ((sym= head "str-trim") (infer-expr (second form)) :str)
+      ((sym= head "str-replace") (dolist (e (cdr form)) (infer-expr e)) :str)
 
       ;; get: struct field access — need struct info
       ((sym= head "get")
@@ -1836,6 +1843,15 @@
                               (list 'hash-set! m elem 1)))
                   m)))))
 
+  ;; partial: (partial f a b) => (lambda [x] (f a b x))
+  ;; Captures the first N args, remaining arg passed at call time
+  (setf (gethash "partial" *macros*)
+        (lambda (form)
+          (let* ((f (second form))
+                 (bound-args (cddr form))
+                 (x (intern (format nil "_pa~d" (incf *sysp-gensym-counter*)))))
+            (list 'lambda (list x) (append (list f) bound-args (list x))))))
+
 (install-builtin-macros)
 
 ;;; === Type Annotation Parsing ===
@@ -2502,7 +2518,10 @@
     ("str-find" . compile-str-find) ("str-concat" . compile-str-concat)
     ("str-slice" . compile-str-slice) ("str-upper" . compile-str-upper)
     ("str-lower" . compile-str-lower) ("str-split" . compile-str-split)
-    ("str-from-int" . compile-str-from-int) ("str-from-float" . compile-str-from-float)))
+    ("str-from-int" . compile-str-from-int) ("str-from-float" . compile-str-from-float)
+    ("str-join" . compile-str-join) ("str-starts?" . compile-str-starts)
+    ("str-ends?" . compile-str-ends) ("str-trim" . compile-str-trim)
+    ("str-replace" . compile-str-replace)))
 
 (defun compile-list (form env)
   (let* ((head (first form))
@@ -2511,9 +2530,15 @@
     (let ((binop (cdr (assoc name *binop-ops* :test #'string-equal))))
       (when binop
         (return-from compile-list
-          (if (and (string= binop "-") (= (length form) 2))
-              (compile-unary-minus form env)
-              (compile-binop binop form env)))))
+          (cond
+            ((and (string= binop "-") (= (length form) 2))
+             (compile-unary-minus form env))
+            ((and (> (length (rest form)) 2)
+                  (member binop '("<" ">" "<=" ">=" "==" "!=") :test #'string=))
+             (compile-chained-comparison binop form env))
+            ((> (length (rest form)) 2)
+             (compile-binop-variadic binop form env))
+            (t (compile-binop binop form env))))))
     (let ((logical (cdr (assoc name *logical-ops* :test #'string-equal))))
       (when logical
         (return-from compile-list (compile-logical logical form env))))
@@ -2584,6 +2609,46 @@
                 ;; Arithmetic operators: use C99 promotion rules
                 (t (sysp-arithmetic-type lt rt)))))
         (values (format nil "(~a ~a ~a)" lhs op rhs) result-type)))))
+
+(defun compile-binop-variadic (op form env)
+  "(+ a b c ...) — fold left: ((a + b) + c) + ..."
+  (let ((args (rest form)))
+    (multiple-value-bind (acc acc-type) (compile-expr (first args) env)
+      (dolist (arg (rest args))
+        (multiple-value-bind (rhs rt) (compile-expr arg env)
+          (setf acc-type
+                (cond
+                  ((member op '("<" ">" "<=" ">=" "==" "!=" "&&" "||") :test #'string=) :bool)
+                  ((member op '("&" "|" "^" "<<" ">>") :test #'string=) :int)
+                  (t (sysp-arithmetic-type acc-type rt))))
+          (setf acc (format nil "(~a ~a ~a)" acc op rhs))))
+      (values acc acc-type))))
+
+(defun compile-chained-comparison (op form env)
+  "(< a b c) → ((a < b) && (b < c)) with b evaluated once via temp"
+  (let* ((args (rest form))
+         (pairs nil))
+    ;; Compile all args, use temps for middle ones to avoid double evaluation
+    (let ((compiled-args
+            (loop for arg in args
+                  collect (multiple-value-bind (code tp) (compile-expr arg env)
+                            (declare (ignore tp))
+                            code))))
+      ;; For middle args (not first, not last), lift to temp var
+      (let ((safe-args
+              (loop for (code . rest) on compiled-args
+                    for i from 0
+                    collect (if (and (> i 0) rest)  ; middle arg
+                                (let ((tmp (fresh-tmp)))
+                                  (push (format nil "  int ~a = ~a;" tmp code) *pending-stmts*)
+                                  tmp)
+                                code))))
+        ;; Build chained pairs: (a < b) && (b < c) && ...
+        (loop for (a b) on safe-args
+              while b
+              collect (format nil "(~a ~a ~a)" a op b) into chain
+              finally (return (values (format nil "(~a)" (format nil "~{~a~^ && ~}" chain))
+                                      :bool)))))))
 
 (defun compile-logical (op form env)
   "(and a b c ...) or (or a b c ...) — variadic logical"
@@ -3198,6 +3263,18 @@
     ;; str-from-float
     (push "static const char* _sysp_str_from_float(double v) { char buf[64]; snprintf(buf, sizeof(buf), \"%g\", v); int n = strlen(buf); char* r = malloc(n + 1); memcpy(r, buf, n + 1); return r; }
 "
+          *functions*)
+    ;; str-trim
+    (push "static const char* _sysp_str_trim(const char* s) { while (*s && (*s == ' ' || *s == '\\t' || *s == '\\n' || *s == '\\r')) s++; int n = strlen(s); while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\\t' || s[n-1] == '\\n' || s[n-1] == '\\r')) n--; char* r = malloc(n + 1); memcpy(r, s, n); r[n] = 0; return r; }
+"
+          *functions*)
+    ;; str-replace
+    (push "static const char* _sysp_str_replace(const char* s, const char* old, const char* new_s) { int slen = strlen(s), olen = strlen(old), nlen = strlen(new_s); if (olen == 0) { int n = slen; char* r = malloc(n + 1); memcpy(r, s, n + 1); return r; } int count = 0; const char* p = s; while ((p = strstr(p, old))) { count++; p += olen; } char* r = malloc(slen + count * (nlen - olen) + 1); char* w = r; p = s; while (1) { const char* f = strstr(p, old); if (!f) { strcpy(w, p); break; } memcpy(w, p, f - p); w += f - p; memcpy(w, new_s, nlen); w += nlen; p = f + olen; } return r; }
+"
+          *functions*)
+    ;; str-join (takes Vector_str and delimiter)
+    (push "static const char* _sysp_str_join(const char** data, int len, const char* delim) { if (len == 0) { char* r = malloc(1); r[0] = 0; return r; } int dlen = strlen(delim), total = 0; for (int i = 0; i < len; i++) total += strlen(data[i]); total += dlen * (len - 1); char* r = malloc(total + 1); char* w = r; for (int i = 0; i < len; i++) { if (i > 0) { memcpy(w, delim, dlen); w += dlen; } int n = strlen(data[i]); memcpy(w, data[i], n); w += n; } *w = 0; return r; }
+"
           *functions*)))
 
 (defun ensure-str-split-helper ()
@@ -3319,6 +3396,56 @@
   (multiple-value-bind (f ft) (compile-expr (second form) env)
     (declare (ignore ft))
     (values (format nil "_sysp_str_from_float(~a)" f) :str)))
+
+(defun compile-str-starts (form env)
+  "(str-starts? s prefix)"
+  (pushnew "string.h" *includes* :test #'string=)
+  (multiple-value-bind (s st) (compile-expr (second form) env)
+    (declare (ignore st))
+    (multiple-value-bind (pfx pt) (compile-expr (third form) env)
+      (declare (ignore pt))
+      (values (format nil "(strncmp(~a, ~a, strlen(~a)) == 0)" s pfx pfx) :bool))))
+
+(defun compile-str-ends (form env)
+  "(str-ends? s suffix)"
+  (pushnew "string.h" *includes* :test #'string=)
+  (multiple-value-bind (s st) (compile-expr (second form) env)
+    (declare (ignore st))
+    (multiple-value-bind (sfx pt) (compile-expr (third form) env)
+      (declare (ignore pt))
+      (let ((tmp-slen (fresh-tmp))
+            (tmp-flen (fresh-tmp)))
+        (push (format nil "  int ~a = strlen(~a);" tmp-flen sfx) *pending-stmts*)
+        (push (format nil "  int ~a = strlen(~a);" tmp-slen s) *pending-stmts*)
+        (values (format nil "(~a >= ~a && strcmp(~a + ~a - ~a, ~a) == 0)"
+                        tmp-slen tmp-flen s tmp-slen tmp-flen sfx) :bool)))))
+
+(defun compile-str-trim (form env)
+  "(str-trim s)"
+  (ensure-string-helpers)
+  (multiple-value-bind (s st) (compile-expr (second form) env)
+    (declare (ignore st))
+    (values (format nil "_sysp_str_trim(~a)" s) :str)))
+
+(defun compile-str-replace (form env)
+  "(str-replace s old new)"
+  (ensure-string-helpers)
+  (multiple-value-bind (s st) (compile-expr (second form) env)
+    (declare (ignore st))
+    (multiple-value-bind (old ot) (compile-expr (third form) env)
+      (declare (ignore ot))
+      (multiple-value-bind (new-s nt) (compile-expr (fourth form) env)
+        (declare (ignore nt))
+        (values (format nil "_sysp_str_replace(~a, ~a, ~a)" s old new-s) :str)))))
+
+(defun compile-str-join (form env)
+  "(str-join vec delim)"
+  (ensure-string-helpers)
+  (multiple-value-bind (v vt) (compile-expr (second form) env)
+    (declare (ignore vt))
+    (multiple-value-bind (d dt) (compile-expr (third form) env)
+      (declare (ignore dt))
+      (values (format nil "_sysp_str_join(~a.data, ~a.len, ~a)" v v d) :str))))
 
 (defun compile-tuple (form env)
   "(tuple elem ...)"
@@ -3919,6 +4046,9 @@
            (multiple-value-bind (val-code val-type) (compile-expr (third form) env)
              (values (format nil "(~a.data[~a] = ~a)" vec-code idx-code val-code)
                      val-type)))))
+      ;; (set! (hash-get m k) val) -> hash-set!(m, k, val)
+      ((and (listp target) (sym= (first target) "hash-get"))
+       (compile-expr (list (intern "hash-set!") (second target) (third target) (third form)) env))
       ;; simple variable
       (t (let ((name (string target)))
            (when (and (env-lookup env name) (not (env-mutable-p env name)))
@@ -4328,9 +4458,8 @@
     ((and (listp form) (sym= (first form) "block"))
      (compile-block-stmt form env))
     ((and (listp form) (sym= (first form) "do"))
-     ;; do as block: compile all sub-forms as statements
-     ;; Use (for [var start end] body...) for loops
-     (compile-body (rest form) env))
+     ;; do = scoped block with cleanup (same as block)
+     (compile-block-stmt form env))
     ((and (listp form) (sym= (first form) "ptr-free"))
      (compile-ptr-free-stmt form env))
     ((and (listp form) (sym= (first form) "ptr-set!"))
@@ -5525,7 +5654,8 @@
                   (if qualifier "" " = {0}")))))
 
 (defun compile-enum (form)
-  "(enum Name [Variant1] [Variant2] ...) or (enum Name [Variant1 0] [Variant2 1] ...)"
+  "(enum Name Variant1 Variant2 ...) or (enum Name [Variant1 0] [Variant2 1] ...)
+   Bare symbols auto-number from 0. Brackets required only for explicit values."
   (let* ((name (string (second form)))
          (variants-raw (cddr form))
          (variants nil)
@@ -6309,7 +6439,8 @@
                                          "block" "runtype" "as" "vector" "hash-map"
                                          "str-len" "str-ref" "str-eq?" "str-contains?" "str-find"
                                          "str-concat" "str-slice" "str-upper" "str-lower"
-                                         "str-split" "str-from-int" "str-from-float")
+                                         "str-split" "str-from-int" "str-from-float"
+                                         "str-join" "str-starts?" "str-ends?" "str-trim" "str-replace")
                                        :test #'equal))
                                  ;; Also safe: any known macro (expands inline)
                                  (not (gethash h *macros*))))
@@ -6357,7 +6488,8 @@
                                  "hash-set!" "array-ref" "array-set!" "get"
                                  "str-len" "str-ref" "str-eq?" "str-contains?" "str-find"
                                  "str-concat" "str-slice" "str-upper" "str-lower"
-                                 "str-split" "str-from-int" "str-from-float")
+                                 "str-split" "str-from-int" "str-from-float"
+                                 "str-join" "str-starts?" "str-ends?" "str-trim" "str-replace")
                             :test #'equal))
              nil  ; extraction: var is accessed, not leaked
              (some (lambda (f) (var-escapes-through-arg-p f var-name))
