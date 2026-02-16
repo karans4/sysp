@@ -6,6 +6,16 @@ examples/*.c
 
 # Test build outputs
 tests/build/
+tests/*.c
+
+# Apple II binaries and disk images
+examples/apple2/*.bin
+examples/apple2/*.dsk
+examples/apple2/build/
+examples/build/
+
+# Backup files
+*.backup.*
 
 # Legacy test binaries (before reorganization)
 test-cons

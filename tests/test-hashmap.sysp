@@ -1,0 +1,53 @@
+;; test-hashmap.sysp — hash map CRUD, merge, keys/vals, contains
+
+(defn main () :int
+  ;; Basic creation and set/get
+  (let-mut m (hash-map "x" 10 "y" 20 "z" 30))
+  (println (hash-get m "x"))   ; 10
+  (println (hash-get m "y"))   ; 20
+  (println (hash-get m "z"))   ; 30
+  (println (hash-len m))       ; 3
+
+  ;; Update existing key
+  (hash-set! m "x" 99)
+  (println (hash-get m "x"))  ; 99
+
+  ;; has/contains
+  (println (hash-has? m "x")) ; true
+  (println (hash-has? m "w")) ; false
+  (println (contains? m "y")) ; true
+
+  ;; Delete
+  (hash-del! m "y")
+  (println (hash-len m))       ; 2
+  (println (hash-has? m "y"))  ; false
+
+  ;; Clojure aliases
+  (assoc! m "a" 42)
+  (println (hash-get m "a"))   ; 42
+  (dissoc! m "a")
+  (println (hash-has? m "a"))  ; false
+
+  ;; Integer keys
+  (let-mut m2 (hash-map 1 100 2 200 3 300))
+  (println (hash-get m2 1))   ; 100
+  (println (hash-get m2 3))   ; 300
+  (hash-set! m2 4 400)
+  (println (hash-len m2))     ; 4
+
+  ;; keys and vals
+  (let-mut m3 (hash-map "a" 1 "b" 2))
+  (let k (hash-keys m3))
+  (let v (hash-vals m3))
+  (println (vector-len k))    ; 2
+  (println (vector-len v))    ; 2
+
+  ;; merge
+  (let-mut m4 (hash-map "x" 1))
+  (let-mut m5 (hash-map "y" 2 "z" 3))
+  (merge! m4 m5)
+  (println (hash-len m4))     ; 3
+  (println (hash-get m4 "y")) ; 2
+  (println (hash-get m4 "z")) ; 3
+
+  0)

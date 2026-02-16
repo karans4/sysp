@@ -1,0 +1,89 @@
+;; test-collections.sysp — Clojure-style collection toolkit
+
+(defn pos? (x :int) :bool (> x 0))
+(defn even? (x :int) :bool (== (% x 2) 0))
+(defn odd? (x :int) :bool (!= (% x 2) 0))
+(defn gt3? (x :int) :bool (> x 3))
+(defn lte3? (x :int) :bool (<= x 3))
+
+(defn main () :int
+  (let v (vector 1 2 3 4 5))
+
+  ;; Access macros
+  (println (first v))           ; 1
+  (println (last v))            ; 5
+  (println (nth v 2))           ; 3
+  (println (count v))           ; 5
+  (println (empty? v))          ; 0
+  (println (empty? (vector)))   ; 1
+
+  ;; some / every?
+  (println (some even? v))      ; 1
+  (println (some gt3? (vector 1 2 3))) ; 0
+  (println (every? pos? v))     ; 1
+  (println (every? even? v))    ; 0
+
+  ;; not-any? / not-every?
+  (println (not-any? gt3? (vector 1 2 3)))  ; 1
+  (println (not-any? even? v))              ; 0
+  (println (not-every? even? v))            ; 1
+  (println (not-every? pos? v))             ; 0
+
+  ;; remove
+  (let r (remove even? v))
+  (println (count r))           ; 3 (1,3,5)
+  (println (first r))           ; 1
+  (println (last r))            ; 5
+
+  ;; take / drop
+  (let t (take 3 v))
+  (println (count t))           ; 3
+  (println (last t))            ; 3
+  (let d (drop 3 v))
+  (println (count d))           ; 2
+  (println (first d))           ; 4
+
+  ;; take-while / drop-while
+  (let tw (take-while lte3? v))
+  (println (count tw))          ; 3
+  (println (last tw))           ; 3
+  (let dw (drop-while lte3? v))
+  (println (count dw))          ; 2
+  (println (first dw))          ; 4
+
+  ;; range
+  (let r5 (range 5))
+  (println (count r5))          ; 5
+  (println (first r5))          ; 0
+  (println (last r5))           ; 4
+  (let r25 (range 2 5))
+  (println (count r25))         ; 3
+  (println (first r25))         ; 2
+
+  ;; repeat
+  (let rp (repeat 3 42))
+  (println (count rp))          ; 3
+  (println (first rp))          ; 42
+
+  ;; reverse
+  (let rev (reverse v))
+  (println (first rev))         ; 5
+  (println (last rev))          ; 1
+
+  ;; concat
+  (let c (concat (vector 1 2) (vector 3 4)))
+  (println (count c))           ; 4
+  (println (first c))           ; 1
+  (println (last c))            ; 4
+
+  ;; distinct (uses hash maps)
+  (let u (distinct (vector "a" "b" "b" "c" "c" "c" "a")))
+  (println (count u))           ; 3
+
+  ;; frequencies (uses hash maps)
+  (let f (frequencies (vector "x" "x" "y" "y" "y" "z")))
+  (println (hash-get f "x"))   ; 2
+  (println (hash-get f "y"))   ; 3
+  (println (hash-get f "z"))   ; 1
+
+  0)

@@ -1,0 +1,27 @@
+;;; Test: Polish features — volatile, struct attributes, exports
+
+;; Volatile type annotation
+(defn test-volatile [] :void
+  (let-mut flag :volatile-int 0)
+  (set! flag 42)
+  (printf "volatile: %d\n" flag))
+
+;; Packed struct with attribute
+(struct "__attribute__((packed))" PackedHeader [magic :u32, size :u16, flags :u8])
+
+;; Regular struct for comparison
+(struct AlignedVec [x :float, y :float, z :float, w :float])
+
+(defn test-packed [] :void
+  ;; packed: 4 + 2 + 1 = 7 bytes (no padding)
+  (printf "packed size: %d\n" (cast :int (sizeof PackedHeader)))
+  ;; aligned: 4*4 = 16 bytes
+  (printf "aligned size: %d\n" (cast :int (sizeof AlignedVec))))
+
+;; Export form (no runtime effect, just metadata for emit-header)
+(export test-volatile test-packed)
+
+(defn main [] :int
+  (test-volatile)
+  (test-packed)
+  0)

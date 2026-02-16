@@ -1,0 +1,64 @@
+;;; Test: HOFs (for-each, map, filter, reduce) and struct destructuring in match
+
+;; --- Struct destructuring in match ---
+
+(struct Point [x :int, y :int])
+
+(defn point-sum [p :Point] :int
+  (match p
+    ((Point x y) (+ x y))))
+
+;; Struct in union via deftype
+(struct Circle [radius :int])
+(struct Rect [w :int, h :int])
+(deftype Shape (:union (:struct Circle) (:struct Rect)))
+
+(defn area [s :Shape] :int
+  (match s
+    ((Circle r) (* r r))
+    ((Rect w h) (* w h))))
+
+;; Struct destructuring with wildcard field
+(defn get-x [p :Point] :int
+  (match p
+    ((Point x _) x)))
+
+;; --- HOFs on vectors ---
+
+(defn double [x :int] :int (* x 2))
+(defn is-even [x :int] :int (== (% x 2) 0))
+(defn add [a :int, b :int] :int (+ a b))
+
+(defn main [] :int
+  ;; Struct destructuring (direct struct)
+  (let p (Point 3 4))
+  (println (point-sum p))  ;; 7
+  (println (get-x p))      ;; 3
+
+  ;; Struct destructuring (union)
+  (let c (Shape-from-Circle (Circle 5)))
+  (let r (Shape-from-Rect (Rect 3 4)))
+  (println (area c))  ;; 25
+  (println (area r))  ;; 12
+
+  ;; for-each
+  (let v (vector 10 20 30))
+  (for-each [x v]
+    (println x))  ;; 10 20 30
+
+  ;; map
+  (let doubled (map double v))
+  (for-each [x doubled]
+    (println x))  ;; 20 40 60
+
+  ;; filter
+  (let nums (vector 1 2 3 4 5 6))
+  (let evens (filter is-even nums))
+  (for-each [x evens]
+    (println x))  ;; 2 4 6
+
+  ;; reduce
+  (let sum (reduce add 0 v))
+  (println sum)  ;; 60
+
+  0)

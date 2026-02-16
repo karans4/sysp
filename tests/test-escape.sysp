@@ -1,0 +1,23 @@
+;;; Test: Escape analysis — non-escaping (new ...) should stack-allocate
+
+(struct Vec3 [x :float, y :float, z :float])
+
+;; Non-escaping: p is only used locally via get
+(defn test-local [] :float
+  (let p (new Vec3 1.0 2.0 3.0))
+  (let sum (+ (get p x) (get p y)))
+  (+ sum (get p z)))
+
+;; Non-escaping: used in computation only
+(defn dot [a :float, b :float, c :float, d :float, e :float, f :float] :float
+  (let v1 (new Vec3 a b c))
+  (let v2 (new Vec3 d e f))
+  (let xy (+ (* (get v1 x) (get v2 x)) (* (get v1 y) (get v2 y))))
+  (+ xy (* (get v1 z) (get v2 z))))
+
+(defn main [] :int
+  ;; test-local: 1+2+3 = 6
+  (printf "local: %.1f\n" (test-local))
+  ;; dot product: 1*4 + 2*5 + 3*6 = 4+10+18 = 32
+  (printf "dot: %.1f\n" (dot 1.0 2.0 3.0 4.0 5.0 6.0))
+  0)

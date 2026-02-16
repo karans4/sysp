@@ -1,0 +1,33 @@
+;; Test spawn/await threading primitives
+
+(defn fib [n :int] :int
+  (if (<= n 1) n (+ (fib (- n 1)) (fib (- n 2)))))
+
+(defn test-basic-spawn [] :int
+  (let f (spawn (fib 20)))
+  (await f))
+
+(defn test-two-threads [] :int
+  (let a (spawn (fib 15)))
+  (let b (spawn (fib 16)))
+  (+ (await a) (await b)))
+
+(defn test-capture-spawn [] :int
+  (let x 10)
+  (let f (spawn (+ x 32)))
+  (await f))
+
+(defn sysp_main [] :int
+  (if (== (test-basic-spawn) 6765)
+    (println "PASS test-basic-spawn")
+    (println "FAIL test-basic-spawn"))
+
+  (if (== (test-two-threads) 1597)
+    (println "PASS test-two-threads")
+    (println "FAIL test-two-threads"))
+
+  (if (== (test-capture-spawn) 42)
+    (println "PASS test-capture-spawn")
+    (println "FAIL test-capture-spawn"))
+
+  0)

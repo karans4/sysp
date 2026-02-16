@@ -25,6 +25,7 @@
 (defun make-vector-type (elem-type) `(:vector ,elem-type))
 (defun make-tuple-type (elem-types) `(:tuple ,@elem-types))
 (defun make-array-type (elem-type size) `(:array ,elem-type ,size))
+(defun make-hashmap-type (key-type val-type) `(:hashmap ,key-type ,val-type))
 (defun make-rc-type (inner) `(:rc ,inner))
 (defun rc-type-p (tp) (and (consp tp) (eq (car tp) :rc)))
 (defun rc-inner-type (tp) (second tp))
@@ -355,6 +356,50 @@
       ;; tuple-ref: we can't statically know which element without evaluating index
       ((sym= head "tuple-ref")
        (make-tvar))
+
+      ;; hash-map: result is (:hashmap K V)
+      ((sym= head "hash-map")
+       (if (null (cdr form))
+           (make-hashmap-type :str :int)  ; empty map defaults to str->int
+           (let ((key-type (infer-expr (second form)))
+                 (val-type (infer-expr (third form))))
+             ;; Infer remaining pairs too
+             (loop for (k v) on (cdddr form) by #'cddr
+                   when k do (unify key-type (infer-expr k))
+                   when v do (unify val-type (infer-expr v)))
+             (make-hashmap-type key-type val-type))))
+
+      ;; hash-get: returns val type
+      ((sym= head "hash-get")
+       (let ((mt (infer-expr (second form))))
+         (infer-expr (third form))
+         (if (eq (type-kind mt) :hashmap) (third mt) (make-tvar))))
+
+      ;; hash-set!: void
+      ((sym= head "hash-set!")
+       (dolist (e (cdr form)) (infer-expr e)) :void)
+
+      ;; hash-has?: bool
+      ((sym= head "hash-has?")
+       (dolist (e (cdr form)) (infer-expr e)) :bool)
+
+      ;; hash-del!: void
+      ((sym= head "hash-del!")
+       (dolist (e (cdr form)) (infer-expr e)) :void)
+
+      ;; hash-len: int
+      ((sym= head "hash-len")
+       (infer-expr (second form)) :int)
+
+      ;; hash-keys: (:vector K)
+      ((sym= head "hash-keys")
+       (let ((mt (infer-expr (second form))))
+         (if (eq (type-kind mt) :hashmap) (make-vector-type (second mt)) (make-vector-type (make-tvar)))))
+
+      ;; hash-vals: (:vector V)
+      ((sym= head "hash-vals")
+       (let ((mt (infer-expr (second form))))
+         (if (eq (type-kind mt) :hashmap) (make-vector-type (third mt)) (make-vector-type (make-tvar)))))
 
       ;; lambda: parse param types, infer body
       ((sym= head "lambda")
@@ -694,8 +739,9 @@
          (infer-defn form))
         ((sym= (first form) "struct")
          ;; Register struct constructor as a function type
-         (let* ((name (string (second form)))
-                (fields-raw (third form))
+         (let* ((has-attr (stringp (second form)))
+                (name (string (if has-attr (third form) (second form))))
+                (fields-raw (if has-attr (fourth form) (third form)))
                 (field-types nil))
            (let ((lst (if (listp fields-raw) (copy-list fields-raw) nil)))
              (loop while lst do
@@ -728,7 +774,9 @@
          ;; Register extern variable type
          (let* ((name (string (second form)))
                 (tp (parse-type-annotation (third form))))
-           (infer-env-bind name tp)))))))
+           (infer-env-bind name tp)))
+        ;; export — no inference needed
+        ((sym= (first form) "export") nil)))))
 
 ;;; === Environment ===
 
@@ -737,7 +785,8 @@
   (parent nil)
   (releases nil)  ; list of C variable names needing val_release at scope exit
   (mutables nil)  ; list of mutable variable names (from let-mut)
-  (rc-releases nil)) ; list of (c-name . inner-type) for RC release at scope exit
+  (rc-releases nil)  ; list of (c-name . inner-type) for RC release at scope exit
+  (data-releases nil)) ; list of (c-name . kind) for vector/hashmap free at scope exit
 
 (defun env-lookup (env name)
   (if (null env) nil
@@ -784,6 +833,24 @@
               (format nil "  _rc_~a_release(&~a);" (mangle-type-name inner-type) c-name)))
           (env-rc-releases env)))
 
+(defun env-add-data-release (env c-name kind)
+  "Record a vector or hashmap for data release at scope exit.
+   kind is :vector or :hashmap."
+  (push (cons c-name kind) (env-data-releases env)))
+
+(defun emit-data-releases (env)
+  "Generate free() calls for vector/hashmap internal data at scope exit.
+   Vectors: only free if cap > 0 (cap=0 means stack-allocated compound literal)."
+  (mapcan (lambda (entry)
+            (let ((c-name (car entry))
+                  (kind (cdr entry)))
+              (case kind
+                (:vector (list (format nil "  if (~a.cap > 0) free(~a.data);" c-name c-name)))
+                (:hashmap (list (format nil "  free(~a.keys); free(~a.vals); free(~a.occ);"
+                                        c-name c-name c-name)))
+                (otherwise nil))))
+          (env-data-releases env)))
+
 ;;; === Global State ===
 
 (defvar *structs* (make-hash-table :test 'equal))
@@ -802,6 +869,7 @@
 (defvar *includes* nil)         ; extra #includes
 (defvar *macros* (make-hash-table :test 'equal))  ; name -> expander function
 (defvar *current-fn-name* nil)  ; for recur: name of function being compiled
+(defvar *current-let-target* nil)  ; for escape analysis: name of let variable being initialized
 (defvar *current-fn-params* nil) ; for recur: param names of current function
 (defvar *symbol-table* (make-hash-table :test 'equal))  ; name -> integer ID
 (defvar *symbol-counter* 0)
@@ -818,11 +886,15 @@
 (defvar *env-counter* 0)  ; counter for closure env structs
 (defvar *interp-gensym-counter* 0)
 (defvar *spawn-counter* 0)    ; counter for spawn sites
+(defvar *uses-hashmap* nil)   ; emit hash function preamble if true
 (defvar *uses-threads* nil)   ; emit #include <pthread.h> if true
 (defvar *restart-counter* 0)  ; counter for restart-case sites
 (defvar *handler-counter* 0)  ; counter for handler-bind sites
 (defvar *handler-wrap-counter* 0) ; counter for handler wrapper functions
-(defvar *uses-conditions* nil) ; emit condition system preamble if true
+(defvar *uses-conditions* nil)
+(defvar *exports* nil)  ; hash table of exported names, nil = export all
+(defvar *escape-info* (make-hash-table :test 'equal))  ; "fn.var" -> :local or :escapes
+(defvar *current-escape-fn* nil)  ; fn name during escape analysis ; emit condition system preamble if true
 
 (defun intern-symbol (name)
   "Get or assign an integer ID for a named symbol"
@@ -1251,13 +1323,23 @@
     (setf *included-files* (make-hash-table :test 'equal))
     (setf (gethash abs-in *included-files*) t)
     (setf forms (expand-uses forms base-dir))
+    ;; Collect export declarations (if any)
+    (let ((exports nil))
+      (dolist (form forms)
+        (when (and (listp form) (sym= (first form) "export"))
+          (unless exports
+            (setf exports (make-hash-table :test 'equal)))
+          (dolist (name (rest form))
+            (setf (gethash (string name) exports) t))))
     (with-open-file (out out-path :direction :output :if-exists :supersede)
-      (format out ";; ~a — auto-generated header~%" (file-namestring out-path))
+      (format out ";; ~a -- auto-generated header~%" (file-namestring out-path))
       (format out ";; Source: ~a~%~%" (file-namestring in-path))
       (dolist (form forms)
         (when (listp form)
           (let ((head (first form)))
             (cond
+              ;; export — skip (metadata, not code)
+              ((sym= head "export") nil)
               ;; struct/deftype/enum — verbatim
               ((or (sym= head "struct") (sym= head "deftype") (sym= head "enum"))
                (format out "~a~%" (serialize-form form)))
@@ -1273,15 +1355,16 @@
               ;; extern / extern-var — verbatim
               ((or (sym= head "extern") (sym= head "extern-var"))
                (format out "~a~%" (serialize-form form)))
-              ;; defn — check if private (starts with _), poly, or normal
+              ;; defn — check exports, private prefix, poly/mono
               ((sym= head "defn")
                (let ((name (string (second form))))
-                 (unless (and (> (length name) 0) (char= (char name 0) #\_))
-                   ;; Private functions skipped
+                 ;; Skip if exports list exists and name not in it
+                 (unless (or (and exports (not (gethash name exports)))
+                             (and (> (length name) 0) (char= (char name 0) #\_)))
                    (if (defn-is-poly-p form)
                        ;; Poly: emit verbatim (needs body for monomorphization)
                        (format out "~a~%" (serialize-form form))
-                       ;; Mono: strip body → extern
+                       ;; Mono: strip body -> extern
                        (let* ((params (third form))
                               (rest (cdddr form))
                               (ret-kw (when (keywordp (first rest)) (first rest))))
@@ -1294,14 +1377,14 @@
               ;; c-decl — skip (raw C, not part of sysp API)
               ((sym= head "c-decl") nil)
               ;; use — skip (already expanded)
-              ((sym= head "use") nil))))))))
+              ((sym= head "use") nil)))))))))
 
 ;;; === Macro System ===
 
 (defun macroexpand-1-sysp (form)
   "Expand one macro call. Returns (values expanded-form expanded-p)"
   (if (and (listp form) (symbolp (first form)))
-      (let ((expander (gethash (string (first form)) *macros*)))
+      (let ((expander (gethash (string-downcase (string (first form))) *macros*)))
         (if expander
             (values (funcall expander form) t)
             (values form nil)))
@@ -1365,7 +1448,336 @@
   ;; dec!: (dec! x) => (set! x (- x 1))
   (setf (gethash "dec!" *macros*)
         (lambda (form)
-          (list 'set! (second form) (list '- (second form) 1)))))
+          (list 'set! (second form) (list '- (second form) 1))))
+  ;; for-each: (for-each [x vec] body...) => (for [_i 0 (vector-len vec)] (let x (vector-ref vec _i)) body...)
+  (setf (gethash "for-each" *macros*)
+        (lambda (form)
+          (let* ((spec (second form))
+                 (var (first spec))
+                 (collection (second spec))
+                 (body (cddr form))
+                 (idx (intern (format nil "_fe~d" (incf *sysp-gensym-counter*)))))
+            (list 'do
+                  (list* 'for (list idx 0 (list 'vector-len collection))
+                         (cons (list 'let var (list 'vector-ref collection idx))
+                               body))))))
+  ;; map: (map f vec) => (do (let-mut _mN (vector)) (for [...] (vector-push! _mN (f (vector-ref vec _i)))) _mN)
+  (setf (gethash "map" *macros*)
+        (lambda (form)
+          (let* ((f (second form))
+                 (vec (third form))
+                 (result (intern (format nil "_mr~d" (incf *sysp-gensym-counter*))))
+                 (idx (intern (format nil "_mi~d" (incf *sysp-gensym-counter*)))))
+            (list 'do
+                  (list 'let-mut result (list 'vector))
+                  (list 'for (list idx 0 (list 'vector-len vec))
+                        (list 'vector-push! result (list f (list 'vector-ref vec idx))))
+                  result))))
+  ;; filter: (filter pred vec) => (do (let-mut _fN (vector)) (for [...] (let _fe ..) (when (pred _fe) (vector-push! ...))) _fN)
+  (setf (gethash "filter" *macros*)
+        (lambda (form)
+          (let* ((pred (second form))
+                 (vec (third form))
+                 (result (intern (format nil "_fr~d" (incf *sysp-gensym-counter*))))
+                 (idx (intern (format nil "_fi~d" (incf *sysp-gensym-counter*))))
+                 (elem (intern (format nil "_fe~d" (incf *sysp-gensym-counter*)))))
+            (list 'do
+                  (list 'let-mut result (list 'vector))
+                  (list 'for (list idx 0 (list 'vector-len vec))
+                        (list 'let elem (list 'vector-ref vec idx))
+                        (list 'when (list pred elem)
+                              (list 'vector-push! result elem)))
+                  result))))
+  ;; keep: alias for filter
+  (setf (gethash "keep" *macros*) (gethash "filter" *macros*))
+  ;; reduce: (reduce f init vec) => (do (let-mut _rN init) (for [...] (set! _rN (f _rN (vector-ref vec _i)))) _rN)
+  (setf (gethash "reduce" *macros*)
+        (lambda (form)
+          (let* ((f (second form))
+                 (init (third form))
+                 (vec (fourth form))
+                 (acc (intern (format nil "_ra~d" (incf *sysp-gensym-counter*))))
+                 (idx (intern (format nil "_ri~d" (incf *sysp-gensym-counter*)))))
+            (list 'do
+                  (list 'let-mut acc init)
+                  (list 'for (list idx 0 (list 'vector-len vec))
+                        (list 'set! acc (list f acc (list 'vector-ref vec idx))))
+                  acc))))
+  ;; === Clojure-style aliases for hash maps ===
+  ;; assoc!: (assoc! m k v) => (hash-set! m k v)
+  (setf (gethash "assoc!" *macros*)
+        (lambda (form)
+          (list 'hash-set! (second form) (third form) (fourth form))))
+  ;; dissoc!: (dissoc! m k) => (hash-del! m k)
+  (setf (gethash "dissoc!" *macros*)
+        (lambda (form)
+          (list 'hash-del! (second form) (third form))))
+  ;; contains?: (contains? m k) => (hash-has? m k)
+  (setf (gethash "contains?" *macros*)
+        (lambda (form)
+          (list 'hash-has? (second form) (third form))))
+  ;; merge!: capture keys once, iterate, free temp vector
+  (setf (gethash "merge!" *macros*)
+        (lambda (form)
+          (let ((k (intern (format nil "_mk~d" (incf *sysp-gensym-counter*))))
+                (kv (intern (format nil "_mkv~d" (incf *sysp-gensym-counter*))))
+                (idx (intern (format nil "_mi~d" (incf *sysp-gensym-counter*)))))
+            (list 'do
+                  (list 'let kv (list 'hash-keys (third form)))
+                  (list 'for (list idx 0 (list 'vector-len kv))
+                        (list 'let k (list 'vector-ref kv idx))
+                        (list 'hash-set! (second form) k (list 'hash-get (third form) k)))))))
+
+  ;; === Clojure-style collection predicates ===
+  ;; some: (some pred vec) => (do (let-mut _r 0) (for [_i 0 (vector-len vec)] (when (pred (vector-ref vec _i)) (set! _r 1) (break))) _r)
+  (setf (gethash "some" *macros*)
+        (lambda (form)
+          (let* ((pred (second form))
+                 (vec (third form))
+                 (sv (intern (format nil "_sv~d" (incf *sysp-gensym-counter*))))
+                 (r (intern (format nil "_sr~d" (incf *sysp-gensym-counter*))))
+                 (idx (intern (format nil "_si~d" (incf *sysp-gensym-counter*)))))
+            (list 'do
+                  (list 'let sv vec)
+                  (list 'let-mut r 0)
+                  (list 'for (list idx 0 (list 'vector-len sv))
+                        (list 'when (list pred (list 'vector-ref sv idx))
+                              (list 'set! r 1)
+                              '(break)))
+                  r))))
+  ;; every?: (every? pred vec) => (do (let-mut _r 1) (for [...] (when (not (pred el)) (set! _r 0) (break))) _r)
+  (setf (gethash "every?" *macros*)
+        (lambda (form)
+          (let* ((pred (second form))
+                 (vec (third form))
+                 (ev (intern (format nil "_ev~d" (incf *sysp-gensym-counter*))))
+                 (r (intern (format nil "_er~d" (incf *sysp-gensym-counter*))))
+                 (idx (intern (format nil "_ei~d" (incf *sysp-gensym-counter*)))))
+            (list 'do
+                  (list 'let ev vec)
+                  (list 'let-mut r 1)
+                  (list 'for (list idx 0 (list 'vector-len ev))
+                        (list 'when (list 'not (list pred (list 'vector-ref ev idx)))
+                              (list 'set! r 0)
+                              '(break)))
+                  r))))
+  ;; not-any?: (not-any? pred vec) => (not (some pred vec))
+  (setf (gethash "not-any?" *macros*)
+        (lambda (form)
+          (list 'not (list 'some (second form) (third form)))))
+  ;; not-every?: (not-every? pred vec) => (not (every? pred vec))
+  (setf (gethash "not-every?" *macros*)
+        (lambda (form)
+          (list 'not (list 'every? (second form) (third form)))))
+
+  ;; === Selection macros ===
+  ;; remove: like filter but inverted predicate
+  (setf (gethash "remove" *macros*)
+        (lambda (form)
+          (let* ((pred (second form))
+                 (vec (third form))
+                 (rv (intern (format nil "_rv~d" (incf *sysp-gensym-counter*))))
+                 (result (intern (format nil "_rr~d" (incf *sysp-gensym-counter*))))
+                 (idx (intern (format nil "_ri~d" (incf *sysp-gensym-counter*))))
+                 (elem (intern (format nil "_re~d" (incf *sysp-gensym-counter*)))))
+            (list 'do
+                  (list 'let rv vec)
+                  (list 'let-mut result (list 'vector))
+                  (list 'for (list idx 0 (list 'vector-len rv))
+                        (list 'let elem (list 'vector-ref rv idx))
+                        (list 'when (list 'not (list pred elem))
+                              (list 'vector-push! result elem)))
+                  result))))
+  ;; take: (take n vec)
+  (setf (gethash "take" *macros*)
+        (lambda (form)
+          (let* ((n (second form))
+                 (vec (third form))
+                 (tv (intern (format nil "_tv~d" (incf *sysp-gensym-counter*))))
+                 (result (intern (format nil "_tr~d" (incf *sysp-gensym-counter*))))
+                 (idx (intern (format nil "_ti~d" (incf *sysp-gensym-counter*))))
+                 (lim (intern (format nil "_tl~d" (incf *sysp-gensym-counter*)))))
+            (list 'do
+                  (list 'let tv vec)
+                  (list 'let-mut result (list 'vector))
+                  (list 'let lim (list 'if (list '< n (list 'vector-len tv)) n (list 'vector-len tv)))
+                  (list 'for (list idx 0 lim)
+                        (list 'vector-push! result (list 'vector-ref tv idx)))
+                  result))))
+  ;; drop: (drop n vec)
+  (setf (gethash "drop" *macros*)
+        (lambda (form)
+          (let* ((n (second form))
+                 (vec (third form))
+                 (dv (intern (format nil "_dv~d" (incf *sysp-gensym-counter*))))
+                 (result (intern (format nil "_dr~d" (incf *sysp-gensym-counter*))))
+                 (idx (intern (format nil "_di~d" (incf *sysp-gensym-counter*)))))
+            (list 'do
+                  (list 'let dv vec)
+                  (list 'let-mut result (list 'vector))
+                  (list 'for (list idx n (list 'vector-len dv))
+                        (list 'vector-push! result (list 'vector-ref dv idx)))
+                  result))))
+  ;; take-while: (take-while pred vec)
+  (setf (gethash "take-while" *macros*)
+        (lambda (form)
+          (let* ((pred (second form))
+                 (vec (third form))
+                 (twv (intern (format nil "_twv~d" (incf *sysp-gensym-counter*))))
+                 (result (intern (format nil "_twr~d" (incf *sysp-gensym-counter*))))
+                 (idx (intern (format nil "_twi~d" (incf *sysp-gensym-counter*))))
+                 (elem (intern (format nil "_twe~d" (incf *sysp-gensym-counter*)))))
+            (list 'do
+                  (list 'let twv vec)
+                  (list 'let-mut result (list 'vector))
+                  (list 'for (list idx 0 (list 'vector-len twv))
+                        (list 'let elem (list 'vector-ref twv idx))
+                        (list 'when (list 'not (list pred elem))
+                              '(break))
+                        (list 'vector-push! result elem))
+                  result))))
+  ;; drop-while: (drop-while pred vec)
+  (setf (gethash "drop-while" *macros*)
+        (lambda (form)
+          (let* ((pred (second form))
+                 (vec (third form))
+                 (dwv (intern (format nil "_dwv~d" (incf *sysp-gensym-counter*))))
+                 (result (intern (format nil "_dwr~d" (incf *sysp-gensym-counter*))))
+                 (idx (intern (format nil "_dwi~d" (incf *sysp-gensym-counter*))))
+                 (dropping (intern (format nil "_dwd~d" (incf *sysp-gensym-counter*)))))
+            (list 'do
+                  (list 'let dwv vec)
+                  (list 'let-mut result (list 'vector))
+                  (list 'let-mut dropping 1)
+                  (list 'for (list idx 0 (list 'vector-len dwv))
+                        (list 'when (list 'and dropping (list 'not (list pred (list 'vector-ref dwv idx))))
+                              (list 'set! dropping 0))
+                        (list 'when (list 'not dropping)
+                              (list 'vector-push! result (list 'vector-ref dwv idx))))
+                  result))))
+
+  ;; === Construction macros ===
+  ;; range: (range n) or (range start end)
+  (setf (gethash "range" *macros*)
+        (lambda (form)
+          (let* ((result (intern (format nil "_rng~d" (incf *sysp-gensym-counter*))))
+                 (idx (intern (format nil "_ri~d" (incf *sysp-gensym-counter*)))))
+            (if (= (length form) 2)
+                ;; (range n) => 0..n
+                (list 'do
+                      (list 'let-mut result (list 'vector))
+                      (list 'for (list idx 0 (second form))
+                            (list 'vector-push! result idx))
+                      result)
+                ;; (range start end) => start..end
+                (list 'do
+                      (list 'let-mut result (list 'vector))
+                      (list 'for (list idx (second form) (third form))
+                            (list 'vector-push! result idx))
+                      result)))))
+  ;; repeat: (repeat n val)
+  (setf (gethash "repeat" *macros*)
+        (lambda (form)
+          (let* ((n (second form))
+                 (val (third form))
+                 (result (intern (format nil "_rp~d" (incf *sysp-gensym-counter*))))
+                 (idx (intern (format nil "_rpi~d" (incf *sysp-gensym-counter*)))))
+            (list 'do
+                  (list 'let-mut result (list 'vector))
+                  (list 'for (list idx 0 n)
+                        (list 'vector-push! result val))
+                  result))))
+  ;; reverse: (reverse vec)
+  (setf (gethash "reverse" *macros*)
+        (lambda (form)
+          (let* ((vec (second form))
+                 (rvv (intern (format nil "_rvv~d" (incf *sysp-gensym-counter*))))
+                 (result (intern (format nil "_rv~d" (incf *sysp-gensym-counter*))))
+                 (idx (intern (format nil "_rvi~d" (incf *sysp-gensym-counter*))))
+                 (ln (intern (format nil "_rvl~d" (incf *sysp-gensym-counter*)))))
+            (list 'do
+                  (list 'let rvv vec)
+                  (list 'let-mut result (list 'vector))
+                  (list 'let ln (list 'vector-len rvv))
+                  (list 'for (list idx 0 ln)
+                        (list 'vector-push! result (list 'vector-ref rvv (list '- (list '- ln 1) idx))))
+                  result))))
+  ;; concat: (concat v1 v2)
+  (setf (gethash "concat" *macros*)
+        (lambda (form)
+          (let* ((v1 (second form))
+                 (v2 (third form))
+                 (cv1 (intern (format nil "_cv1~d" (incf *sysp-gensym-counter*))))
+                 (cv2 (intern (format nil "_cv2~d" (incf *sysp-gensym-counter*))))
+                 (result (intern (format nil "_cc~d" (incf *sysp-gensym-counter*))))
+                 (idx (intern (format nil "_ci~d" (incf *sysp-gensym-counter*)))))
+            (list 'do
+                  (list 'let cv1 v1)
+                  (list 'let cv2 v2)
+                  (list 'let-mut result (list 'vector))
+                  (list 'for (list idx 0 (list 'vector-len cv1))
+                        (list 'vector-push! result (list 'vector-ref cv1 idx)))
+                  (list 'for (list idx 0 (list 'vector-len cv2))
+                        (list 'vector-push! result (list 'vector-ref cv2 idx)))
+                  result))))
+
+  ;; === Access macros ===
+  ;; first: (first vec) => (vector-ref vec 0)
+  (setf (gethash "first" *macros*)
+        (lambda (form) (list 'vector-ref (second form) 0)))
+  ;; last: (last vec) => (vector-ref vec (- (vector-len vec) 1))
+  (setf (gethash "last" *macros*)
+        (lambda (form) (list 'vector-ref (second form) (list '- (list 'vector-len (second form)) 1))))
+  ;; nth: (nth vec i) => (vector-ref vec i)
+  (setf (gethash "nth" *macros*)
+        (lambda (form) (list 'vector-ref (second form) (third form))))
+  ;; count: (count vec) => (vector-len vec)
+  (setf (gethash "count" *macros*)
+        (lambda (form) (list 'vector-len (second form))))
+  ;; empty?: (empty? vec) => (== (vector-len vec) 0)
+  (setf (gethash "empty?" *macros*)
+        (lambda (form) (list '== (list 'vector-len (second form)) 0)))
+
+  ;; === Hash-map dependent collection macros ===
+  ;; distinct: (distinct vec) => use hash-map as seen set
+  ;; Note: generates hash-set! with first element to establish type, then loops
+  (setf (gethash "distinct" *macros*)
+        (lambda (form)
+          (let* ((vec (second form))
+                 (result (intern (format nil "_dsr~d" (incf *sysp-gensym-counter*))))
+                 (seen (intern (format nil "_dss~d" (incf *sysp-gensym-counter*))))
+                 (idx (intern (format nil "_dsi~d" (incf *sysp-gensym-counter*))))
+                 (elem (intern (format nil "_dse~d" (incf *sysp-gensym-counter*))))
+                 (vref (intern (format nil "_dsv~d" (incf *sysp-gensym-counter*)))))
+            ;; Use hash-map with first element to establish type
+            (list 'do
+                  (list 'let vref vec)
+                  (list 'let-mut result (list 'vector (list 'vector-ref vref 0)))
+                  (list 'let-mut seen (list 'hash-map (list 'vector-ref vref 0) 1))
+                  (list 'for (list idx 1 (list 'vector-len vref))
+                        (list 'let elem (list 'vector-ref vref idx))
+                        (list 'when (list 'not (list 'hash-has? seen elem))
+                              (list 'hash-set! seen elem 1)
+                              (list 'vector-push! result elem)))
+                  result))))
+  ;; frequencies: (frequencies vec) => hash-map counting occurrences
+  ;; Uses hash-map with first element to establish type
+  (setf (gethash "frequencies" *macros*)
+        (lambda (form)
+          (let* ((vec (second form))
+                 (m (intern (format nil "_fqm~d" (incf *sysp-gensym-counter*))))
+                 (idx (intern (format nil "_fqi~d" (incf *sysp-gensym-counter*))))
+                 (elem (intern (format nil "_fqe~d" (incf *sysp-gensym-counter*))))
+                 (vref (intern (format nil "_fqv~d" (incf *sysp-gensym-counter*)))))
+            (list 'do
+                  (list 'let vref vec)
+                  (list 'let-mut m (list 'hash-map (list 'vector-ref vref 0) 1))
+                  (list 'for (list idx 1 (list 'vector-len vref))
+                        (list 'let elem (list 'vector-ref vref idx))
+                        (list 'if (list 'hash-has? m elem)
+                              (list 'hash-set! m elem (list '+ (list 'hash-get m elem) 1))
+                              (list 'hash-set! m elem 1)))
+                  m)))))
 
 (install-builtin-macros)
 
@@ -1394,9 +1806,13 @@
                                                  (parse-type-expr (third form))))
          ((string= head "array") (make-array-type (parse-type-expr (second form)) (third form)))
          ((string= head "vector") (make-vector-type (parse-type-expr (second form))))
+         ((string= head "hashmap") (make-hashmap-type (parse-type-expr (second form))
+                                                       (parse-type-expr (third form))))
          ((string= head "list") (make-list-type (parse-type-expr (second form))))
          ((string= head "tuple") (make-tuple-type (mapcar #'parse-type-expr (rest form))))
          ((string= head "union") `(:union ,@(mapcar #'parse-type-expr (rest form))))
+         ((string= head "struct") (make-struct-type (string (second form))))
+         ((string= head "enum") `(:enum ,(string (second form))))
          (t form))))
     (t form)))
 
@@ -1421,6 +1837,10 @@
       (prim prim)
       ;; Polymorphic type variable: :? means "infer at call site"
       ((string= name "?") :poly)
+      ;; Volatile shorthand: :volatile-int, :volatile-ptr-int, etc.
+      ((and (> (length name) 9) (string= (subseq name 0 9) "volatile-"))
+       `(:volatile ,(parse-type-annotation
+                     (intern (subseq (symbol-name sym) 9) :keyword))))
       ;; Pointer shorthand: :ptr-int, :ptr-float, etc.
       ((and (> (length name) 4) (string= (subseq name 0 4) "ptr-"))
        ;; Use original symbol-name suffix to preserve case for struct names
@@ -1480,6 +1900,7 @@
     (:enum (second tp))
     (:array (type-to-c (second tp)))  ; array decl handled specially
     (:vector (vector-type-c-name tp))
+    (:hashmap (hashmap-type-c-name tp))
     (:tuple (tuple-type-c-name tp))
     (:fn (fn-type-c-name tp))
     (:symbol "Symbol")
@@ -1489,6 +1910,7 @@
     (:list "Value")  ; lists are also Values (tagged cons chain)
     (:variadic "Value")  ; variadic rest compiles to Value at runtime
     (:union (union-type-c-name tp))
+    (:volatile (format nil "volatile ~a" (type-to-c (second tp))))
     (:rc (format nil "_RC_~a*" (type-to-c (rc-inner-type tp))))
     (:future (format nil "_spawn_~a*" (third tp)))  ; (:future T spawn-id) → _spawn_N*
     (otherwise "int")))
@@ -1528,6 +1950,7 @@
     (:array (format nil "arr_~a_~a" (mangle-type-name (second tp))
                     (third tp)))
     (:vector (vector-type-c-name tp))
+    (:hashmap (hashmap-type-c-name tp))
     (:tuple (tuple-type-c-name tp))
     (:fn (fn-type-c-name tp))
     (:list (format nil "list_~a" (mangle-type-name (second tp))))
@@ -1544,6 +1967,13 @@
   (let* ((elem (second tp))
          (name (format nil "Vector_~a" (mangle-type-name elem))))
     (ensure-vector-type name elem)
+    name))
+
+(defun hashmap-type-c-name (tp)
+  (let* ((key-type (second tp))
+         (val-type (third tp))
+         (name (format nil "HashMap_~a_~a" (mangle-type-name key-type) (mangle-type-name val-type))))
+    (ensure-hashmap-type name key-type val-type)
     name))
 
 (defun tuple-type-c-name (tp)
@@ -1578,6 +2008,102 @@
                         collect (format nil "  ~a _~d;" (type-to-c tp) i))))
       (push (format nil "typedef struct {~%~{~a~%~}} ~a;~%" fields name)
             *type-decls*))))
+
+(defun ensure-hashmap-type (name key-type val-type)
+  "Generate C struct + helpers for a hash map type (open addressing, linear probing)."
+  (unless (gethash name *generated-types*)
+    (setf (gethash name *generated-types*) t)
+    (setf *uses-hashmap* t)
+    (let* ((ck (type-to-c key-type))
+           (cv (type-to-c val-type))
+           (mk (mangle-type-name key-type))
+           (mv (mangle-type-name val-type))
+           (is-str-key (eq key-type :str))
+           ;; Ensure vector types for keys/vals
+           (vec-k-name (vector-type-c-name (make-vector-type key-type)))
+           (vec-v-name (vector-type-c-name (make-vector-type val-type)))
+           (push-k-name (format nil "sysp_vecpush_~a" mk))
+           (push-v-name (format nil "sysp_vecpush_~a" mv)))
+      ;; Ensure vector push helpers for keys/vals
+      (ensure-vector-push-helper push-k-name vec-k-name ck)
+      (ensure-vector-push-helper push-v-name vec-v-name cv)
+      ;; Struct: { keys, vals, occ, len, cap }
+      (push (format nil "typedef struct { ~a* keys; ~a* vals; char* occ; int len; int cap; } ~a;~%"
+                    ck cv name)
+            *type-decls*)
+      ;; key comparison expression
+      (let ((key-eq (if is-str-key
+                        "strcmp(m->keys[h], key) == 0"
+                        "m->keys[h] == key"))
+            (hash-call (if is-str-key
+                           "_sysp_hash_str(key)"
+                           (format nil "_sysp_hash_int(*(unsigned int*)&key)"))))
+        ;; grow helper
+        (push (format nil "static void _hm_grow_~a_~a(~a* m) {
+  int oc = m->cap; ~a* ok = m->keys; ~a* ov = m->vals; char* oo = m->occ;
+  m->cap = oc ? oc * 2 : 8; m->len = 0;
+  m->keys = calloc(m->cap, sizeof(~a)); m->vals = calloc(m->cap, sizeof(~a));
+  m->occ = calloc(m->cap, 1);
+  for (int i = 0; i < oc; i++) { if (oo[i] == 1) { unsigned int h = ~a % m->cap;~a while (m->occ[h]) h = (h + 1) % m->cap; m->keys[h] = ok[i]; m->vals[h] = ov[i]; m->occ[h] = 1; m->len++; } }
+  free(ok); free(ov); free(oo);
+}~%"
+                      mk mv name ck cv ck cv
+                      ;; hash the OLD key during rehash
+                      (if is-str-key "_sysp_hash_str(ok[i])" (format nil "_sysp_hash_int(*(unsigned int*)&ok[i])"))
+                      ;; for str keys during rehash, no extra step needed; hash already computed above
+                      "")
+              *functions*)
+        ;; set helper
+        (push (format nil "static void _hm_set_~a_~a(~a* m, ~a key, ~a val) {
+  if (m->len * 4 >= m->cap * 3) _hm_grow_~a_~a(m);
+  unsigned int h = ~a % m->cap;
+  while (m->occ[h] == 1) { if (~a) { m->vals[h] = val; return; } h = (h + 1) % m->cap; }
+  m->keys[h] = key; m->vals[h] = val; m->occ[h] = 1; m->len++;
+}~%"
+                      mk mv name ck cv mk mv hash-call key-eq)
+              *functions*)
+        ;; get helper
+        (push (format nil "static ~a _hm_get_~a_~a(~a* m, ~a key) {
+  if (!m->cap) return (~a){0};
+  unsigned int h = ~a % m->cap;
+  while (m->occ[h]) { if (m->occ[h] == 1 && ~a) return m->vals[h]; h = (h + 1) % m->cap; }
+  return (~a){0};
+}~%"
+                      cv mk mv name ck cv hash-call key-eq cv)
+              *functions*)
+        ;; has helper
+        (push (format nil "static int _hm_has_~a_~a(~a* m, ~a key) {
+  if (!m->cap) return 0;
+  unsigned int h = ~a % m->cap;
+  while (m->occ[h]) { if (m->occ[h] == 1 && ~a) return 1; h = (h + 1) % m->cap; }
+  return 0;
+}~%"
+                      mk mv name ck hash-call key-eq)
+              *functions*)
+        ;; del helper
+        (push (format nil "static void _hm_del_~a_~a(~a* m, ~a key) {
+  if (!m->cap) return;
+  unsigned int h = ~a % m->cap;
+  while (m->occ[h]) { if (m->occ[h] == 1 && ~a) { m->occ[h] = 2; m->len--; return; } h = (h + 1) % m->cap; }
+}~%"
+                      mk mv name ck hash-call key-eq)
+              *functions*)
+        ;; keys helper
+        (push (format nil "static ~a _hm_keys_~a_~a(~a* m) {
+  ~a r = {NULL, 0, 0};
+  for (int i = 0; i < m->cap; i++) { if (m->occ[i] == 1) ~a(&r, m->keys[i]); }
+  return r;
+}~%"
+                      vec-k-name mk mv name vec-k-name push-k-name)
+              *functions*)
+        ;; vals helper
+        (push (format nil "static ~a _hm_vals_~a_~a(~a* m) {
+  ~a r = {NULL, 0, 0};
+  for (int i = 0; i < m->cap; i++) { if (m->occ[i] == 1) ~a(&r, m->vals[i]); }
+  return r;
+}~%"
+                      vec-v-name mk mv name vec-v-name push-v-name)
+              *functions*)))))
 
 (defun ensure-fn-type (name arg-types ret-type)
   (unless (gethash name *generated-types*)
@@ -1678,13 +2204,15 @@
       code))
 
 (defun ensure-vector-push-helper (name c-vec c-elem)
-  "Emit a helper function for pushing to vectors of a specific type"
+  "Emit a helper function for pushing to vectors of a specific type.
+   Handles stack-to-heap transition: cap=0 means stack/compound-literal data,
+   so we malloc+memcpy instead of realloc (can't realloc stack memory)."
   (unless (gethash name *generated-types*)
     (setf (gethash name *generated-types*) t)
     (pushnew "string.h" *includes* :test #'string=)
     ;; Emit: void sysp_vecpush_T(Vector_T* v, T val) { ... }
-    (push (format nil "static void ~a(~a* v, ~a val) { if(v->len >= v->cap) { v->cap = v->cap ? v->cap * 2 : 4; v->data = realloc(v->data, sizeof(~a) * v->cap); } v->data[v->len++] = val; }~%"
-                  name c-vec c-elem c-elem)
+    (push (format nil "static void ~a(~a* v, ~a val) { if(v->len >= v->cap) { int _nc = (v->cap > 0) ? v->cap * 2 : (v->len > 0 ? v->len * 2 : 4); ~a* _nd = malloc(sizeof(~a) * _nc); if(v->len > 0) memcpy(_nd, v->data, sizeof(~a) * v->len); if(v->cap > 0) free(v->data); v->data = _nd; v->cap = _nc; } v->data[v->len++] = val; }~%"
+                  name c-vec c-elem c-elem c-elem c-elem)
           *functions*)))
 
 ;;; === Statement Lifting (expressions that are really statements) ===
@@ -1742,6 +2270,11 @@
   "Compile an expression, return (values c-string type).
    Statement-like forms (if, do, cond) are lifted to temp variables
    with their statements pushed onto *pending-stmts*."
+  ;; Expand macros before checking statement-like-p (macros may expand to do/if/etc)
+  (when (and (listp form) (symbolp (first form)))
+    (multiple-value-bind (expanded was-expanded) (macroexpand-1-sysp form)
+      (when was-expanded
+        (return-from compile-expr (compile-expr (macroexpand-all expanded) env)))))
   (if (statement-like-p form)
       ;; Lift statement-like form: compile as statement assigning to temp
       (let ((tmp (fresh-tmp)))
@@ -1861,6 +2394,11 @@
     ("get" . compile-get) ("vector" . compile-vector)
     ("vector-ref" . compile-vector-ref) ("vector-set!" . compile-vector-set)
     ("vector-push!" . compile-vector-push) ("vector-len" . compile-vector-len)
+    ("hash-map" . compile-hash-map)
+    ("hash-get" . compile-hash-get) ("hash-set!" . compile-hash-set)
+    ("hash-has?" . compile-hash-has) ("hash-del!" . compile-hash-del)
+    ("hash-len" . compile-hash-len)
+    ("hash-keys" . compile-hash-keys) ("hash-vals" . compile-hash-vals)
     ("tuple" . compile-tuple) ("tuple-ref" . compile-tuple-ref)
     ("lambda" . compile-lambda)
     ("array-ref" . compile-array-ref) ("array-set!" . compile-array-set)
@@ -2100,18 +2638,27 @@
 ;;; === ARC Memory Model & Raw Pointers ===
 
 (defun compile-new-expr (form env)
-  "(new StructName args...) → RC-managed heap allocation.
-   Returns (:rc (:struct Name))."
+  "(new StructName args...) -- RC-managed heap allocation or stack allocation (escape analysis).
+   Returns (:rc (:struct Name)) for heap, (:struct Name) for stack."
   (let* ((struct-name (string (second form)))
          (args (cddr form))
          (inner-type (make-struct-type struct-name))
-         (rc-type (make-rc-type inner-type))
          (compiled-args (mapcar (lambda (a) (first (multiple-value-list (compile-expr a env)))) args))
-         (rc-c-name (ensure-rc-type inner-type))
-         (mname (mangle-type-name inner-type)))
-    (values (format nil "_rc_~a_new((~a){~{~a~^, ~}})"
-                    mname struct-name compiled-args)
-            rc-type)))
+         ;; Check escape analysis: if bound to a non-escaping let, stack-allocate
+         (stack-p (and *current-fn-name* *current-let-target*
+                       (escape-local-p *current-fn-name* *current-let-target*))))
+    (if stack-p
+        ;; Stack allocation: plain compound literal, struct type
+        (values (format nil "(~a){~{~a~^, ~}}" struct-name compiled-args)
+                inner-type)
+        ;; Heap allocation: RC-managed
+        (let* ((rc-type (make-rc-type inner-type))
+               (rc-c-name (ensure-rc-type inner-type))
+               (mname (mangle-type-name inner-type)))
+          (declare (ignore rc-c-name))
+          (values (format nil "_rc_~a_new((~a){~{~a~^, ~}})"
+                          mname struct-name compiled-args)
+                  rc-type)))))
 
 (defun compile-ptr-alloc (form env)
   "(ptr-alloc :type n) → malloc(n * sizeof(T)), returns (:ptr :T)"
@@ -2261,7 +2808,26 @@
                (last-form (car (last exprs))))
           (multiple-value-bind (type last-stmts)
               (compile-expr-returning last-form new-env target)
-            (values type (append body-stmts last-stmts)))))))
+            ;; Emit data releases for do-block scope, skipping the return variable
+            ;; (it's been assigned to target and ownership transfers to caller)
+            (let* ((return-cname (when (symbolp last-form)
+                                   (sanitize-name (string last-form))))
+                   (releases (if return-cname
+                                 (remove-if (lambda (entry)
+                                              (string= (car entry) return-cname))
+                                            (env-data-releases new-env))
+                                 (env-data-releases new-env)))
+                   (release-stmts (mapcan
+                                   (lambda (entry)
+                                     (let ((c-name (car entry))
+                                           (kind (cdr entry)))
+                                       (case kind
+                                         (:vector (list (format nil "  if (~a.cap > 0) free(~a.data);" c-name c-name)))
+                                         (:hashmap (list (format nil "  free(~a.keys); free(~a.vals); free(~a.occ);"
+                                                                 c-name c-name c-name)))
+                                         (otherwise nil))))
+                                   releases)))
+              (values type (append body-stmts last-stmts release-stmts))))))))
 
 (defun compile-cond-stmt-returning (form env target)
   "(cond [t1 e1] [t2 e2] [else e3]) -> if-else chain assigning to target"
@@ -2343,23 +2909,30 @@
                   (or field-type :int))))))
 
 (defun compile-vector (form env)
-  "(vector elem ...) - C99 compound literal with malloc helper"
+  "(vector elem ...) - stack compound literal if non-escaping, heap if escaping"
   (let* ((elems (rest form))
          (compiled (mapcar (lambda (e) (multiple-value-list (compile-expr e env))) elems))
          (elem-type (if compiled (second (first compiled)) :int))
          (vec-type (make-vector-type elem-type))
          (c-name (type-to-c vec-type))
          (c-elem (type-to-c elem-type))
-         (n (length elems)))
+         (n (length elems))
+         ;; Escape analysis: stack-allocate if bound to a non-escaping let
+         (stack-p (and *current-fn-name* *current-let-target*
+                       (escape-local-p *current-fn-name* *current-let-target*))))
     (if (= n 0)
-        ;; Empty vector: just zero-initialize
+        ;; Empty vector: zero-initialize (cap=0, NULL data)
         (values (format nil "(~a){NULL, 0, 0}" c-name) vec-type)
-        ;; Non-empty: use helper function call that returns initialized Vector
-        ;; Generate: sysp_mkvec_T(n, e0, e1, e2, ...)
-        (let ((helper-name (format nil "sysp_mkvec_~a" (mangle-type-name elem-type))))
-          (ensure-vector-helper helper-name c-elem c-name)
-          (values (format nil "~a(~d~{, ~a~})" helper-name n (mapcar #'first compiled))
-                  vec-type)))))
+        (if stack-p
+            ;; Non-escaping: C99 compound literal, cap=0 marks stack-allocated
+            (values (format nil "(~a){(~a[]){~{~a~^, ~}}, ~d, 0}"
+                            c-name c-elem (mapcar #'first compiled) n)
+                    vec-type)
+            ;; Escaping or unknown: heap-allocate via helper
+            (let ((helper-name (format nil "sysp_mkvec_~a" (mangle-type-name elem-type))))
+              (ensure-vector-helper helper-name c-elem c-name)
+              (values (format nil "~a(~d~{, ~a~})" helper-name n (mapcar #'first compiled))
+                      vec-type))))))
 
 (define-accessor vector-ref "~a.data[~a]"
   (if (eq (type-kind tp) :vector)
@@ -2394,6 +2967,129 @@
                 :void)))))
 
 (define-len vector-len "~a.len")
+
+;;; === Hash Map Operations ===
+
+(defun compile-hash-map (form env)
+  "(hash-map) or (hash-map k1 v1 k2 v2 ...)"
+  (let ((args (rest form)))
+    (if (null args)
+        ;; Empty: infer from context or default to str->int
+        (let* ((key-type :str) (val-type :int)
+               (hm-type (make-hashmap-type key-type val-type))
+               (c-name (type-to-c hm-type)))
+          (values (format nil "(~a){NULL, NULL, NULL, 0, 0}" c-name) hm-type))
+        ;; Non-empty: compile k/v pairs, infer types from first pair
+        (let* ((pairs (loop for (k v) on args by #'cddr
+                            collect (list (multiple-value-list (compile-expr k env))
+                                         (multiple-value-list (compile-expr v env)))))
+               (key-type (second (first (first pairs))))
+               (val-type (second (second (first pairs))))
+               (hm-type (make-hashmap-type key-type val-type))
+               (c-name (type-to-c hm-type))
+               (mk (mangle-type-name key-type))
+               (mv (mangle-type-name val-type))
+               (tmp (fresh-tmp))
+               (set-stmts nil))
+          ;; Statement-lift: create map, then set all pairs
+          ;; Build set stmts in forward order
+          (dolist (pair pairs)
+            (push (format nil "  _hm_set_~a_~a(&~a, ~a, ~a);" mk mv tmp
+                          (first (first pair)) (first (second pair)))
+                  set-stmts))
+          ;; Push in reverse: set stmts first (so they end up after decl), decl last (so it appears first)
+          (dolist (s set-stmts)
+            (push s *pending-stmts*))
+          (push (format nil "  ~a ~a = (~a){NULL, NULL, NULL, 0, 0};" c-name tmp c-name) *pending-stmts*)
+          (values tmp hm-type)))))
+
+(defun compile-hash-get (form env)
+  "(hash-get m k)"
+  (multiple-value-bind (m mt) (compile-expr (second form) env)
+    (multiple-value-bind (k kt) (compile-expr (third form) env)
+      (declare (ignore kt))
+      (let* ((key-type (if (eq (type-kind mt) :hashmap) (second mt) :str))
+             (val-type (if (eq (type-kind mt) :hashmap) (third mt) :int))
+             (mk (mangle-type-name key-type))
+             (mv (mangle-type-name val-type)))
+        (values (format nil "_hm_get_~a_~a(&~a, ~a)" mk mv m k) val-type)))))
+
+(defun compile-hash-set (form env)
+  "(hash-set! m k v)"
+  (multiple-value-bind (m mt) (compile-expr (second form) env)
+    (multiple-value-bind (k kt) (compile-expr (third form) env)
+      (declare (ignore kt))
+      (multiple-value-bind (v vt) (compile-expr (fourth form) env)
+        (declare (ignore vt))
+        (let* ((key-type (if (eq (type-kind mt) :hashmap) (second mt) :str))
+               (val-type (if (eq (type-kind mt) :hashmap) (third mt) :int))
+               (mk (mangle-type-name key-type))
+               (mv (mangle-type-name val-type)))
+          (values (format nil "_hm_set_~a_~a(&~a, ~a, ~a)" mk mv m k v) :void))))))
+
+(defun compile-hash-has (form env)
+  "(hash-has? m k)"
+  (multiple-value-bind (m mt) (compile-expr (second form) env)
+    (multiple-value-bind (k kt) (compile-expr (third form) env)
+      (declare (ignore kt))
+      (let* ((key-type (if (eq (type-kind mt) :hashmap) (second mt) :str))
+             (val-type (if (eq (type-kind mt) :hashmap) (third mt) :int))
+             (mk (mangle-type-name key-type))
+             (mv (mangle-type-name val-type)))
+        (values (format nil "_hm_has_~a_~a(&~a, ~a)" mk mv m k) :bool)))))
+
+(defun compile-hash-del (form env)
+  "(hash-del! m k)"
+  (multiple-value-bind (m mt) (compile-expr (second form) env)
+    (multiple-value-bind (k kt) (compile-expr (third form) env)
+      (declare (ignore kt))
+      (let* ((key-type (if (eq (type-kind mt) :hashmap) (second mt) :str))
+             (val-type (if (eq (type-kind mt) :hashmap) (third mt) :int))
+             (mk (mangle-type-name key-type))
+             (mv (mangle-type-name val-type)))
+        (values (format nil "_hm_del_~a_~a(&~a, ~a)" mk mv m k) :void)))))
+
+(defun compile-hash-len (form env)
+  "(hash-len m)"
+  (multiple-value-bind (m mt) (compile-expr (second form) env)
+    (declare (ignore mt))
+    (values (format nil "~a.len" m) :int)))
+
+(defun compile-hash-keys (form env)
+  "(hash-keys m)"
+  (multiple-value-bind (m mt) (compile-expr (second form) env)
+    (let* ((key-type (if (eq (type-kind mt) :hashmap) (second mt) :str))
+           (val-type (if (eq (type-kind mt) :hashmap) (third mt) :int))
+           (mk (mangle-type-name key-type))
+           (mv (mangle-type-name val-type)))
+      (values (format nil "_hm_keys_~a_~a(&~a)" mk mv m)
+              (make-vector-type key-type)))))
+
+(defun compile-hash-vals (form env)
+  "(hash-vals m)"
+  (multiple-value-bind (m mt) (compile-expr (second form) env)
+    (let* ((key-type (if (eq (type-kind mt) :hashmap) (second mt) :str))
+           (val-type (if (eq (type-kind mt) :hashmap) (third mt) :int))
+           (mk (mangle-type-name key-type))
+           (mv (mangle-type-name val-type)))
+      (values (format nil "_hm_vals_~a_~a(&~a)" mk mv m)
+              (make-vector-type val-type)))))
+
+(defun compile-hash-free-stmt (form env)
+  "(hash-free m) — free internal arrays of a hash map"
+  (let ((*pending-stmts* nil))
+    (multiple-value-bind (m mt) (compile-expr (second form) env)
+      (declare (ignore mt))
+      (append *pending-stmts*
+              (list (format nil "  free(~a.keys); free(~a.vals); free(~a.occ);" m m m))))))
+
+(defun compile-vector-free-stmt (form env)
+  "(vector-free v) — free data array of a vector"
+  (let ((*pending-stmts* nil))
+    (multiple-value-bind (v vt) (compile-expr (second form) env)
+      (declare (ignore vt))
+      (append *pending-stmts*
+              (list (format nil "  free(~a.data);" v))))))
 
 (defun compile-tuple (form env)
   "(tuple elem ...)"
@@ -3416,6 +4112,20 @@
      (list (format nil "#pragma ~a" (second form))))
     ((and (listp form) (sym= (first form) "kernel-launch"))
      (compile-kernel-launch-stmt form env))
+    ((and (listp form) (sym= (first form) "hash-set!"))
+     (let ((*pending-stmts* nil))
+       (multiple-value-bind (code tp) (compile-hash-set form env)
+         (declare (ignore tp))
+         (append *pending-stmts* (list (format nil "  ~a;" code))))))
+    ((and (listp form) (sym= (first form) "hash-del!"))
+     (let ((*pending-stmts* nil))
+       (multiple-value-bind (code tp) (compile-hash-del form env)
+         (declare (ignore tp))
+         (append *pending-stmts* (list (format nil "  ~a;" code))))))
+    ((and (listp form) (sym= (first form) "hash-free"))
+     (compile-hash-free-stmt form env))
+    ((and (listp form) (sym= (first form) "vector-free"))
+     (compile-vector-free-stmt form env))
     (t (let ((*pending-stmts* nil))
          (multiple-value-bind (code tp) (compile-expr form env)
            (declare (ignore tp))
@@ -3432,23 +4142,49 @@
                      (prog1 (parse-type-annotation (first rest))
                        (setf rest (cdr rest)))))
          (init-form (first rest)))
-    (let ((*pending-stmts* nil))
+    (let ((*pending-stmts* nil)
+          (*current-let-target* name))
       (multiple-value-bind (init-code init-type) (compile-expr init-form env)
         (let* ((lifted-stmts *pending-stmts*)
                (final-type (or type-ann init-type))
                (c-name (sanitize-name name))
+               ;; Check if escape analysis says this is stack-allocatable
+               (stack-rc-p (and (rc-type-p final-type)
+                                (listp init-form) (sym= (first init-form) "new")
+                                *current-fn-name*
+                                (escape-local-p *current-fn-name* name)))
                ;; Retain if storing borrowed ref or shared variable (not fresh allocs)
                (needs-retain (and *uses-value-type*
                                  (value-type-p final-type)
                                  (needs-retain-for-storage-p init-form env))))
+          ;; Downgrade RC to struct type for stack alloc
+          (when stack-rc-p
+            (setf final-type (rc-inner-type final-type)))
           (env-bind env name final-type)
           (when is-mut (env-mark-mutable env name))
           ;; Track Value-typed locals for release at scope exit
           (when (and *uses-value-type* (value-type-p final-type))
             (env-add-release env c-name))
-          ;; Track RC-typed locals for release at scope exit
-          (when (rc-type-p final-type)
+          ;; Track RC-typed locals for release at scope exit (skip stack-allocated)
+          (when (and (rc-type-p final-type) (not stack-rc-p))
             (env-add-rc-release env c-name (rc-inner-type final-type)))
+          ;; Track vector/hashmap locals for data release at scope exit
+          ;; Three cases:
+          ;;   EA says :local  → register (non-escaping allocation, we own it)
+          ;;   EA says :escapes → skip (ownership transfers to caller)
+          ;;   Not in EA (macro results, copies) → fall back to init-form:
+          ;;     list init (constructor/call) → register (likely new allocation)
+          ;;     symbol init (variable ref) → skip (shallow copy, borrow)
+          (let* ((ea-key (when *current-fn-name*
+                          (format nil "~a.~a" *current-fn-name* name)))
+                 (ea-result (when ea-key (gethash ea-key *escape-info*)))
+                 (should-release (or (eq ea-result :local)
+                                     (and (null ea-result)
+                                          (not (symbolp init-form))))))
+            (when (and (eq (type-kind final-type) :vector) should-release)
+              (env-add-data-release env c-name :vector))
+            (when (and (eq (type-kind final-type) :hashmap) should-release)
+              (env-add-data-release env c-name :hashmap)))
           ;; Determine if this is an RC copy (variable → variable, needs retain)
           (let* ((rc-copy-p (and (rc-type-p final-type)
                                  (symbolp init-form)
@@ -3520,32 +4256,33 @@
 
 (defun compile-print-stmt (form env)
   "(print expr) — print without newline"
-  (multiple-value-bind (val-code val-type) (compile-expr (second form) env)
-    (multiple-value-bind (fmt arg) (format-print-arg val-code val-type)
-      (cond
-        ((eq fmt :value-print)
-         (list (format nil "  sysp_print_value(~a);" arg)))
-        ((eq fmt :pri)
-         ;; Use inttypes.h macros for portable fixed-width printing
-         ;; arg is the macro name (e.g., "PRId64"), val-code is the value
-         (list (format nil "  printf(\"%\" ~a, ~a);" arg val-code)))
-        (t
-         (list (format nil "  printf(\"~a\", ~a);" fmt arg)))))))
+  (let ((*pending-stmts* nil))
+    (multiple-value-bind (val-code val-type) (compile-expr (second form) env)
+      (multiple-value-bind (fmt arg) (format-print-arg val-code val-type)
+        (append *pending-stmts*
+                (cond
+                  ((eq fmt :value-print)
+                   (list (format nil "  sysp_print_value(~a);" arg)))
+                  ((eq fmt :pri)
+                   (list (format nil "  printf(\"%\" ~a, ~a);" arg val-code)))
+                  (t
+                   (list (format nil "  printf(\"~a\", ~a);" fmt arg)))))))))
 
 (defun compile-println-stmt (form env)
   "(println expr) or (println) — print with newline"
   (if (null (rest form))
       (list "  printf(\"\\n\");")
-      (multiple-value-bind (val-code val-type) (compile-expr (second form) env)
-        (multiple-value-bind (fmt arg) (format-print-arg val-code val-type)
-          (cond
-            ((eq fmt :value-print)
-             (list (format nil "  sysp_print_value(~a); printf(\"\\n\");" arg)))
-            ((eq fmt :pri)
-             ;; Use inttypes.h macros for portable fixed-width printing
-             (list (format nil "  printf(\"%\" ~a \"\\n\", ~a);" arg val-code)))
-            (t
-             (list (format nil "  printf(\"~a\\n\", ~a);" fmt arg))))))))
+      (let ((*pending-stmts* nil))
+        (multiple-value-bind (val-code val-type) (compile-expr (second form) env)
+          (multiple-value-bind (fmt arg) (format-print-arg val-code val-type)
+            (append *pending-stmts*
+                    (cond
+                      ((eq fmt :value-print)
+                       (list (format nil "  sysp_print_value(~a); printf(\"\\n\");" arg)))
+                      ((eq fmt :pri)
+                       (list (format nil "  printf(\"%\" ~a \"\\n\", ~a);" arg val-code)))
+                      (t
+                       (list (format nil "  printf(\"~a\\n\", ~a);" fmt arg))))))))))
 
 (defun c-escape-string (s)
   "Escape a CL string for C string literal content.
@@ -3631,10 +4368,12 @@
           (result (list (format nil "  while (~a) {" cond-code))))
       (dolist (s (compile-body (cddr form) body-env))
         (push (format nil "  ~a" s) result))
-      ;; Release Value locals at end of each iteration
+      ;; Release locals at end of each iteration
       (when *uses-value-type*
         (dolist (r (emit-releases body-env))
           (push (format nil "  ~a" r) result)))
+      (dolist (r (emit-data-releases body-env))
+        (push (format nil "  ~a" r) result))
       (push "  }" result)
       (nreverse result))))
 
@@ -3658,10 +4397,12 @@
                                      c-var start-code c-var end-code c-var step-code))))
           (dolist (s (compile-body body-forms body-env))
             (push (format nil "  ~a" s) result))
-          ;; Release Value locals at end of each iteration
+          ;; Release locals at end of each iteration
           (when *uses-value-type*
             (dolist (r (emit-releases body-env))
               (push (format nil "  ~a" r) result)))
+          (dolist (r (emit-data-releases body-env))
+            (push (format nil "  ~a" r) result))
           (push "  }" result)
           (nreverse result))))))
 
@@ -3782,6 +4523,41 @@
             (values lit-check nil new-env)))
          ;; Default: just tag check
          (t (values tag-check nil new-env)))))
+    ;; Struct destructuring: (StructName f1 f2 ...)
+    ((and (listp pattern) (symbolp (first pattern))
+          (not (keywordp (first pattern)))
+          (gethash (string (first pattern)) *structs*))
+     (let* ((struct-name (string (first pattern)))
+            (field-defs (gethash struct-name *structs*))  ; ((name . type) ...)
+            (pat-vars (rest pattern))
+            (new-env (make-env :parent env))
+            (bindings nil))
+       ;; Bind each pattern variable to corresponding struct field
+       (loop for field-def in field-defs
+             for pat-var in pat-vars
+             when (and (symbolp pat-var) (not (string= (string pat-var) "_")))
+             do (let* ((field-name (car field-def))
+                       (field-type (cdr field-def))
+                       (var-name (string pat-var))
+                       (c-var (sanitize-name var-name))
+                       ;; For union scrutinee: access via .as_StructName.field
+                       ;; For direct struct: access via .field
+                       (access (if (union-type-p scrutinee-type)
+                                   (format nil "~a.as_~a.~a"
+                                           scrutinee struct-name (sanitize-name field-name))
+                                   (format nil "~a.~a"
+                                           scrutinee (sanitize-name field-name)))))
+                  (push (format nil "  ~a ~a = ~a;"
+                                (type-to-c field-type) c-var access)
+                        bindings)
+                  (env-bind new-env var-name field-type)))
+       ;; If scrutinee is union → tag check; if struct → no check (always matches)
+       (let ((cond-code (when (union-type-p scrutinee-type)
+                          (let ((union-c-name (ensure-union-type scrutinee-type)))
+                            (format nil "~a.tag == ~a_TAG_~a"
+                                    scrutinee union-c-name
+                                    (string-upcase struct-name))))))
+         (values cond-code (nreverse bindings) new-env))))
     ;; Wildcard: always matches
     ((and (symbolp pattern) (string-equal (string pattern) "_"))
      (values nil nil (make-env :parent env)))
@@ -3972,10 +4748,12 @@
         (result (list "  {")))
     (dolist (s (compile-body (rest form) body-env))
       (push (format nil "  ~a" s) result))
-    ;; Release Value locals at scope exit
+    ;; Release locals at scope exit
     (when *uses-value-type*
       (dolist (r (emit-releases body-env))
         (push (format nil "  ~a" r) result)))
+    (dolist (r (emit-data-releases body-env))
+      (push (format nil "  ~a" r) result))
     (push "  }" result)
     (nreverse result)))
 
@@ -4055,25 +4833,27 @@
   (if rest (append fixed (list rest)) fixed))
 
 (defun compile-struct (form)
-  "(struct Name [field :type, ...])"
-  (let* ((name (string (second form)))
+  "(struct Name [field :type, ...]) or (struct \"attr\" Name [field :type, ...])"
+  (let* ((has-attr (stringp (second form)))
+         (attr (when has-attr (second form)))
+         (name (string (if has-attr (third form) (second form))))
+         (fields-raw (if has-attr (fourth form) (third form)))
          ;; Register struct name early so fields can reference it (self-referential types)
          (already-registered (gethash name *structs*)))
     (unless already-registered
       (setf (gethash name *structs*) :forward-declared)  ; placeholder
       ;; Emit forward declaration
       (push (format nil "typedef struct ~a ~a;~%" name name) *struct-defs*))
-    (let* ((fields-raw (third form))
-           (fields (multiple-value-bind (fixed rest) (parse-params fields-raw)
+    (let* ((fields (multiple-value-bind (fixed rest) (parse-params fields-raw)
                      (declare (ignore rest))
                      fixed)))
       (setf (gethash name *structs*)
             (mapcar (lambda (f) (cons (first f) (second f))) fields))
-      (push (format nil "struct ~a {~%~{  ~a ~a;~%~}};~%"
+      (push (format nil "struct ~a~a {~%~{  ~a ~a;~%~}};~%"
+                    (if attr (format nil "~a " attr) "")
                     name
                     (loop for f in fields
-                          append (list (type-to-c (second f)) (sanitize-name (first f))))
-                    )
+                          append (list (type-to-c (second f)) (sanitize-name (first f)))))
             *struct-defs*))))
 
 (defun compile-deftype (form)
@@ -4312,7 +5092,8 @@
             (progn
               (setf stmts (append stmts (compile-stmt last-form env)))
               (let ((releases (append (when *uses-value-type* (emit-releases env))
-                                      (emit-rc-releases env))))
+                                      (emit-rc-releases env)
+                                      (emit-data-releases env))))
                 (when releases
                   (setf return-stmt (format nil "~{~a~%~}" releases)))))
             ;; Non-void: last form is return value
@@ -4322,7 +5103,7 @@
             (cond
               ;; Return unlifting: statement-like, no Value/RC cleanup needed
               ;; Branches emit "return expr;" directly, no temp variable
-              ((and (statement-like-p last-form) (not *uses-value-type*) (null (env-rc-releases env)))
+              ((and (statement-like-p last-form) (not *uses-value-type*) (null (env-rc-releases env)) (null (env-data-releases env)))
                (multiple-value-bind (type ret-stmts)
                    (compile-expr-returning last-form env ":return")
                  (declare (ignore type))
@@ -4336,7 +5117,8 @@
                    (declare (ignore type))
                    (setf stmts (append stmts (list tmp-decl) ret-stmts))
                    (let ((releases (append (when *uses-value-type* (emit-releases env))
-                                           (emit-rc-releases env))))
+                                           (emit-rc-releases env)
+                                           (emit-data-releases env))))
                      (setf return-stmt
                            (if releases
                                (format nil "~{~a~%~}  return ~a;~%" releases tmp)
@@ -4349,7 +5131,8 @@
                    (when *pending-stmts*
                      (setf stmts (append stmts *pending-stmts*)))
                    (let* ((releases (append (when *uses-value-type* (emit-releases env))
-                                            (emit-rc-releases env)))
+                                            (emit-rc-releases env)
+                                            (emit-data-releases env)))
                           (ret-var (and (symbolp last-form)
                                         (member (sanitize-name (string last-form))
                                                 (env-releases env) :test #'equal))))
@@ -4801,6 +5584,13 @@
   (let ((text (string-left-trim '(#\;) comment)))
     (format nil "//~a" text)))
 
+(defun compile-export (form)
+  "(export name1 name2 ...) — mark names as public. When present, only listed names are exported."
+  (unless *exports*
+    (setf *exports* (make-hash-table :test 'equal)))
+  (dolist (name (rest form))
+    (setf (gethash (string name) *exports*) t)))
+
 (defun compile-toplevel (forms)
   (let ((form-idx 0))
     (dolist (form forms)
@@ -4811,6 +5601,7 @@
           (cond
             ((sym= (first form) "defmacro") (compile-defmacro form))
             ((sym= (first form) "defn-ct") (compile-defn-ct form))
+            ((sym= (first form) "export") (compile-export form))
             (t
              ;; Expand macros, then compile
              (let ((expanded (macroexpand-all form)))
@@ -5124,6 +5915,20 @@
     (format out "  #define RC_DEC(x) (--(x))~%")
     (format out "  #define SYSP_TLS~%")
     (format out "#endif~%~%")
+    ;; Hash function preamble (if needed)
+    (when *uses-hashmap*
+      (pushnew "string.h" *includes* :test #'string=)
+      (format out "/* Hash functions (FNV-1a for strings, integer hash for ints) */~%")
+      (format out "static unsigned int _sysp_hash_str(const char* s) {~%")
+      (format out "  unsigned int h = 2166136261u;~%")
+      (format out "  for (; *s; s++) h = (h ^ (unsigned char)*s) * 16777619u;~%")
+      (format out "  return h;~%")
+      (format out "}~%")
+      (format out "static unsigned int _sysp_hash_int(unsigned int u) {~%")
+      (format out "  u = ((u >> 16) ^ u) * 0x45d9f3bu;~%")
+      (format out "  u = ((u >> 16) ^ u) * 0x45d9f3bu;~%")
+      (format out "  return (u >> 16) ^ u;~%")
+      (format out "}~%~%"))
     ;; Condition system preamble (if needed)
     (when *uses-conditions*
       (emit-condition-preamble out))
@@ -5191,7 +5996,149 @@
   (setf *restart-counter* 0)
   (setf *handler-counter* 0)
   (setf *handler-wrap-counter* 0)
-  (setf *uses-conditions* nil))
+  (setf *uses-conditions* nil)
+  (setf *exports* nil)
+  (setf *escape-info* (make-hash-table :test 'equal))
+  (setf *uses-hashmap* nil))
+
+;;; === Escape Analysis ===
+
+(defun escape-find-alloc-bindings (forms)
+  "Find all let/let-mut bindings where init is a heap allocation:
+   (new ...), (vector ...), (hash-map ...).
+   Returns list of var-name strings."
+  (let ((bindings nil))
+    (labels ((alloc-form-p (init)
+               "Check if init form is a known allocation"
+               (and (listp init) (symbolp (first init))
+                    (let ((h (string-downcase (string (first init)))))
+                      (or (string= h "new") (string= h "vector") (string= h "hash-map")))))
+             (walk (form)
+               (when (listp form)
+                 (let ((head (first form)))
+                   (cond
+                     ;; let/let-mut with allocating initializer
+                     ((and (or (sym= head "let") (sym= head "let-mut"))
+                           (>= (length form) 3))
+                      (let* ((name (string (second form)))
+                             (rest (cddr form))
+                             (init (if (keywordp (first rest)) (second rest) (first rest))))
+                        (when (alloc-form-p init)
+                          (push name bindings))
+                        ;; Walk body forms
+                        (dolist (f (if (keywordp (first rest)) (cddr rest) (cdr rest)))
+                          (walk f))))
+                     ;; Recurse into all subforms for compound statements
+                     (t (dolist (f (rest form)) (walk f))))))))
+      (dolist (f forms) (walk f)))
+    bindings))
+
+(defun escape-check-var (var-name forms)
+  "Check if var-name escapes in forms. Conservative: escapes if returned, passed to a call, stored, or captured."
+  (labels ((escapes-p (form context)
+             ;; context: :expr (in expression), :stmt (in statement)
+             (cond
+               ((null form) nil)
+               ((symbolp form) nil)  ; bare reference is fine
+               ((not (listp form)) nil)
+               (t
+                (let ((head (first form)))
+                  (cond
+                    ;; Return: variable escapes
+                    ((and (sym= head "return")
+                          (some (lambda (f) (mentions-var-p f var-name)) (rest form)))
+                     t)
+                    ;; Function call: if var is an argument, it escapes (conservative)
+                    ;; Safe: builtins, macros (expand inline, don't capture refs)
+                    ((and (symbolp head)
+                          (let ((h (string-downcase (string head))))
+                            (and (not (member h
+                                       '("let" "let-mut" "if" "do" "when" "unless" "while" "for"
+                                         "set!" "get" "println" "printf" "print"
+                                         "cond" "match" "+" "-" "*" "/" "%" "=" "!=" "<" ">" "<=" ">="
+                                         "and" "or" "not" "cast" "addr-of" "sizeof" "deref"
+                                         "array-ref" "array-set!" "vector-ref" "vector-set!"
+                                         "vector-len" "vector-push!" "vector-free"
+                                         "hash-get" "hash-set!" "hash-has?" "hash-del!"
+                                         "hash-len" "hash-keys" "hash-vals" "hash-free"
+                                         "inc" "dec" "bit-and" "bit-or" "bit-xor" "bit-not"
+                                         "bit-shl" "bit-shr" "new" "recur" "break" "continue"
+                                         "block" "runtype" "as" "vector" "hash-map")
+                                       :test #'equal))
+                                 ;; Also safe: any known macro (expands inline)
+                                 (not (gethash h *macros*))))
+                          (some (lambda (arg) (var-escapes-through-arg-p arg var-name)) (rest form)))
+                     t)
+                    ;; set! to pointer/struct field — escapes
+                    ((and (sym= head "set!")
+                          (listp (second form))  ; compound target like (get x field)
+                          (some (lambda (f) (mentions-var-p f var-name)) (cddr form)))
+                     t)
+                    ;; ptr-set! — escapes
+                    ((and (sym= head "ptr-set!")
+                          (some (lambda (f) (mentions-var-p f var-name)) (rest form)))
+                     t)
+                    ;; spawn/lambda — capture escapes
+                    ((and (or (sym= head "spawn") (sym= head "lambda") (sym= head "fn"))
+                          (mentions-var-p (rest form) var-name))
+                     t)
+                    ;; Recurse into subforms
+                    (t (some (lambda (f) (escapes-p f :expr)) (rest form)))))))))
+    (some (lambda (f) (escapes-p f :stmt)) forms)))
+
+(defun mentions-var-p (form var-name)
+  "Does form mention var-name as a symbol?"
+  (cond
+    ((null form) nil)
+    ((symbolp form) (string= (string form) var-name))
+    ((listp form) (some (lambda (f) (mentions-var-p f var-name)) form))
+    (t nil)))
+
+(defun var-escapes-through-arg-p (arg var-name)
+  "Does var-name escape through arg? Returns nil if var is only accessed inside
+   extraction forms (vector-ref, vector-len, hash-get, etc.) that read FROM the
+   container without leaking the container itself."
+  (cond
+    ((null arg) nil)
+    ((symbolp arg) (string= (string arg) var-name))
+    ((not (listp arg)) nil)
+    (t (let* ((head (first arg))
+              (h (and (symbolp head) (string-downcase (string head)))))
+         (if (and h (member h '("vector-ref" "vector-len" "vector-set!"
+                                 "vector-push!" "vector-free"
+                                 "hash-get" "hash-has?" "hash-del!"
+                                 "hash-len" "hash-keys" "hash-vals" "hash-free"
+                                 "hash-set!" "array-ref" "array-set!" "get")
+                            :test #'equal))
+             nil  ; extraction: var is accessed, not leaked
+             (some (lambda (f) (var-escapes-through-arg-p f var-name))
+                   arg))))))
+
+(defun escape-analysis-fn (fn-name body-forms)
+  "Analyze a function body for non-escaping heap allocations (new, vector, hash-map).
+   Expands macros first so binding forms like [x v] in for-each aren't misread as calls."
+  (let* ((expanded (mapcar #'macroexpand-all body-forms))
+         (bindings (escape-find-alloc-bindings expanded)))
+    (dolist (var-name bindings)
+      (let ((key (format nil "~a.~a" fn-name var-name)))
+        (if (escape-check-var var-name expanded)
+            (setf (gethash key *escape-info*) :escapes)
+            (setf (gethash key *escape-info*) :local))))))
+
+(defun escape-analysis (forms)
+  "Run escape analysis on all defn forms."
+  (dolist (form forms)
+    (when (and (listp form) (sym= (first form) "defn"))
+      (let* ((has-attr (stringp (second form)))
+             (form2 (if has-attr (cons (first form) (cddr form)) form))
+             (name (string (second form2)))
+             (rest-forms (cdddr form2))
+             (body (if (keywordp (first rest-forms)) (cdr rest-forms) rest-forms)))
+        (escape-analysis-fn name body)))))
+
+(defun escape-local-p (fn-name var-name)
+  "Check if (new ...) bound to var-name in fn-name is stack-allocatable."
+  (eq (gethash (format nil "~a.~a" fn-name var-name) *escape-info*) :local))
 
 (defun compile-file-to-c (in-path out-path)
   (reset-state)
@@ -5204,6 +6151,8 @@
     (setf forms (expand-uses forms base-dir))
     ;; Phase 1: Type inference (constraint generation + solving)
     (infer-toplevel forms)
+    ;; Phase 1.5: Escape analysis (marks non-escaping allocations for stack placement)
+    (escape-analysis forms)
     ;; Phase 2: Compilation (uses inferred types from *infer-env*)
     (compile-toplevel forms)
     (emit-c out-path)
