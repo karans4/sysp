@@ -940,6 +940,20 @@
            *enums*)
   nil)
 
+;;; === Error Reporting with Source Locations ===
+
+;; Forward declare — actual defvar is in parser section
+(defvar *source-locations*)
+
+(defun sysp-error (form fmt &rest args)
+  "Signal an error with source location if available for form."
+  (let ((loc (and (boundp '*source-locations*) (consp form)
+                  (gethash form *source-locations*))))
+    (if loc
+        (error "~a:~d:~d: ~a" (first loc) (second loc) (third loc)
+               (apply #'format nil fmt args))
+        (error "sysp: ~a" (apply #'format nil fmt args)))))
+
 ;;; === Parsing ===
 
 ;;; === Custom Parser (tokenizer + recursive descent) ===
@@ -1198,7 +1212,7 @@
                                         (if (probe-file sysp)
                                             sysp
                                             (merge-pathnames (format nil "lib/~a.sysph" sname))))))
-                                   (t (error "use: argument must be a string or symbol, got ~s" arg))))
+                                   (t (sysp-error form "use: argument must be a string or symbol, got ~s" arg))))
                        (abs-path (namestring (truename resolved))))
                   (if (gethash abs-path *included-files*)
                       nil  ; already included — skip
@@ -1398,7 +1412,12 @@
   (if (and (listp form) (symbolp (first form)))
       (let ((expander (gethash (string-downcase (string (first form))) *macros*)))
         (if expander
-            (values (funcall expander form) t)
+            (let ((expanded (funcall expander form)))
+              ;; Propagate source location from original form to expanded form
+              (when (and (consp expanded) (gethash form *source-locations*))
+                (setf (gethash expanded *source-locations*)
+                      (gethash form *source-locations*)))
+              (values expanded t))
             (values form nil)))
       (values form nil)))
 
@@ -1410,8 +1429,17 @@
       (multiple-value-bind (expanded was-expanded) (macroexpand-1-sysp form)
         (if was-expanded
             (macroexpand-all expanded)  ; re-expand in case macro produces another macro call
-            ;; Not a macro — recurse into subforms
-            (mapcar #'macroexpand-all form)))))
+            ;; Not a macro — recurse into subforms, preserving identity if unchanged
+            (let* ((new-elems (mapcar #'macroexpand-all form))
+                   (changed (loop for o in form for n in new-elems
+                                  thereis (not (eq o n)))))
+              (if changed
+                  ;; Propagate source location to new list
+                  (let ((result new-elems)
+                        (loc (gethash form *source-locations*)))
+                    (when loc (setf (gethash result *source-locations*) loc))
+                    result)
+                  form))))))
 
 (defun install-builtin-macros ()
   "Install the standard macros: ->, ->>, when-let, dotimes, etc."
@@ -2477,9 +2505,9 @@
         (return-from compile-list (funcall handler form env))))
     (cond
       ((sym= head "recur")
-       (error "sysp: recur must be in tail position (last expression of a function, or branch of if/cond in tail position)"))
+       (sysp-error form "recur must be in tail position (last expression of a function, or branch of if/cond in tail position)"))
       ((sym= head "return")
-       (error "sysp: return cannot be used as an expression"))
+       (sysp-error form "return cannot be used as an expression"))
       (t (compile-call form env)))))
 
 (defun sysp-arithmetic-type (t1 t2)
@@ -2601,19 +2629,19 @@
            (case state
              (:then (setf then-forms (nreverse current)))
              (:elif-body (push (cons elif-cond (nreverse current)) elifs))
-             (:elif-cond (error "sysp: elif without body before next elif")))
+             (:elif-cond (sysp-error f "elif without body before next elif")))
            (setf state :elif-cond current nil))
           ((and (symbolp f) (sym= f "else"))
            (case state
              (:then (setf then-forms (nreverse current)))
              (:elif-body (push (cons elif-cond (nreverse current)) elifs))
-             (:elif-cond (error "sysp: elif without body before else")))
+             (:elif-cond (sysp-error f "elif without body before else")))
            (setf state :else current nil))
           ((eq state :elif-cond)
            (setf elif-cond f state :elif-body current nil))
           (t (push f current))))
       (when (eq state :elif-cond)
-        (error "sysp: elif at end of if without condition/body"))
+        (sysp-error elif-cond "elif at end of if without condition/body"))
       (case state
         (:then (setf then-forms (nreverse current)))
         (:elif-body (push (cons elif-cond (nreverse current)) elifs))
@@ -3554,7 +3582,7 @@
   "(await future-expr) — block until thread completes, extract result."
   (multiple-value-bind (fut-code fut-type) (compile-expr (second form) env)
     (unless (future-type-p fut-type)
-      (error "await: expected future type, got ~a" fut-type))
+      (sysp-error form "await: expected future type, got ~a" fut-type))
     (let* ((inner-type (future-inner-type fut-type))
            (result-var (format nil "_await_~d" (incf *temp-counter*)))
            (inner-c (type-to-c inner-type)))
@@ -3877,7 +3905,7 @@
       ;; simple variable
       (t (let ((name (string target)))
            (when (and (env-lookup env name) (not (env-mutable-p env name)))
-             (error "Cannot set! immutable variable '~a' (use let-mut for mutable bindings)" name))
+             (sysp-error form "cannot set! immutable variable '~a' (use let-mut for mutable bindings)" name))
            (multiple-value-bind (val-code val-type) (compile-expr (third form) env)
              (values (format nil "(~a = ~a)" (sanitize-name name) val-code)
                      val-type)))))))
@@ -5420,7 +5448,7 @@
           do (if (char= c #\~)
                  (progn
                    (when (>= arg-idx (length compiled-args))
-                     (error "c-tmpl: more ~ placeholders than arguments"))
+                     (error "sysp: c-tmpl: more ~ placeholders than arguments"))
                    (loop for ch across (nth arg-idx compiled-args)
                          do (vector-push-extend ch result))
                    (incf arg-idx))
@@ -5716,7 +5744,7 @@
                                        collect (cons (string p) a))
                                  closure-env)))
                  (eval-body body call-env))
-               (error "Unknown function in macro expansion: ~a" fn-name)))))))
+               (sysp-error form "unknown function in macro expansion: ~a" fn-name)))))))
 
 (defun eval-quasiquote (datum env)
   "Process quasiquote at compile time — returns CL list structure"
