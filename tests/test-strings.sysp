@@ -1,0 +1,56 @@
+;; test-strings.sysp — string builtin operations
+
+(defn main () :int
+  ;; str-len
+  (println (str-len "hello"))        ; 5
+  (println (str-len ""))             ; 0
+
+  ;; str-ref
+  (let c (str-ref "abc" 1))
+  (printf "%c\n" c)                  ; b
+
+  ;; str-eq?
+  (println (str-eq? "foo" "foo"))    ; true
+  (println (str-eq? "foo" "bar"))    ; false
+
+  ;; str-contains?
+  (println (str-contains? "hello world" "world")) ; true
+  (println (str-contains? "hello world" "xyz"))   ; false
+
+  ;; str-find
+  (println (str-find "hello world" "world"))  ; 6
+  (println (str-find "hello world" "xyz"))    ; -1
+
+  ;; str-concat
+  (let s (str-concat "hello" " world"))
+  (println s)                        ; hello world
+
+  ;; str-slice
+  (let s2 (str-slice "hello world" 0 5))
+  (println s2)                       ; hello
+  (let s3 (str-slice "hello world" 6 11))
+  (println s3)                       ; world
+
+  ;; str-upper / str-lower
+  (println (str-upper "hello"))      ; HELLO
+  (println (str-lower "HELLO"))      ; hello
+
+  ;; str-split
+  (let parts (str-split "a,b,c" ","))
+  (println (vector-len parts))       ; 3
+  (println (vector-ref parts 0))     ; a
+  (println (vector-ref parts 1))     ; b
+  (println (vector-ref parts 2))     ; c
+
+  ;; str-from-int / str-from-float
+  (println (str-from-int 42))        ; 42
+  (println (str-from-float 3.14))    ; 3.14
+
+  ;; Composition: concat + slice
+  (let full (str-concat "foo" "bar"))
+  (println (str-slice full 1 5))     ; ooba
+
+  ;; str-find returns -1 for empty match? No, strstr("x","") returns "x", so index 0
+  (println (str-find "hello" ""))    ; 0
+
+  0)

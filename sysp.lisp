@@ -499,6 +499,20 @@
       ((sym= head "sym-eq?") :bool)
       ((sym= head "gensym") :value)
 
+      ;; String builtins
+      ((sym= head "str-len") (infer-expr (second form)) :int)
+      ((sym= head "str-ref") (infer-expr (second form)) (infer-expr (third form)) :char)
+      ((sym= head "str-eq?") (infer-expr (second form)) (infer-expr (third form)) :bool)
+      ((sym= head "str-contains?") (infer-expr (second form)) (infer-expr (third form)) :bool)
+      ((sym= head "str-find") (infer-expr (second form)) (infer-expr (third form)) :int)
+      ((sym= head "str-concat") (infer-expr (second form)) (infer-expr (third form)) :str)
+      ((sym= head "str-slice") (dolist (e (cdr form)) (infer-expr e)) :str)
+      ((sym= head "str-upper") (infer-expr (second form)) :str)
+      ((sym= head "str-lower") (infer-expr (second form)) :str)
+      ((sym= head "str-split") (infer-expr (second form)) (infer-expr (third form)) (make-vector-type :str))
+      ((sym= head "str-from-int") (infer-expr (second form)) :str)
+      ((sym= head "str-from-float") (infer-expr (second form)) :str)
+
       ;; get: struct field access — need struct info
       ((sym= head "get")
        (make-tvar))  ; can't resolve without struct definition context
@@ -2437,7 +2451,13 @@
     ("c-expr" . compile-c-expr)
     ("c-tmpl" . compile-c-tmpl-expr)
     ("ptr+" . compile-ptr-add)
-    ("ptr-to" . compile-ptr-to)))
+    ("ptr-to" . compile-ptr-to)
+    ("str-len" . compile-str-len) ("str-ref" . compile-str-ref)
+    ("str-eq?" . compile-str-eq) ("str-contains?" . compile-str-contains)
+    ("str-find" . compile-str-find) ("str-concat" . compile-str-concat)
+    ("str-slice" . compile-str-slice) ("str-upper" . compile-str-upper)
+    ("str-lower" . compile-str-lower) ("str-split" . compile-str-split)
+    ("str-from-int" . compile-str-from-int) ("str-from-float" . compile-str-from-float)))
 
 (defun compile-list (form env)
   (let* ((head (first form))
@@ -3100,6 +3120,160 @@
       (declare (ignore vt))
       (append *pending-stmts*
               (list (format nil "  free(~a.data);" v))))))
+
+;;; === String Builtins ===
+
+(defun ensure-string-helpers ()
+  "Emit C helper functions for string operations, guarded by *generated-types*."
+  (unless (gethash "_sysp_str_helpers" *generated-types*)
+    (setf (gethash "_sysp_str_helpers" *generated-types*) t)
+    (pushnew "string.h" *includes* :test #'string=)
+    (pushnew "ctype.h" *includes* :test #'string=)
+    (pushnew "stdio.h" *includes* :test #'string=)
+    ;; str-concat: allocate new string from two parts
+    (push "static const char* _sysp_str_concat(const char* a, const char* b) { int la = strlen(a), lb = strlen(b); char* r = malloc(la + lb + 1); memcpy(r, a, la); memcpy(r + la, b, lb + 1); return r; }
+"
+          *functions*)
+    ;; str-slice: extract substring [start, end)
+    (push "static const char* _sysp_str_slice(const char* s, int start, int end) { int slen = strlen(s); if (start < 0) start = 0; if (end > slen) end = slen; if (start >= end) { char* r = malloc(1); r[0] = 0; return r; } int n = end - start; char* r = malloc(n + 1); memcpy(r, s + start, n); r[n] = 0; return r; }
+"
+          *functions*)
+    ;; str-upper
+    (push "static const char* _sysp_str_upper(const char* s) { int n = strlen(s); char* r = malloc(n + 1); for (int i = 0; i <= n; i++) r[i] = toupper((unsigned char)s[i]); return r; }
+"
+          *functions*)
+    ;; str-lower
+    (push "static const char* _sysp_str_lower(const char* s) { int n = strlen(s); char* r = malloc(n + 1); for (int i = 0; i <= n; i++) r[i] = tolower((unsigned char)s[i]); return r; }
+"
+          *functions*)
+    ;; str-from-int
+    (push "static const char* _sysp_str_from_int(int v) { char buf[32]; snprintf(buf, sizeof(buf), \"%d\", v); int n = strlen(buf); char* r = malloc(n + 1); memcpy(r, buf, n + 1); return r; }
+"
+          *functions*)
+    ;; str-from-float
+    (push "static const char* _sysp_str_from_float(double v) { char buf[64]; snprintf(buf, sizeof(buf), \"%g\", v); int n = strlen(buf); char* r = malloc(n + 1); memcpy(r, buf, n + 1); return r; }
+"
+          *functions*)))
+
+(defun ensure-str-split-helper ()
+  "Emit C helper for str-split. Returns Vector_str."
+  (unless (gethash "_sysp_str_split" *generated-types*)
+    (setf (gethash "_sysp_str_split" *generated-types*) t)
+    (ensure-string-helpers)
+    ;; Ensure Vector_str type exists
+    (let* ((vec-type (make-vector-type :str))
+           (c-vec (type-to-c vec-type))
+           (push-name "sysp_vecpush_str"))
+      (ensure-vector-push-helper push-name c-vec "const char*")
+      ;; str-split: split on delimiter, return Vector_str
+      (push (format nil "static ~a _sysp_str_split(const char* s, const char* delim) { ~a r = {NULL, 0, 0}; int dlen = strlen(delim); if (dlen == 0) { for (int i = 0; s[i]; i++) { char* c = malloc(2); c[0] = s[i]; c[1] = 0; ~a(&r, c); } return r; } const char* p = s; while (1) { const char* f = strstr(p, delim); if (!f) { int n = strlen(p); char* c = malloc(n + 1); memcpy(c, p, n + 1); ~a(&r, c); break; } int n = f - p; char* c = malloc(n + 1); memcpy(c, p, n); c[n] = 0; ~a(&r, c); p = f + dlen; } return r; }~%"
+                    c-vec c-vec push-name push-name push-name)
+            *functions*))))
+
+(defun compile-str-len (form env)
+  "(str-len s)"
+  (pushnew "string.h" *includes* :test #'string=)
+  (multiple-value-bind (s st) (compile-expr (second form) env)
+    (declare (ignore st))
+    (values (format nil "(int)strlen(~a)" s) :int)))
+
+(defun compile-str-ref (form env)
+  "(str-ref s i)"
+  (multiple-value-bind (s st) (compile-expr (second form) env)
+    (declare (ignore st))
+    (multiple-value-bind (i it) (compile-expr (third form) env)
+      (declare (ignore it))
+      (values (format nil "~a[~a]" s i) :char))))
+
+(defun compile-str-eq (form env)
+  "(str-eq? a b)"
+  (pushnew "string.h" *includes* :test #'string=)
+  (multiple-value-bind (a at) (compile-expr (second form) env)
+    (declare (ignore at))
+    (multiple-value-bind (b bt) (compile-expr (third form) env)
+      (declare (ignore bt))
+      (values (format nil "(strcmp(~a, ~a) == 0)" a b) :bool))))
+
+(defun compile-str-contains (form env)
+  "(str-contains? s sub)"
+  (pushnew "string.h" *includes* :test #'string=)
+  (multiple-value-bind (s st) (compile-expr (second form) env)
+    (declare (ignore st))
+    (multiple-value-bind (sub subt) (compile-expr (third form) env)
+      (declare (ignore subt))
+      (values (format nil "(strstr(~a, ~a) != NULL)" s sub) :bool))))
+
+(defun compile-str-find (form env)
+  "(str-find s sub) — index of sub in s, or -1"
+  (pushnew "string.h" *includes* :test #'string=)
+  (multiple-value-bind (s st) (compile-expr (second form) env)
+    (declare (ignore st))
+    (multiple-value-bind (sub subt) (compile-expr (third form) env)
+      (declare (ignore subt))
+      (let ((tmp (fresh-tmp))
+            (ptr-tmp (fresh-tmp)))
+        ;; LIFO: push int computation first so it emits after ptr decl
+        (push (format nil "  int ~a = ~a ? (int)(~a - ~a) : -1;" tmp ptr-tmp ptr-tmp s) *pending-stmts*)
+        (push (format nil "  const char* ~a = strstr(~a, ~a);" ptr-tmp s sub) *pending-stmts*)
+        (values tmp :int)))))
+
+(defun compile-str-concat (form env)
+  "(str-concat a b)"
+  (ensure-string-helpers)
+  (multiple-value-bind (a at) (compile-expr (second form) env)
+    (declare (ignore at))
+    (multiple-value-bind (b bt) (compile-expr (third form) env)
+      (declare (ignore bt))
+      (values (format nil "_sysp_str_concat(~a, ~a)" a b) :str))))
+
+(defun compile-str-slice (form env)
+  "(str-slice s start end)"
+  (ensure-string-helpers)
+  (multiple-value-bind (s st) (compile-expr (second form) env)
+    (declare (ignore st))
+    (multiple-value-bind (start start-t) (compile-expr (third form) env)
+      (declare (ignore start-t))
+      (multiple-value-bind (end end-t) (compile-expr (fourth form) env)
+        (declare (ignore end-t))
+        (values (format nil "_sysp_str_slice(~a, ~a, ~a)" s start end) :str)))))
+
+(defun compile-str-upper (form env)
+  "(str-upper s)"
+  (ensure-string-helpers)
+  (multiple-value-bind (s st) (compile-expr (second form) env)
+    (declare (ignore st))
+    (values (format nil "_sysp_str_upper(~a)" s) :str)))
+
+(defun compile-str-lower (form env)
+  "(str-lower s)"
+  (ensure-string-helpers)
+  (multiple-value-bind (s st) (compile-expr (second form) env)
+    (declare (ignore st))
+    (values (format nil "_sysp_str_lower(~a)" s) :str)))
+
+(defun compile-str-split (form env)
+  "(str-split s delim)"
+  (ensure-str-split-helper)
+  (multiple-value-bind (s st) (compile-expr (second form) env)
+    (declare (ignore st))
+    (multiple-value-bind (d dt) (compile-expr (third form) env)
+      (declare (ignore dt))
+      (values (format nil "_sysp_str_split(~a, ~a)" s d)
+              (make-vector-type :str)))))
+
+(defun compile-str-from-int (form env)
+  "(str-from-int n)"
+  (ensure-string-helpers)
+  (multiple-value-bind (n nt) (compile-expr (second form) env)
+    (declare (ignore nt))
+    (values (format nil "_sysp_str_from_int(~a)" n) :str)))
+
+(defun compile-str-from-float (form env)
+  "(str-from-float f)"
+  (ensure-string-helpers)
+  (multiple-value-bind (f ft) (compile-expr (second form) env)
+    (declare (ignore ft))
+    (values (format nil "_sysp_str_from_float(~a)" f) :str)))
 
 (defun compile-tuple (form env)
   "(tuple elem ...)"
@@ -6087,7 +6261,10 @@
                                          "hash-len" "hash-keys" "hash-vals" "hash-free"
                                          "inc" "dec" "bit-and" "bit-or" "bit-xor" "bit-not"
                                          "bit-shl" "bit-shr" "new" "recur" "break" "continue"
-                                         "block" "runtype" "as" "vector" "hash-map")
+                                         "block" "runtype" "as" "vector" "hash-map"
+                                         "str-len" "str-ref" "str-eq?" "str-contains?" "str-find"
+                                         "str-concat" "str-slice" "str-upper" "str-lower"
+                                         "str-split" "str-from-int" "str-from-float")
                                        :test #'equal))
                                  ;; Also safe: any known macro (expands inline)
                                  (not (gethash h *macros*))))
@@ -6132,7 +6309,10 @@
                                  "vector-push!" "vector-free"
                                  "hash-get" "hash-has?" "hash-del!"
                                  "hash-len" "hash-keys" "hash-vals" "hash-free"
-                                 "hash-set!" "array-ref" "array-set!" "get")
+                                 "hash-set!" "array-ref" "array-set!" "get"
+                                 "str-len" "str-ref" "str-eq?" "str-contains?" "str-find"
+                                 "str-concat" "str-slice" "str-upper" "str-lower"
+                                 "str-split" "str-from-int" "str-from-float")
                             :test #'equal))
              nil  ; extraction: var is accessed, not leaked
              (some (lambda (f) (var-escapes-through-arg-p f var-name))
