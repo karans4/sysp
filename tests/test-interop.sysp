@@ -1,0 +1,29 @@
+;; Test: C interop with vectors and hash maps
+;; Vectors should be passable to C functions expecting raw pointers
+
+(include "string.h")
+
+;; C function expecting int*
+(c-decl "static int _sum_array(int* arr, int n) { int s=0; for(int i=0;i<n;i++) s+=arr[i]; return s; }")
+(extern _sum_array [arr :ptr-int, n :int] :int)
+
+;; C function expecting const char**
+(c-decl "static int _count_strs(const char** strs, int n) { int c=0; for(int i=0;i<n;i++) if(strs[i]) c++; return c; }")
+(extern _count_strs [strs :ptr-str, n :int] :int)
+
+(defn main [] :int
+  ;; Pass vector's .data to C function expecting int*
+  (let v (vector 10 20 30 40 50))
+  (let sum (_sum_array (get v data) (get v len)))
+  (println sum)  ;; 150
+
+  ;; Access vector fields directly
+  (println (get v len))  ;; 5
+  (println (get v cap))  ;; 0 (stack-allocated)
+
+  ;; Pass string vector's .data to C function
+  (let names (vector "alice" "bob" "charlie"))
+  (let count (_count_strs (get names data) (get names len)))
+  (println count)  ;; 3
+
+  0)

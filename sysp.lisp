@@ -494,7 +494,6 @@
        :value)
 
       ;; Simple type returns
-      ((sym= head "nil?") :bool)
       ((sym= head "null?") :bool)
       ((sym= head "sym") :value)
       ((sym= head "sym-eq?") :bool)
@@ -909,7 +908,6 @@
         ((alphanumericp ch) (write-char ch s))
         ((char= ch #\-) (write-char #\_ s))
         ((char= ch #\+) (write-string "PLUS" s))
-        ((char= ch #\-) (write-string "MINUS" s))
         ((char= ch #\*) (write-string "STAR" s))
         ((char= ch #\/) (write-string "SLASH" s))
         ((char= ch #\=) (write-string "EQ" s))
@@ -1998,7 +1996,12 @@
     (setf (gethash name *generated-types*) t)
     (push (format nil "typedef struct { ~a* data; int len; int cap; } ~a;~%"
                   (type-to-c elem-type) name)
-          *type-decls*)))
+          *type-decls*)
+    ;; Register fields so (get v data), (get v len), (get v cap) type-check
+    (setf (gethash name *structs*)
+          (list (cons "data" (make-ptr-type elem-type))
+                (cons "len" :int)
+                (cons "cap" :int)))))
 
 (defun ensure-tuple-type (name elem-types)
   (unless (gethash name *generated-types*)
@@ -2031,6 +2034,13 @@
       (push (format nil "typedef struct { ~a* keys; ~a* vals; char* occ; int len; int cap; } ~a;~%"
                     ck cv name)
             *type-decls*)
+      ;; Register fields so (get m keys), (get m len) etc. type-check
+      (setf (gethash name *structs*)
+            (list (cons "keys" (make-ptr-type key-type))
+                  (cons "vals" (make-ptr-type val-type))
+                  (cons "occ" (make-ptr-type :char))
+                  (cons "len" :int)
+                  (cons "cap" :int)))
       ;; key comparison expression
       (let ((key-eq (if is-str-key
                         "strcmp(m->keys[h], key) == 0"
@@ -3212,10 +3222,13 @@
     ;; Compile body — use inner *pending-stmts* for lambda body, save results
     (let* ((all-but-last (butlast body-forms))
            (last-form (car (last body-forms)))
+           (uses-recur (form-uses-recur-p body-forms))
            (result-code nil)
            (result-type nil)
            (env-decl-stmt nil))
-      (let ((*pending-stmts* nil))
+      (let ((*pending-stmts* nil)
+            (*current-fn-params* params)
+            (*current-fn-name* lambda-name))
         (multiple-value-bind (last-code last-type) (compile-expr last-form fn-env)
           (let* ((ret-type (or ret-annotation last-type))
                  (arg-types (mapcar #'second params))
@@ -3244,7 +3257,10 @@
                  (last-code-fixed (if capturing-p
                                       (fix-capture-refs last-code captures)
                                       last-code))
-                 (all-body (append env-stmts body-stmts)))
+                 (all-body (append env-stmts
+                                   (if uses-recur
+                                       (cons "  _recur_top: ;" body-stmts)
+                                       body-stmts))))
             ;; Generate env struct typedef if capturing
             (when capturing-p
               (let ((fields (format nil "~{~a~^~%~}"
@@ -4882,13 +4898,21 @@
           (setf (gethash fn-name *name-overrides*) c-name))))))
 
 (defun form-uses-recur-p (forms)
-  "Check if any form in the tree contains a (recur ...) call"
+  "Check if any form in the tree contains a (recur ...) call.
+   Stops at lambda/fn boundaries — recur inside a nested lambda
+   belongs to that lambda, not the enclosing defn."
   (cond
     ((null forms) nil)
     ((symbolp forms) (sym= forms "recur"))
     ((listp forms)
-     (or (and (symbolp (first forms)) (sym= (first forms) "recur"))
-         (some #'form-uses-recur-p forms)))
+     (let ((head (first forms)))
+       (cond
+         ((and (symbolp head) (sym= head "recur")) t)
+         ;; Don't descend into nested function forms
+         ((and (symbolp head)
+               (or (sym= head "lambda") (sym= head "fn")))
+          nil)
+         (t (some #'form-uses-recur-p forms)))))
     (t nil)))
 
 (defun compile-recur-stmt (form env)

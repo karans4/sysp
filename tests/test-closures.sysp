@@ -35,6 +35,21 @@
   (set! result (add-y 10))
   result)
 
+;; Test 6: recur inside lambda (factorial)
+(defn test-lambda-recur [] :int
+  (let fact (lambda [n :int, acc :int] :int
+              (if (<= n 1) acc
+                  (recur (- n 1) (* acc n)))))
+  (fact 5 1))
+
+;; Test 7: recur inside lambda with accumulator, outer defn does NOT recur
+;; (verifies form-uses-recur-p stops at lambda boundary)
+(defn test-lambda-recur-no-outer [] :int
+  (let sum-to (lambda [n :int, acc :int] :int
+                (if (<= n 0) acc
+                    (recur (- n 1) (+ acc n)))))
+  (+ (sum-to 10 0) 1))
+
 (defn sysp_main [] :int
   ;; Test 1: basic capture
   (if (== (test-basic-capture) 15)
@@ -60,5 +75,15 @@
   (if (== (test-capture-value) 15)
     (println "PASS test-capture-value")
     (println "FAIL test-capture-value"))
+
+  ;; Test 6: lambda recur (factorial)
+  (if (== (test-lambda-recur) 120)
+    (println "PASS test-lambda-recur")
+    (println "FAIL test-lambda-recur"))
+
+  ;; Test 7: lambda recur, outer fn doesn't recur
+  (if (== (test-lambda-recur-no-outer) 56)
+    (println "PASS test-lambda-recur-no-outer")
+    (println "FAIL test-lambda-recur-no-outer"))
 
   0)
