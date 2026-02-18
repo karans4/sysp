@@ -522,6 +522,7 @@
       ((sym= head "str-ends?") (infer-expr (second form)) (infer-expr (third form)) :bool)
       ((sym= head "str-trim") (infer-expr (second form)) :str)
       ((sym= head "str-replace") (dolist (e (cdr form)) (infer-expr e)) :str)
+      ((sym= head "fmt") :str)  ; format string interpolation always returns :str
 
       ;; get: struct field access — need struct info
       ((sym= head "get")
@@ -2526,7 +2527,8 @@
     ("str-from-int" . compile-str-from-int) ("str-from-float" . compile-str-from-float)
     ("str-join" . compile-str-join) ("str-starts?" . compile-str-starts)
     ("str-ends?" . compile-str-ends) ("str-trim" . compile-str-trim)
-    ("str-replace" . compile-str-replace)))
+    ("str-replace" . compile-str-replace)
+    ("fmt" . compile-fmt)))
 
 (defun compile-list (form env)
   (let* ((head (first form))
@@ -3464,6 +3466,98 @@
     (multiple-value-bind (d dt) (compile-expr (third form) env)
       (declare (ignore dt))
       (values (lift-string-alloc (format nil "_sysp_str_join(~a.data, ~a.len, ~a)" v v d)) :str))))
+
+(defun parse-fmt-string (fmt-str)
+  "Parse a format string into segments. Returns list of (:lit \"text\") and (:expr \"code\").
+   {expr} interpolates, {{ and }} are literal braces."
+  (let ((segments nil)
+        (i 0)
+        (len (length fmt-str))
+        (buf (make-string-output-stream)))
+    (loop while (< i len) do
+      (let ((c (char fmt-str i)))
+        (cond
+          ;; {{ → literal {
+          ((and (char= c #\{) (< (1+ i) len) (char= (char fmt-str (1+ i)) #\{))
+           (write-char #\{ buf)
+           (incf i 2))
+          ;; }} → literal }
+          ((and (char= c #\}) (< (1+ i) len) (char= (char fmt-str (1+ i)) #\}))
+           (write-char #\} buf)
+           (incf i 2))
+          ;; { → start of interpolation
+          ((char= c #\{)
+           ;; Flush literal buffer
+           (let ((lit (get-output-stream-string buf)))
+             (when (> (length lit) 0)
+               (push (list :lit lit) segments)))
+           ;; Find matching } (handle nested parens for expressions)
+           (incf i)
+           (let ((expr-buf (make-string-output-stream))
+                 (depth 0))
+             (loop while (and (< i len)
+                              (not (and (char= (char fmt-str i) #\}) (= depth 0)))) do
+               (let ((ec (char fmt-str i)))
+                 (cond ((char= ec #\() (incf depth))
+                       ((char= ec #\)) (decf depth)))
+                 (write-char ec expr-buf)
+                 (incf i)))
+             (when (< i len) (incf i))  ; skip closing }
+             (push (list :expr (get-output-stream-string expr-buf)) segments)))
+          ;; Normal char
+          (t (write-char c buf)
+             (incf i)))))
+    ;; Flush remaining literal
+    (let ((lit (get-output-stream-string buf)))
+      (when (> (length lit) 0)
+        (push (list :lit lit) segments)))
+    (nreverse segments)))
+
+(defun compile-fmt (form env)
+  "(fmt \"hello {name}, you are {age}\") → chain of str-concat with auto-conversion.
+   {expr} interpolates: strings used directly, ints → str-from-int, floats → str-from-float."
+  (ensure-string-helpers)
+  (let* ((fmt-str (second form))
+         (segments (parse-fmt-string fmt-str)))
+    (if (null segments)
+        ;; Empty format string
+        (values "\"\"" :str)
+        ;; Build chain of str-concat calls
+        (let ((parts nil))
+          ;; Compile each segment to a C expression
+          (dolist (seg segments)
+            (ecase (first seg)
+              (:lit
+               (push (format nil "~s" (second seg)) parts))
+              (:expr
+               (let* ((expr-str (second seg))
+                      ;; Parse the expression string using sysp reader
+                      (expr-form (with-input-from-string (s expr-str)
+                                   (let ((*readtable* (copy-readtable nil)))
+                                     (setf (readtable-case *readtable*) :preserve)
+                                     (read s)))))
+                 (multiple-value-bind (code tp) (compile-expr expr-form env)
+                   ;; Auto-convert non-strings
+                   (cond
+                     ((eq tp :str) (push code parts))
+                     ((member tp '(:int :i8 :i16 :i32 :i64 :u8 :u16 :u32 :u64
+                                   :char :short :long :long-long :size))
+                      (push (lift-string-alloc (format nil "_sysp_str_from_int(~a)" code)) parts))
+                     ((member tp '(:float :double :f32 :f64))
+                      (push (lift-string-alloc (format nil "_sysp_str_from_float(~a)" code)) parts))
+                     ((eq tp :bool)
+                      (push (format nil "(~a ? \"true\" : \"false\")" code) parts))
+                     (t (push code parts))))))))
+          (setf parts (nreverse parts))
+          (if (= (length parts) 1)
+              ;; Single part — just return it
+              (values (first parts) :str)
+              ;; Multiple parts — chain str-concat, lifting each to a temp
+              (let ((result (first parts)))
+                (dolist (p (rest parts))
+                  (setf result (lift-string-alloc
+                                (format nil "_sysp_str_concat(~a, ~a)" result p))))
+                (values result :str)))))))
 
 (defun compile-tuple (form env)
   "(tuple elem ...)"

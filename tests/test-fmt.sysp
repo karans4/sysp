@@ -1,0 +1,54 @@
+;; test-fmt.sysp — string interpolation
+
+(defn test-basic [] :int
+  (let name "world")
+  (let s (fmt "hello {name}"))
+  (if (str-eq? s "hello world") (println "PASS basic") (println "FAIL basic"))
+  0)
+
+(defn test-multi [] :int
+  (let first "Jane")
+  (let last "Doe")
+  (let s (fmt "{first} {last}"))
+  (if (str-eq? s "Jane Doe") (println "PASS multi") (println "FAIL multi"))
+  0)
+
+(defn test-int [] :int
+  (let age 25)
+  (let s (fmt "age: {age}"))
+  (if (str-eq? s "age: 25") (println "PASS int") (println "FAIL int"))
+  0)
+
+(defn test-expr [] :int
+  (let x 10)
+  (let s (fmt "result: {(+ x 5)}"))
+  (if (str-eq? s "result: 15") (println "PASS expr") (println "FAIL expr"))
+  0)
+
+(defn test-no-interp [] :int
+  (let s (fmt "plain string"))
+  (if (str-eq? s "plain string") (println "PASS no-interp") (println "FAIL no-interp"))
+  0)
+
+(defn test-adjacent [] :int
+  (let a "hello")
+  (let b "world")
+  (let s (fmt "{a}{b}"))
+  (if (str-eq? s "helloworld") (println "PASS adjacent") (println "FAIL adjacent"))
+  0)
+
+(defn test-empty [] :int
+  (let s (fmt ""))
+  (if (str-eq? s "") (println "PASS empty") (println "FAIL empty"))
+  0)
+
+(defn main [] :int
+  (test-basic)
+  (test-multi)
+  (test-int)
+  (test-expr)
+  (test-no-interp)
+  (test-adjacent)
+  (test-empty)
+  (println "All fmt tests passed!")
+  0)
