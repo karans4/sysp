@@ -82,6 +82,9 @@
 
 ;; Pending statements to emit before current expression
 (defvar *pending-stmts* nil)
+;; Pending string frees to emit after current statement
+;; Each entry is a C variable name (temp) holding an allocated string
+(defvar *pending-string-frees* nil)
 
 ;; Type variable bindings: hash table from tvar-id -> type
 (defvar *tvar-bindings* (make-hash-table))
@@ -854,13 +857,14 @@
           (env-rc-releases env)))
 
 (defun env-add-data-release (env c-name kind)
-  "Record a vector or hashmap for data release at scope exit.
-   kind is :vector or :hashmap."
+  "Record a vector, hashmap, or allocated string for data release at scope exit.
+   kind is :vector, :hashmap, or :string."
   (push (cons c-name kind) (env-data-releases env)))
 
 (defun emit-data-releases (env)
-  "Generate free() calls for vector/hashmap internal data at scope exit.
-   Vectors: only free if cap > 0 (cap=0 means stack-allocated compound literal)."
+  "Generate free() calls for vector/hashmap/string data at scope exit.
+   Vectors: only free if cap > 0 (cap=0 means stack-allocated compound literal).
+   Strings: free the malloc'd char* (only registered for allocating ops, not literals)."
   (mapcan (lambda (entry)
             (let ((c-name (car entry))
                   (kind (cdr entry)))
@@ -868,6 +872,7 @@
                 (:vector (list (format nil "  if (~a.cap > 0) free(~a.data);" c-name c-name)))
                 (:hashmap (list (format nil "  free(~a.keys); free(~a.vals); free(~a.occ);"
                                         c-name c-name c-name)))
+                (:string (list (format nil "  free((char*)~a);" c-name)))
                 (otherwise nil))))
           (env-data-releases env)))
 
@@ -2965,6 +2970,7 @@
                                          (:vector (list (format nil "  if (~a.cap > 0) free(~a.data);" c-name c-name)))
                                          (:hashmap (list (format nil "  free(~a.keys); free(~a.vals); free(~a.occ);"
                                                                  c-name c-name c-name)))
+                                         (:string (list (format nil "  free((char*)~a);" c-name)))
                                          (otherwise nil))))
                                    releases)))
               (values type (append body-stmts last-stmts release-stmts))))))))
@@ -3339,6 +3345,18 @@
         (push (format nil "  const char* ~a = strstr(~a, ~a);" ptr-tmp s sub) *pending-stmts*)
         (values tmp :int)))))
 
+(defun lift-string-alloc (c-expr)
+  "Statement-lift an allocating string expression to a temp variable.
+   Appends to end of *pending-stmts* (not push) so inner allocations
+   appear before outer ones that depend on them in the output.
+   Registers the temp for deferred free (cleaned up at statement boundary).
+   Returns the temp name."
+  (let ((tmp (fresh-tmp)))
+    (setf *pending-stmts* (append *pending-stmts*
+                                  (list (format nil "  const char* ~a = ~a;" tmp c-expr))))
+    (push tmp *pending-string-frees*)
+    tmp))
+
 (defun compile-str-concat (form env)
   "(str-concat a b)"
   (ensure-string-helpers)
@@ -3346,7 +3364,7 @@
     (declare (ignore at))
     (multiple-value-bind (b bt) (compile-expr (third form) env)
       (declare (ignore bt))
-      (values (format nil "_sysp_str_concat(~a, ~a)" a b) :str))))
+      (values (lift-string-alloc (format nil "_sysp_str_concat(~a, ~a)" a b)) :str))))
 
 (defun compile-str-slice (form env)
   "(str-slice s start end)"
@@ -3357,21 +3375,21 @@
       (declare (ignore start-t))
       (multiple-value-bind (end end-t) (compile-expr (fourth form) env)
         (declare (ignore end-t))
-        (values (format nil "_sysp_str_slice(~a, ~a, ~a)" s start end) :str)))))
+        (values (lift-string-alloc (format nil "_sysp_str_slice(~a, ~a, ~a)" s start end)) :str)))))
 
 (defun compile-str-upper (form env)
   "(str-upper s)"
   (ensure-string-helpers)
   (multiple-value-bind (s st) (compile-expr (second form) env)
     (declare (ignore st))
-    (values (format nil "_sysp_str_upper(~a)" s) :str)))
+    (values (lift-string-alloc (format nil "_sysp_str_upper(~a)" s)) :str)))
 
 (defun compile-str-lower (form env)
   "(str-lower s)"
   (ensure-string-helpers)
   (multiple-value-bind (s st) (compile-expr (second form) env)
     (declare (ignore st))
-    (values (format nil "_sysp_str_lower(~a)" s) :str)))
+    (values (lift-string-alloc (format nil "_sysp_str_lower(~a)" s)) :str)))
 
 (defun compile-str-split (form env)
   "(str-split s delim)"
@@ -3388,14 +3406,14 @@
   (ensure-string-helpers)
   (multiple-value-bind (n nt) (compile-expr (second form) env)
     (declare (ignore nt))
-    (values (format nil "_sysp_str_from_int(~a)" n) :str)))
+    (values (lift-string-alloc (format nil "_sysp_str_from_int(~a)" n)) :str)))
 
 (defun compile-str-from-float (form env)
   "(str-from-float f)"
   (ensure-string-helpers)
   (multiple-value-bind (f ft) (compile-expr (second form) env)
     (declare (ignore ft))
-    (values (format nil "_sysp_str_from_float(~a)" f) :str)))
+    (values (lift-string-alloc (format nil "_sysp_str_from_float(~a)" f)) :str)))
 
 (defun compile-str-starts (form env)
   "(str-starts? s prefix)"
@@ -3425,7 +3443,7 @@
   (ensure-string-helpers)
   (multiple-value-bind (s st) (compile-expr (second form) env)
     (declare (ignore st))
-    (values (format nil "_sysp_str_trim(~a)" s) :str)))
+    (values (lift-string-alloc (format nil "_sysp_str_trim(~a)" s)) :str)))
 
 (defun compile-str-replace (form env)
   "(str-replace s old new)"
@@ -3436,7 +3454,7 @@
       (declare (ignore ot))
       (multiple-value-bind (new-s nt) (compile-expr (fourth form) env)
         (declare (ignore nt))
-        (values (format nil "_sysp_str_replace(~a, ~a, ~a)" s old new-s) :str)))))
+        (values (lift-string-alloc (format nil "_sysp_str_replace(~a, ~a, ~a)" s old new-s)) :str)))))
 
 (defun compile-str-join (form env)
   "(str-join vec delim)"
@@ -3445,7 +3463,7 @@
     (declare (ignore vt))
     (multiple-value-bind (d dt) (compile-expr (third form) env)
       (declare (ignore dt))
-      (values (format nil "_sysp_str_join(~a.data, ~a.len, ~a)" v v d) :str))))
+      (values (lift-string-alloc (format nil "_sysp_str_join(~a.data, ~a.len, ~a)" v v d)) :str))))
 
 (defun compile-tuple (form env)
   "(tuple elem ...)"
@@ -4490,11 +4508,16 @@
      (compile-hash-free-stmt form env))
     ((and (listp form) (sym= (first form) "vector-free"))
      (compile-vector-free-stmt form env))
-    (t (let ((*pending-stmts* nil))
+    (t (let ((*pending-stmts* nil)
+             (*pending-string-frees* nil))
          (multiple-value-bind (code tp) (compile-expr form env)
            (declare (ignore tp))
-           (append *pending-stmts*
-                   (list (format nil "  ~a;" code))))))))
+           (let ((str-free-stmts (mapcar (lambda (tmp)
+                                           (format nil "  free((char*)~a);" tmp))
+                                         *pending-string-frees*)))
+             (append *pending-stmts*
+                     (list (format nil "  ~a;" code))
+                     str-free-stmts)))))))
 
 (defun compile-let-stmt (form env)
   "(let name expr) or (let name :type expr) or (let name (make-array :type size))
@@ -4507,9 +4530,11 @@
                        (setf rest (cdr rest)))))
          (init-form (first rest)))
     (let ((*pending-stmts* nil)
+          (*pending-string-frees* nil)
           (*current-let-target* name))
       (multiple-value-bind (init-code init-type) (compile-expr init-form env)
         (let* ((lifted-stmts *pending-stmts*)
+               (str-frees *pending-string-frees*)
                (final-type (or type-ann init-type))
                (c-name (sanitize-name name))
                ;; Check if escape analysis says this is stack-allocatable
@@ -4548,7 +4573,13 @@
             (when (and (eq (type-kind final-type) :vector) should-release)
               (env-add-data-release env c-name :vector))
             (when (and (eq (type-kind final-type) :hashmap) should-release)
-              (env-add-data-release env c-name :hashmap)))
+              (env-add-data-release env c-name :hashmap))
+            ;; For strings: only register for scope-exit free when the init
+            ;; actually produced string allocations (tracked via *pending-string-frees*).
+            ;; This avoids false positives on borrows like (vector-ref v i).
+            (when (and (eq final-type :str) str-frees
+                       (or (eq ea-result :local) (null ea-result)))
+              (env-add-data-release env c-name :string)))
           ;; Determine if this is an RC copy (variable → variable, needs retain)
           (let* ((rc-copy-p (and (rc-type-p final-type)
                                  (symbolp init-form)
@@ -4571,7 +4602,18 @@
                          (t
                           (list (format nil "  ~a ~a = ~a;"
                                         (type-to-c final-type) c-name init-code))))))
-            (append lifted-stmts decl)))))))
+            ;; Free intermediate string temps (not the one assigned to this let)
+            ;; If this let is tracking the string for scope-exit cleanup, the outermost
+            ;; temp (init-code) is aliased by c-name — don't free it.
+            (let* ((str-free-stmts
+                     (when str-frees
+                       (let ((exclude (when (member (cons c-name :string) (env-data-releases env) :test #'equal)
+                                        init-code)))
+                         (mapcan (lambda (tmp)
+                                   (unless (and exclude (string= tmp exclude))
+                                     (list (format nil "  free((char*)~a);" tmp))))
+                                 str-frees)))))
+              (append lifted-stmts decl str-free-stmts))))))))
 
 (defun format-print-arg (val-code val-type)
   "Return format string and arg for a typed value (C99 format specifiers)
@@ -4620,33 +4662,41 @@
 
 (defun compile-print-stmt (form env)
   "(print expr) — print without newline"
-  (let ((*pending-stmts* nil))
+  (let ((*pending-stmts* nil)
+        (*pending-string-frees* nil))
     (multiple-value-bind (val-code val-type) (compile-expr (second form) env)
       (multiple-value-bind (fmt arg) (format-print-arg val-code val-type)
-        (append *pending-stmts*
-                (cond
-                  ((eq fmt :value-print)
-                   (list (format nil "  sysp_print_value(~a);" arg)))
-                  ((eq fmt :pri)
-                   (list (format nil "  printf(\"%\" ~a, ~a);" arg val-code)))
-                  (t
-                   (list (format nil "  printf(\"~a\", ~a);" fmt arg)))))))))
+        (let ((str-free-stmts (mapcar (lambda (tmp) (format nil "  free((char*)~a);" tmp))
+                                      *pending-string-frees*)))
+          (append *pending-stmts*
+                  (cond
+                    ((eq fmt :value-print)
+                     (list (format nil "  sysp_print_value(~a);" arg)))
+                    ((eq fmt :pri)
+                     (list (format nil "  printf(\"%\" ~a, ~a);" arg val-code)))
+                    (t
+                     (list (format nil "  printf(\"~a\", ~a);" fmt arg))))
+                  str-free-stmts))))))
 
 (defun compile-println-stmt (form env)
   "(println expr) or (println) — print with newline"
   (if (null (rest form))
       (list "  printf(\"\\n\");")
-      (let ((*pending-stmts* nil))
+      (let ((*pending-stmts* nil)
+            (*pending-string-frees* nil))
         (multiple-value-bind (val-code val-type) (compile-expr (second form) env)
           (multiple-value-bind (fmt arg) (format-print-arg val-code val-type)
-            (append *pending-stmts*
-                    (cond
-                      ((eq fmt :value-print)
-                       (list (format nil "  sysp_print_value(~a); printf(\"\\n\");" arg)))
-                      ((eq fmt :pri)
-                       (list (format nil "  printf(\"%\" ~a \"\\n\", ~a);" arg val-code)))
-                      (t
-                       (list (format nil "  printf(\"~a\\n\", ~a);" fmt arg))))))))))
+            (let ((str-free-stmts (mapcar (lambda (tmp) (format nil "  free((char*)~a);" tmp))
+                                          *pending-string-frees*)))
+              (append *pending-stmts*
+                      (cond
+                        ((eq fmt :value-print)
+                         (list (format nil "  sysp_print_value(~a); printf(\"\\n\");" arg)))
+                        ((eq fmt :pri)
+                         (list (format nil "  printf(\"%\" ~a \"\\n\", ~a);" arg val-code)))
+                        (t
+                         (list (format nil "  printf(\"~a\\n\", ~a);" fmt arg))))
+                      str-free-stmts)))))))
 
 (defun c-escape-string (s)
   "Escape a CL string for C string literal content.
@@ -4825,18 +4875,30 @@
 
 (defun compile-set-stmt (form env)
   "(set! target val)"
-  (let ((*pending-stmts* nil))
+  (let ((*pending-stmts* nil)
+        (*pending-string-frees* nil))
     (multiple-value-bind (code tp) (compile-set-expr form env)
-      (declare (ignore tp))
-      (append *pending-stmts*
-              (list (format nil "  ~a;" code))))))
+      ;; Free intermediate string temps (not the one being assigned to the target)
+      (let ((str-free-stmts (mapcar (lambda (tmp) (format nil "  free((char*)~a);" tmp))
+                                    (if (and (eq tp :str) *pending-string-frees*)
+                                        (rest *pending-string-frees*)
+                                        *pending-string-frees*))))
+        (append *pending-stmts*
+                (list (format nil "  ~a;" code))
+                str-free-stmts)))))
 
 (defun compile-return-stmt (form env)
   "(return expr) or (return)"
   (if (rest form)
-      (multiple-value-bind (code tp) (compile-expr (second form) env)
-        (declare (ignore tp))
-        (list (format nil "  return ~a;" code)))
+      (let ((*pending-string-frees* nil))
+        (multiple-value-bind (code tp) (compile-expr (second form) env)
+          (declare (ignore tp))
+          ;; Free intermediate string temps (not the returned value itself)
+          (let ((str-free-stmts (mapcar (lambda (tmp) (format nil "  free((char*)~a);" tmp))
+                                        (if (and (eq tp :str) *pending-string-frees*)
+                                            (rest *pending-string-frees*)
+                                            *pending-string-frees*))))
+            (append str-free-stmts (list (format nil "  return ~a;" code))))))
       (list "  return;")))
 
 ;;; === Pattern Matching ===
@@ -6372,7 +6434,8 @@
   (setf *uses-conditions* nil)
   (setf *exports* nil)
   (setf *escape-info* (make-hash-table :test 'equal))
-  (setf *uses-hashmap* nil))
+  (setf *uses-hashmap* nil)
+  (setf *pending-string-frees* nil))
 
 ;;; === Escape Analysis ===
 
@@ -6382,10 +6445,14 @@
    Returns list of var-name strings."
   (let ((bindings nil))
     (labels ((alloc-form-p (init)
-               "Check if init form is a known allocation"
+               "Check if init form is a known allocation (struct, vector, hashmap, or string)"
                (and (listp init) (symbolp (first init))
                     (let ((h (string-downcase (string (first init)))))
-                      (or (string= h "new") (string= h "vector") (string= h "hash-map")))))
+                      (or (string= h "new") (string= h "vector") (string= h "hash-map")
+                          (member h '("str-concat" "str-slice" "str-upper" "str-lower"
+                                      "str-trim" "str-replace" "str-from-int" "str-from-float"
+                                      "str-join")
+                                  :test #'equal)))))
              (walk (form)
                (when (listp form)
                  (let ((head (first form)))

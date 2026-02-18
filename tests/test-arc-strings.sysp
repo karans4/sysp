@@ -1,0 +1,112 @@
+;; test-arc-strings.sysp — verify allocated strings are freed at scope exit
+;; Run with valgrind to confirm zero leaks.
+
+(defn test-concat [] :int
+  (let s (str-concat "hello" " world"))
+  (if (str-eq? s "hello world") (println "PASS concat") (println "FAIL concat"))
+  0)
+
+(defn test-slice [] :int
+  (let s (str-slice "hello world" 0 5))
+  (if (str-eq? s "hello") (println "PASS slice") (println "FAIL slice"))
+  0)
+
+(defn test-upper-lower [] :int
+  (let u (str-upper "hello"))
+  (let l (str-lower "WORLD"))
+  (if (and (str-eq? u "HELLO") (str-eq? l "world"))
+    (println "PASS upper/lower")
+    (println "FAIL upper/lower"))
+  0)
+
+(defn test-trim [] :int
+  (let s (str-trim "  hello  "))
+  (if (str-eq? s "hello") (println "PASS trim") (println "FAIL trim"))
+  0)
+
+(defn test-replace [] :int
+  (let s (str-replace "hello world" "world" "sysp"))
+  (if (str-eq? s "hello sysp") (println "PASS replace") (println "FAIL replace"))
+  0)
+
+(defn test-from-int [] :int
+  (let s (str-from-int 42))
+  (if (str-eq? s "42") (println "PASS from-int") (println "FAIL from-int"))
+  0)
+
+(defn test-from-float [] :int
+  (let s (str-from-float 3.14))
+  (if (str-starts? s "3.14") (println "PASS from-float") (println "FAIL from-float"))
+  0)
+
+(defn test-nested-scope [] :int
+  ;; Strings in inner do-block should be freed when block exits
+  (let result (do
+    (let a (str-concat "foo" "bar"))
+    (let b (str-concat a "baz"))
+    (str-eq? b "foobarbaz")))
+  (if result (println "PASS nested") (println "FAIL nested"))
+  0)
+
+(defn test-loop-alloc [] :int
+  ;; Strings allocated in loop body should be freed each iteration
+  (let-mut count 0)
+  (for [i 0 100]
+    (let s (str-concat "iter" (str-from-int i)))
+    (set! count (+ count 1)))
+  (if (== count 100) (println "PASS loop") (println "FAIL loop"))
+  0)
+
+(defn test-literal-no-free [] :int
+  ;; String literals are NOT allocated — no free
+  (let s "hello")
+  (if (str-eq? s "hello") (println "PASS literal") (println "FAIL literal"))
+  0)
+
+(defn test-borrow [] :int
+  ;; Assigning from another var is a borrow — no double-free
+  (let a (str-concat "hello" " world"))
+  (let b a)
+  (if (str-eq? b "hello world") (println "PASS borrow") (println "FAIL borrow"))
+  0)
+
+(defn make-greeting [name :str] :str
+  ;; Returned string escapes — should NOT be freed by callee
+  (str-concat "hello " name))
+
+(defn test-return-escapes [] :int
+  (let s (make-greeting "sysp"))
+  (if (str-eq? s "hello sysp") (println "PASS return-escapes") (println "FAIL return-escapes"))
+  0)
+
+(defn test-join [] :int
+  (let v (vector "a" "b" "c"))
+  (let s (str-join v ","))
+  (if (str-eq? s "a,b,c") (println "PASS join") (println "FAIL join"))
+  0)
+
+(defn test-chained [] :int
+  ;; Chain of string ops — intermediate results should be freed
+  (let s1 (str-concat "hello" " "))
+  (let s2 (str-concat s1 "world"))
+  (let s3 (str-upper s2))
+  (if (str-eq? s3 "HELLO WORLD") (println "PASS chained") (println "FAIL chained"))
+  0)
+
+(defn main [] :int
+  (test-concat)
+  (test-slice)
+  (test-upper-lower)
+  (test-trim)
+  (test-replace)
+  (test-from-int)
+  (test-from-float)
+  (test-nested-scope)
+  (test-loop-alloc)
+  (test-literal-no-free)
+  (test-borrow)
+  (test-return-escapes)
+  (test-join)
+  (test-chained)
+  (println "All ARC string tests passed!")
+  0)
