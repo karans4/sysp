@@ -967,6 +967,7 @@
 (defvar *mono-instances* (make-hash-table :test #'equal))  ; mangled-name -> t (already generated)
 (defvar *macro-fns* (make-hash-table :test 'equal))  ; name -> (params body) for compile-time eval
 (defvar *direct-fns* (make-hash-table :test 'equal))  ; names of defn/extern functions (direct call, not Fn)
+(defvar *defn-wrappers* (make-hash-table :test 'equal))  ; c-name -> wrapper-name (defn→Fn wrapper dedup)
 (defvar *env-counter* 0)  ; counter for closure env structs
 (defvar *interp-gensym-counter* 0)
 (defvar *spawn-counter* 0)    ; counter for spawn sites
@@ -1677,48 +1678,9 @@
                         (list* 'for (list idx 0 (list 'vector-len collection))
                                (cons (list 'let var (list 'vector-ref collection idx))
                                      body))))))))
-  ;; map: (map f vec) => (do (let-mut _mN (vector)) (for [...] (vector-push! _mN (f (vector-ref vec _i)))) _mN)
-  (setf (gethash "map" *macros*)
-        (lambda (form)
-          (let* ((f (second form))
-                 (vec (third form))
-                 (result (intern (format nil "_mr~d" (incf *sysp-gensym-counter*))))
-                 (idx (intern (format nil "_mi~d" (incf *sysp-gensym-counter*)))))
-            (list 'do
-                  (list 'let-mut result (list 'vector))
-                  (list 'for (list idx 0 (list 'vector-len vec))
-                        (list 'vector-push! result (list f (list 'vector-ref vec idx))))
-                  result))))
-  ;; filter: (filter pred vec) => (do (let-mut _fN (vector)) (for [...] (let _fe ..) (when (pred _fe) (vector-push! ...))) _fN)
-  (setf (gethash "filter" *macros*)
-        (lambda (form)
-          (let* ((pred (second form))
-                 (vec (third form))
-                 (result (intern (format nil "_fr~d" (incf *sysp-gensym-counter*))))
-                 (idx (intern (format nil "_fi~d" (incf *sysp-gensym-counter*))))
-                 (elem (intern (format nil "_fe~d" (incf *sysp-gensym-counter*)))))
-            (list 'do
-                  (list 'let-mut result (list 'vector))
-                  (list 'for (list idx 0 (list 'vector-len vec))
-                        (list 'let elem (list 'vector-ref vec idx))
-                        (list 'when (list pred elem)
-                              (list 'vector-push! result elem)))
-                  result))))
-  ;; keep: alias for filter
-  (setf (gethash "keep" *macros*) (gethash "filter" *macros*))
-  ;; reduce: (reduce f init vec) => (do (let-mut _rN init) (for [...] (set! _rN (f _rN (vector-ref vec _i)))) _rN)
-  (setf (gethash "reduce" *macros*)
-        (lambda (form)
-          (let* ((f (second form))
-                 (init (third form))
-                 (vec (fourth form))
-                 (acc (intern (format nil "_ra~d" (incf *sysp-gensym-counter*))))
-                 (idx (intern (format nil "_ri~d" (incf *sysp-gensym-counter*)))))
-            (list 'do
-                  (list 'let-mut acc init)
-                  (list 'for (list idx 0 (list 'vector-len vec))
-                        (list 'set! acc (list f acc (list 'vector-ref vec idx))))
-                  acc))))
+  ;; map, filter, reduce: now real poly defn functions in lib/core.sysp
+  ;; keep: alias for filter (also in core.sysp now)
+  ;; (removed macro definitions — these are now first-class HOFs)
   ;; === Clojure-style aliases for hash maps ===
   ;; assoc!: (assoc! m k v) => (hash-set! m k v)
   (setf (gethash "assoc!" *macros*)
@@ -4679,6 +4641,32 @@
     (or (gethash resolved *name-overrides*)
         (sanitize-name resolved))))
 
+(defun wrap-defn-as-fn (c-name fn-type)
+  "Generate a static wrapper so a defn (no void* ctx) can be used as an Fn struct.
+   Returns the Fn struct literal string. Deduplicates by c-name."
+  (let* ((arg-types (fn-type-args fn-type))
+         (ret-type (fn-type-ret fn-type))
+         (fn-c-type (fn-type-c-name fn-type))
+         (wrapper-name (gethash c-name *defn-wrappers*)))
+    (unless wrapper-name
+      (setf wrapper-name (format nil "_wrap_~a" c-name))
+      (setf (gethash c-name *defn-wrappers*) wrapper-name)
+      ;; Generate: static ret wrapper(void* _ctx, args...) { (void)_ctx; return name(args...); }
+      (let* ((param-names (loop for i from 0 below (length arg-types)
+                                collect (format nil "_a~d" i)))
+             (c-params (format nil "void* _ctx~{, ~a ~a~}"
+                               (mapcan (lambda (tp pn) (list (type-to-c tp) pn))
+                                       arg-types param-names)))
+             (call-args (format nil "~{~a~^, ~}" param-names))
+             (body (if (eq ret-type :void)
+                       (format nil "  (void)_ctx; ~a(~a);" c-name call-args)
+                       (format nil "  (void)_ctx; return ~a(~a);" c-name call-args))))
+        (push (format nil "static ~a ~a(~a);" (type-to-c ret-type) wrapper-name c-params)
+              *lambda-forward-decls*)
+        (push (format nil "static ~a ~a(~a) {~%~a~%}~%" (type-to-c ret-type) wrapper-name c-params body)
+              *functions*)))
+    (format nil "(~a){~a, NULL}" fn-c-type wrapper-name)))
+
 (defun compile-call (form env)
   "Compile a function call, handling variadic and polymorphic functions."
   (let* ((fn-name (resolve-name (string (first form))))
@@ -4688,6 +4676,15 @@
       (let* ((compiled-args-data (mapcar (lambda (a) (multiple-value-list (compile-expr a env))) args))
              (arg-codes (mapcar #'first compiled-args-data))
              (arg-types (mapcar #'second compiled-args-data))
+             ;; Auto-wrap: if arg is a defn name with (:fn ...) type, wrap as Fn struct
+             (wrapped-codes
+              (mapcar (lambda (arg code tp)
+                        (if (and (symbolp arg)
+                                 (gethash (resolve-name (string arg)) *direct-fns*)
+                                 (consp tp) (eq (car tp) :fn))
+                            (wrap-defn-as-fn code tp)
+                            code))
+                      args arg-codes arg-types))
              (mangled (instantiate-poly-fn fn-name arg-types))
              ;; Look up the instantiated function's return type
              (inst-fn-type (env-lookup *global-env* mangled))
@@ -4695,7 +4692,7 @@
                            (fn-type-ret inst-fn-type)
                            (first arg-types))))  ; fallback for identity-like
         (return-from compile-call
-          (values (format nil "~a(~{~a~^, ~})" mangled arg-codes) ret-type))))
+          (values (format nil "~a(~{~a~^, ~})" mangled wrapped-codes) ret-type))))
     (if (gethash fn-name *structs*)
         (compile-struct-construct fn-name args env)
         (let* ((fn-type (env-lookup env fn-name))
@@ -5573,6 +5570,19 @@
               (car-type (parse-type-annotation car-sym))
               (cdr-type (parse-type-annotation cdr-sym)))
          (cons (make-cons-type car-type cdr-type) lst)))
+      ;; Vector type: (:vector elem-type)
+      ((and (keywordp sym)
+            (string-equal (symbol-name sym) "vector")
+            lst)
+       (let ((elem-sym (pop lst)))
+         (cons (make-vector-type (parse-type-annotation elem-sym)) lst)))
+      ;; Hashmap type: (:hashmap key-type val-type)
+      ((and (keywordp sym)
+            (string-equal (symbol-name sym) "hashmap")
+            lst (cdr lst))
+       (let* ((key-sym (pop lst))
+              (val-sym (pop lst)))
+         (cons (make-hashmap-type (parse-type-annotation key-sym) (parse-type-annotation val-sym)) lst)))
       ;; Simple type
       (t (cons (parse-type-annotation sym) lst)))))
 
@@ -5766,6 +5776,33 @@
   (format nil "~a_~{~a~^_~}" (sanitize-name base-name)
           (mapcar #'mangle-type-name concrete-types)))
 
+(defun type-to-annotation-tokens (tp)
+  "Convert an internal type to annotation tokens for synthetic defn param lists.
+   Simple types become a single keyword; compound types become multiple tokens."
+  (cond
+    ;; Compound fn type: (:fn (arg-types) ret) -> :fn (:arg1 :arg2) :ret
+    ((and (consp tp) (eq (car tp) :fn))
+     (let ((arg-types (fn-type-args tp))
+           (ret-type (fn-type-ret tp)))
+       (list (intern "FN" :keyword)
+             (mapcar (lambda (at)
+                       (let ((tokens (type-to-annotation-tokens at)))
+                         (if (= (length tokens) 1) (first tokens) tokens)))
+                     arg-types)
+             (let ((ret-tokens (type-to-annotation-tokens ret-type)))
+               (if (= (length ret-tokens) 1) (first ret-tokens) ret-tokens)))))
+    ;; Compound vector type: (:vector elem) -> :vector :elem-type
+    ((and (consp tp) (eq (car tp) :vector))
+     (let ((elem-tokens (type-to-annotation-tokens (second tp))))
+       (cons (intern "VECTOR" :keyword) elem-tokens)))
+    ;; Compound hashmap type: (:hashmap k v) -> :hashmap :k :v
+    ((and (consp tp) (eq (car tp) :hashmap))
+     (let ((key-tokens (type-to-annotation-tokens (second tp)))
+           (val-tokens (type-to-annotation-tokens (third tp))))
+       (append (list (intern "HASHMAP" :keyword)) key-tokens val-tokens)))
+    ;; Simple type: :int -> (:INT)
+    (t (list (intern (string-upcase (mangle-type-name tp)) :keyword)))))
+
 (defun instantiate-poly-fn (name concrete-arg-types)
   "Instantiate a polymorphic function with concrete types.
    Returns the mangled C name."
@@ -5788,9 +5825,11 @@
               ;; :? annotation — substitute with concrete type
               ((and (keywordp item) (string-equal (symbol-name item) "?"))
                (pop new-params)  ; remove the :?
-               ;; Push the concrete type keyword
-               (let ((concrete (nth type-idx concrete-arg-types)))
-                 (push (intern (string-upcase (mangle-type-name concrete)) :keyword) new-params))
+               ;; Push annotation tokens for the concrete type (may be multiple for compound types)
+               (let* ((concrete (nth type-idx concrete-arg-types))
+                      (tokens (type-to-annotation-tokens concrete)))
+                 (dolist (tok tokens)
+                   (push tok new-params)))
                (incf type-idx))
               ;; Other type annotation — skip it for counting
               ((keywordp item)
@@ -5801,8 +5840,8 @@
         ;; Determine concrete return type
         (let* ((concrete-ret (cond
                                ((eq ret-ann :poly)
-                                ;; For :? return, use the first concrete arg type as heuristic
-                                (or (first concrete-arg-types) :int))
+                                ;; Return :poly → omit annotation, let body type inference handle it
+                                nil)
                                ;; Compound return with :? (e.g., (:values :? :?))
                                ((and (listp ret-ann) (form-has-poly-marker-p ret-ann))
                                 (subst-poly-type ret-ann concrete-arg-types))
@@ -5810,12 +5849,9 @@
                ;; Convert return type to form for synthetic defn
                (ret-form (cond
                            ((null concrete-ret) nil)
-                           ((values-type-p concrete-ret)
-                            ;; Emit as list annotation: (:values :int :str)
-                            (cons (intern "VALUES" :keyword)
-                                  (mapcar (lambda (tp)
-                                            (intern (string-upcase (mangle-type-name tp)) :keyword))
-                                          (values-type-elems concrete-ret))))
+                           ;; Compound types: pass as list for parse-type-expr
+                           ((consp concrete-ret) concrete-ret)
+                           ;; Simple types: keyword for parse-type-annotation
                            (t (intern (string-upcase (mangle-type-name concrete-ret)) :keyword))))
                ;; Build the synthetic defn form
                (synthetic-form `(,(intern "defn" :sysp)
@@ -5876,6 +5912,8 @@
          (raw-body (let ((rb (cdddr form)))
                      (if (keywordp (first rb)) (cdr rb) rb)))
          (env (make-env :parent *global-env*)))
+    ;; Track if we need to infer return type from body
+    (let ((no-ret-annotation-p (and (null ret-annotation) (null inferred-ret-type))))
     ;; Register function in global env (use inferred ret type if no annotation)
     (let* ((arg-types (mapcar #'second params))
            (ret-type (or ret-annotation inferred-ret-type :int))
@@ -5939,7 +5977,9 @@
               ((and (statement-like-p last-form) (not *uses-value-type*) (null (env-rc-releases env)) (null (env-data-releases env)))
                (multiple-value-bind (type ret-stmts)
                    (compile-expr-returning last-form env ":return")
-                 (declare (ignore type))
+                 ;; Infer return type from body when no annotation was given
+                 (when (and no-ret-annotation-p type (not (eq type :unknown)))
+                   (setf ret-type type))
                  (setf stmts (append stmts ret-stmts))))
               ;; Statement-like with Value/RC cleanup: need temp for releases before return
               ((statement-like-p last-form)
@@ -5947,7 +5987,10 @@
                       (tmp-decl (format nil "  ~a ~a;" (type-to-c ret-type) tmp)))
                  (multiple-value-bind (type ret-stmts)
                      (compile-expr-returning last-form env tmp)
-                   (declare (ignore type))
+                   ;; Infer return type from body when no annotation was given
+                   (when (and no-ret-annotation-p type (not (eq type :unknown)))
+                     (setf ret-type type)
+                     (setf tmp-decl (format nil "  ~a ~a;" (type-to-c ret-type) tmp)))
                    (setf stmts (append stmts (list tmp-decl) ret-stmts))
                    (let ((releases (append (when *uses-value-type* (emit-releases env))
                                            (emit-rc-releases env)
@@ -5960,7 +6003,9 @@
               (t
                (let ((*pending-stmts* nil))
                  (multiple-value-bind (last-code lt) (compile-expr last-form env)
-                   (declare (ignore lt))
+                   ;; Infer return type from body when no annotation was given
+                   (when (and no-ret-annotation-p lt (not (eq lt :unknown)))
+                     (setf ret-type lt))
                    (when *pending-stmts*
                      (setf stmts (append stmts *pending-stmts*)))
                    (let* ((releases (append (when *uses-value-type* (emit-releases env))
@@ -5978,6 +6023,11 @@
                                (if releases
                                    (format nil "~{~a~%~}  return ~a;~%" releases last-code)
                                    (format nil "  return ~a;~%" last-code))))))))))
+          ;; Update global env if return type was inferred from body
+          (when no-ret-annotation-p
+            (let* ((arg-types (mapcar #'second params))
+                   (fn-type (make-fn-type arg-types ret-type)))
+              (env-bind *global-env* name fn-type)))
           (let ((body-stmts (if uses-recur
                                   (cons "  _recur_top: ;" (or stmts nil))
                                   (or stmts nil)))
@@ -5997,7 +6047,7 @@
             (push (format nil "~a ~a(~a);"
                           (type-to-c ret-type) c-name
                           (if (string= param-str "") "void" param-str))
-                  *forward-decls*))))))))
+                  *forward-decls*)))))))))
 
 
 (defun compile-extern (form)
@@ -6916,6 +6966,7 @@
   (setf *mono-instances* (make-hash-table :test #'equal))
   (setf *included-files* (make-hash-table :test 'equal))
   (setf *direct-fns* (make-hash-table :test 'equal))
+  (setf *defn-wrappers* (make-hash-table :test 'equal))
   (setf *env-counter* 0)
   (setf *spawn-counter* 0)
   (setf *uses-threads* nil)

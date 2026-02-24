@@ -12,3 +12,29 @@
 (defn min [a :? b :?] :? (if (< a b) a b))
 (defn max [a :? b :?] :? (if (> a b) a b))
 (defn clamp [x :? lo :? hi :?] :? (if (< x lo) lo (if (> x hi) hi x)))
+
+;; --- HOFs as real polymorphic functions ---
+
+(defn map [f :? v :?] :?
+  (do
+    (let-mut result (vector))
+    (for [i 0 (vector-len v)]
+      (vector-push! result (f (vector-ref v i))))
+    result))
+
+(defn filter [pred :? v :?] :?
+  (do
+    (let-mut result (vector))
+    (for [i 0 (vector-len v)]
+      (do
+        (let elem (vector-ref v i))
+        (when (pred elem)
+          (vector-push! result elem))))
+    result))
+
+(defn reduce [f :? init :? v :?] :?
+  (do
+    (let-mut acc init)
+    (for [i 0 (vector-len v)]
+      (set! acc (f acc (vector-ref v i))))
+    acc))

@@ -1,4 +1,5 @@
 ;;; Test: HOFs (for-each, map, filter, reduce) and struct destructuring in match
+(use core)
 
 ;; --- Struct destructuring in match ---
 
