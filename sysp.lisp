@@ -91,6 +91,9 @@
 ;; Each entry is a C variable name (temp) holding an allocated string
 (defvar *pending-string-frees* nil)
 
+;; Track functions auto-generalized by inference (no explicit :? annotation)
+(defvar *auto-poly-fns* (make-hash-table :test #'equal))
+
 ;; Type variable bindings: hash table from tvar-id -> type
 (defvar *tvar-bindings* (make-hash-table))
 
@@ -821,13 +824,22 @@
       (when (car (last body-forms))
         (setf body-type (infer-expr (car (last body-forms)))))
       (let* ((ret-type (or ret-annotation body-type))
-             (resolved-params (mapcar #'resolve-or-default param-types))
-             (resolved-ret (resolve-or-default ret-type))
-             (fn-type (make-fn-type resolved-params resolved-ret)))
+             (fn-type-raw (make-fn-type param-types ret-type))
+             (free (free-tvars fn-type-raw)))
         ;; Restore env but keep function binding
         (setf *infer-env* old-env)
-        (infer-env-bind name fn-type)
-        fn-type))))
+        (if (and free (not (string-equal name "main")))
+            ;; Free tvars remain — auto-generalize as polymorphic
+            (progn
+              (setf (gethash name *auto-poly-fns*) t)
+              (infer-env-bind name :poly)
+              :poly)
+            ;; No free tvars — resolve and register concrete type
+            (let* ((resolved-params (mapcar #'resolve-or-default param-types))
+                   (resolved-ret (resolve-or-default ret-type))
+                   (fn-type (make-fn-type resolved-params resolved-ret)))
+              (infer-env-bind name fn-type)
+              fn-type))))))
 
 ;; Run inference on all top-level forms (pre-pass before compilation)
 (defun infer-toplevel (forms)
@@ -5934,8 +5946,15 @@
               ;; Other type annotation — skip it for counting
               ((keywordp item)
                (incf type-idx))
-              ;; Symbol (param name) — just keep
-              (t nil))))
+              ;; Symbol (param name) — for auto-poly, insert concrete type annotation
+              (t
+               (when (and (gethash name *auto-poly-fns*)
+                          (not (and lst (keywordp (first lst)))))
+                 (let* ((concrete (nth type-idx concrete-arg-types))
+                        (tokens (type-to-annotation-tokens concrete)))
+                   (dolist (tok tokens)
+                     (push tok new-params)))
+                 (incf type-idx))))))
         (setf new-params (nreverse new-params))
         ;; Determine concrete return type
         (let* ((concrete-ret (cond
@@ -5973,7 +5992,8 @@
          ;; Shift form if attribute present so rest of function sees normal structure
          (form (if has-attr (cons (first form) (cddr form)) form)))
   ;; Check for polymorphic function — store template, don't compile
-  (when (defn-is-poly-p form)
+  (when (or (defn-is-poly-p form)
+            (gethash (string (second form)) *auto-poly-fns*))
     (let* ((name (string (second form)))
            (params-raw (third form))
            (rest-forms (cdddr form))
@@ -7064,6 +7084,7 @@
   (setf *name-overrides* (make-hash-table :test 'equal))
   (setf *poly-fns* (make-hash-table :test #'equal))
   (setf *mono-instances* (make-hash-table :test #'equal))
+  (setf *auto-poly-fns* (make-hash-table :test #'equal))
   (setf *included-files* (make-hash-table :test 'equal))
   (setf *direct-fns* (make-hash-table :test 'equal))
   (setf *defn-wrappers* (make-hash-table :test 'equal))

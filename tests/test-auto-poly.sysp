@@ -1,0 +1,32 @@
+;;; Test: Auto-polymorphism — unannotated params auto-generalize
+
+;; Identity: unconstrained param, called with int and float
+(defn identity [x] x)
+
+;; First-of: returns first arg, different type combos
+(defn first-of [a b] a)
+
+;; Add-generic: constrained by + to numeric types
+(defn add-generic [a b] (+ a b))
+
+;; Explicit :? still works alongside auto-poly
+(defn explicit-id [x :?] :? x)
+
+(defn main [] :int
+  ;; Auto-poly identity
+  (println (identity 42))       ;; 42
+  (println (identity 3.14))     ;; 3.14
+
+  ;; Auto-poly first-of
+  (println (first-of 1 2))      ;; 1
+  (println (first-of 3.14 99))  ;; 3.14
+
+  ;; Auto-poly add-generic
+  (println (add-generic 10 20))     ;; 30
+  (println (add-generic 1.5 2.5))   ;; 4.0
+
+  ;; Explicit :? still works
+  (println (explicit-id 7))     ;; 7
+  (println (explicit-id 2.72))  ;; 2.72
+
+  0)

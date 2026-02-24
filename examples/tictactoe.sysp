@@ -17,20 +17,20 @@
 
 ;; Check if a player has won. Returns the winning Square or EMPTY.
 (defn check-winner [board :ptr-int] :int
-  ;; Check rows
+  ;; Rows
   (for [i 0 3]
     (let idx (* i 3))
     (when (and (!= (array-ref board idx) EMPTY)
               (== (array-ref board idx) (array-ref board (+ idx 1)))
               (== (array-ref board idx) (array-ref board (+ idx 2))))
       (return (array-ref board idx))))
-  ;; Check columns
+  ;; Columns
   (for [j 0 3]
     (when (and (!= (array-ref board j) EMPTY)
               (== (array-ref board j) (array-ref board (+ j 3)))
               (== (array-ref board j) (array-ref board (+ j 6))))
       (return (array-ref board j))))
-  ;; Check diagonals
+  ;; Diagonals
   (when (and (!= (array-ref board 0) EMPTY)
             (== (array-ref board 0) (array-ref board 4))
             (== (array-ref board 0) (array-ref board 8)))
@@ -55,39 +55,34 @@
   (let y1 (+ (* row CELL_SIZE) pad))
   (let x2 (- (* (+ col 1) CELL_SIZE) pad))
   (let y2 (- (* (+ row 1) CELL_SIZE) pad))
-  (let start1 (Vector2 (cast :f32 x1) (cast :f32 y1)))
-  (let end1 (Vector2 (cast :f32 x2) (cast :f32 y2)))
-  (let start2 (Vector2 (cast :f32 x2) (cast :f32 y1)))
-  (let end2 (Vector2 (cast :f32 x1) (cast :f32 y2)))
-  (DrawLineEx start1 end1 (cast :f32 LINE_THICK) color)
-  (DrawLineEx start2 end2 (cast :f32 LINE_THICK) color))
+  (DrawLineEx (Vector2 (cast :f32 x1) (cast :f32 y1))
+              (Vector2 (cast :f32 x2) (cast :f32 y2))
+              (cast :f32 LINE_THICK) color)
+  (DrawLineEx (Vector2 (cast :f32 x2) (cast :f32 y1))
+              (Vector2 (cast :f32 x1) (cast :f32 y2))
+              (cast :f32 LINE_THICK) color))
 
-;; Draw an O in a cell (ring with LINE_THICK thickness to match X)
+;; Draw an O in a cell
 (defn draw-o [col :int, row :int, color :Color] :void
   (let cx (cast :f32 (+ (* col CELL_SIZE) (/ CELL_SIZE 2))))
   (let cy (cast :f32 (+ (* row CELL_SIZE) (/ CELL_SIZE 2))))
-  (let center (Vector2 cx cy))
   (let radius (cast :f32 (- (/ CELL_SIZE 2) 30)))
   (let half-thick (cast :f32 (/ LINE_THICK 2)))
-  (DrawRing center (- radius half-thick) (+ radius half-thick) 0.0 360.0 36 color))
+  (DrawRing (Vector2 cx cy) (- radius half-thick) (+ radius half-thick)
+            0.0 360.0 36 color))
 
 ;; Draw the grid lines
 (defn draw-grid [color :Color] :void
   (let thick (cast :f32 LINE_THICK))
-  ;; Vertical lines
-  (let v1s (Vector2 (cast :f32 CELL_SIZE) 0.0))
-  (let v1e (Vector2 (cast :f32 CELL_SIZE) (cast :f32 WINDOW_SIZE)))
-  (DrawLineEx v1s v1e thick color)
-  (let v2s (Vector2 (cast :f32 (* CELL_SIZE 2)) 0.0))
-  (let v2e (Vector2 (cast :f32 (* CELL_SIZE 2)) (cast :f32 WINDOW_SIZE)))
-  (DrawLineEx v2s v2e thick color)
-  ;; Horizontal lines
-  (let h1s (Vector2 0.0 (cast :f32 CELL_SIZE)))
-  (let h1e (Vector2 (cast :f32 WINDOW_SIZE) (cast :f32 CELL_SIZE)))
-  (DrawLineEx h1s h1e thick color)
-  (let h2s (Vector2 0.0 (cast :f32 (* CELL_SIZE 2))))
-  (let h2e (Vector2 (cast :f32 WINDOW_SIZE) (cast :f32 (* CELL_SIZE 2))))
-  (DrawLineEx h2s h2e thick color))
+  (let size (cast :f32 WINDOW_SIZE))
+  (let c1 (cast :f32 CELL_SIZE))
+  (let c2 (cast :f32 (* CELL_SIZE 2)))
+  ;; Vertical
+  (DrawLineEx (Vector2 c1 0.0) (Vector2 c1 size) thick color)
+  (DrawLineEx (Vector2 c2 0.0) (Vector2 c2 size) thick color)
+  ;; Horizontal
+  (DrawLineEx (Vector2 0.0 c1) (Vector2 size c1) thick color)
+  (DrawLineEx (Vector2 0.0 c2) (Vector2 size c2) thick color))
 
 ;; Main
 (defn main [] :int
@@ -100,19 +95,19 @@
   (let-mut state :int PLAYING)
   (let-mut winner :int EMPTY)
 
-  (let white (Color 245 245 245 255))       ; RAYWHITE
-  (let dark-bg (Color 0 0 0 255))           ; BLACK
-  (let red (Color 230 41 55 255))           ; RED
-  (let blue (Color 0 121 241 255))          ; BLUE
-  (let overlay (Color 0 0 0 200))            ; BLACK (with alpha for fade)
+  (let white (Color 245 245 245 255))
+  (let dark-bg (Color 0 0 0 255))
+  (let red (Color 230 41 55 255))
+  (let blue (Color 0 121 241 255))
+  (let overlay (Color 0 0 0 200))
 
   (while (not (WindowShouldClose))
-    ;; Handle input (before drawing, one branch per frame)
+    ;; Input
     (if (== state PLAYING)
       (when (IsMouseButtonPressed LEFT_CLICK)
         (let mouse (GetMousePosition))
-        (let col (cast :int (/ (get mouse x) (cast :f32 CELL_SIZE))))
-        (let row (cast :int (/ (get mouse y) (cast :f32 CELL_SIZE))))
+        (let col (cast :int (/ mouse.x (cast :f32 CELL_SIZE))))
+        (let row (cast :int (/ mouse.y (cast :f32 CELL_SIZE))))
         (when (and (>= col 0) (< col 3) (>= row 0) (< row 3))
           (let idx (+ (* row 3) col))
           (when (== (array-ref board idx) EMPTY)
@@ -155,12 +150,9 @@
     (when (!= state PLAYING)
       (DrawRectangle 0 0 WINDOW_SIZE WINDOW_SIZE overlay)
       (cond
-        [(== winner X_PIECE)
-         (DrawText "X Wins!" 180 250 60 red)]
-        [(== winner O_PIECE)
-         (DrawText "O Wins!" 180 250 60 blue)]
-        [else
-         (DrawText "Draw!" 210 250 60 white)])
+        [(== winner X_PIECE) (DrawText "X Wins!" 180 250 60 red)]
+        [(== winner O_PIECE) (DrawText "O Wins!" 180 250 60 blue)]
+        [else (DrawText "Draw!" 210 250 60 white)])
       (DrawText "Click to play again" 150 350 30 white))
 
     (EndDrawing))
