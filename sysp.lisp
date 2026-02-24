@@ -347,8 +347,10 @@
            (unify first-type (infer-expr arg)))
          :bool))
 
-      ;; Logical: result is bool
-      ((member (string head) '("and" "or" "not") :test #'string-equal) :bool)
+      ;; Logical: infer sub-expressions, result is bool
+      ((member (string head) '("and" "or" "not") :test #'string-equal)
+       (dolist (arg (cdr form)) (infer-expr arg))
+       :bool)
 
       ;; Bitwise: operands are int, result is int
       ((member (string head) '("bit-and" "bit-or" "bit-xor" "bit-not" "shl" "shr"
@@ -404,7 +406,11 @@
            (:tuple (make-tvar))  ; can't resolve without literal index
            (:array (second coll-type))
            (:ptr (second coll-type))
-           (otherwise (make-tvar)))))
+           (otherwise
+            ;; Unresolved — assume pointer indexing
+            (let ((elem (make-tvar)))
+              (unify coll-type (make-ptr-type elem))
+              elem)))))
 
       ;; hash-map: result is (:hashmap K V)
       ((sym= head "hash-map")
@@ -585,6 +591,7 @@
          (unify ptr-type (make-ptr-type elem-tvar))
          elem-tvar))
       ((sym= head "cast")
+       (when (third form) (infer-expr (third form)))
        (parse-type-annotation (second form)))
       ((sym= head "sizeof")
        :int)
@@ -630,8 +637,19 @@
       ((sym= head "vector-len") :int)
       ((sym= head "vector-set!") :void)
       ((sym= head "vector-push!") :void)
-      ((sym= head "array-ref") (make-tvar))
-      ((sym= head "array-set!") :void)
+      ((sym= head "array-ref")
+       (let ((elem (make-tvar))
+             (arr-type (infer-expr (second form))))
+         (when (third form) (infer-expr (third form)))
+         (unify arr-type (make-ptr-type elem))
+         elem))
+      ((sym= head "array-set!")
+       (let ((elem (make-tvar))
+             (arr-type (infer-expr (second form))))
+         (when (third form) (infer-expr (third form)))
+         (unify arr-type (make-ptr-type elem))
+         (when (fourth form) (unify elem (infer-expr (fourth form))))
+         :void))
       ((sym= head "make-array") (make-tvar))
 
       ;; match: infer scrutinee, collect body types from all clauses, unify
@@ -712,7 +730,8 @@
          (dolist (f (cddr form))
            (infer-stmt f)))
         ((sym= head "for")
-         (dolist (f (cdddr form))
+         ;; (for [var start end] body...) — body starts at position 2
+         (dolist (f (cddr form))
            (infer-stmt f)))
         ((sym= head "cond")
          (dolist (clause (cdr form))
@@ -824,8 +843,9 @@
       (when (car (last body-forms))
         (setf body-type (infer-expr (car (last body-forms)))))
       (let* ((ret-type (or ret-annotation body-type))
-             (fn-type-raw (make-fn-type param-types ret-type))
-             (free (free-tvars fn-type-raw)))
+             (free (reduce #'append
+                           (mapcar #'free-tvars (cons ret-type param-types))
+                           :initial-value nil)))
         ;; Restore env but keep function binding
         (setf *infer-env* old-env)
         (if (and free (not (string-equal name "main")))
@@ -851,11 +871,16 @@
       (cond
         ((sym= (first form) "defn")
          (infer-defn form))
-        ((sym= (first form) "struct")
-         ;; Register struct constructor as a function type
-         (let* ((has-attr (stringp (second form)))
-                (name (string (if has-attr (third form) (second form))))
-                (fields-raw (if has-attr (fourth form) (third form)))
+        ((or (sym= (first form) "struct") (sym= (first form) "foreign-struct"))
+         ;; Register struct name and constructor type
+         (let* ((is-struct (sym= (first form) "struct"))
+                (has-attr (and is-struct (stringp (second form))))
+                (name (string (cond (has-attr (third form))
+                                    (is-struct (second form))
+                                    (t (second form)))))
+                (fields-raw (cond (has-attr (fourth form))
+                                  (is-struct (third form))
+                                  (t (third form))))
                 (field-types nil))
            (let ((lst (if (listp fields-raw) (copy-list fields-raw) nil)))
              (loop while lst do
@@ -865,7 +890,27 @@
                    (push (car result) field-types)
                    (setf lst (cdr result))))))
            (setf field-types (nreverse field-types))
-           (infer-env-bind name (make-fn-type field-types (make-struct-type name)))))
+           ;; Register in *structs* temporarily for parse-type-annotation resolution
+           ;; (will be overwritten by compile phase)
+           (unless (gethash name *structs*)
+             (setf (gethash name *structs*) :infer-placeholder))
+           (when is-struct
+             (infer-env-bind name (make-fn-type field-types (make-struct-type name))))))
+        ((sym= (first form) "enum")
+         ;; Register enum variants as :int in inference env
+         (let ((variants (cddr form)))
+           (dolist (v variants)
+             (when (listp v)
+               (infer-env-bind (string (first v)) :int)))))
+        ((and (or (sym= (first form) "let") (sym= (first form) "let-mut"))
+              (not (listp (second form))))  ; top-level let/let-mut
+         ;; Register top-level constant with inferred or annotated type
+         (let* ((name (string (second form)))
+                (rest (cddr form))
+                (type (if (keywordp (first rest))
+                          (parse-type-annotation (first rest))
+                          (when (first rest) (infer-expr (first rest))))))
+           (when type (infer-env-bind name type))))
         ((sym= (first form) "extern")
          ;; Register extern function type
          (let* ((name (string (second form)))
@@ -5739,7 +5784,8 @@
          (name (string (if has-attr (third form) (second form))))
          (fields-raw (if has-attr (fourth form) (third form)))
          ;; Register struct name early so fields can reference it (self-referential types)
-         (already-registered (gethash name *structs*)))
+         (already-registered (let ((v (gethash name *structs*)))
+                               (and v (not (eq v :infer-placeholder))))))
     (unless already-registered
       (setf (gethash name *structs*) :forward-declared)  ; placeholder
       ;; Emit forward declaration
@@ -5912,6 +5958,20 @@
      (let ((key-tokens (type-to-annotation-tokens (second tp)))
            (val-tokens (type-to-annotation-tokens (third tp))))
        (append (list (intern "HASHMAP" :keyword)) key-tokens val-tokens)))
+    ;; Pointer type: (:ptr :int) -> (:PTR-INT)
+    ((and (consp tp) (eq (car tp) :ptr))
+     (let ((inner-tokens (type-to-annotation-tokens (second tp))))
+       (if (= (length inner-tokens) 1)
+           ;; Simple pointee: (:ptr :int) -> :PTR-INT
+           (list (intern (format nil "PTR-~a" (symbol-name (first inner-tokens))) :keyword))
+           ;; Compound pointee: wrap as (:ptr inner...)
+           (cons (intern "PTR" :keyword) inner-tokens))))
+    ;; Struct type: (:struct "Color") -> (:Color) — preserve case
+    ((and (consp tp) (eq (car tp) :struct))
+     (list (intern (second tp) :keyword)))
+    ;; Array type: (:array :int 9) -> treat as pointer (arrays decay to ptr)
+    ((and (consp tp) (eq (car tp) :array))
+     (type-to-annotation-tokens (make-ptr-type (second tp))))
     ;; Simple type: :int -> (:INT)
     (t (list (intern (string-upcase (mangle-type-name tp)) :keyword)))))
 
