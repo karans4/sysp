@@ -249,7 +249,8 @@
 (defvar *infer-env* nil)
 
 (defun infer-env-lookup (name)
-  (let ((entry (assoc name *infer-env* :test #'equal)))
+  (let* ((resolved (resolve-name name))
+         (entry (assoc resolved *infer-env* :test #'equal)))
     (when entry
       (let ((tp (cdr entry)))
         (if (and (consp tp) (eq (car tp) :scheme))
@@ -290,7 +291,7 @@
          ((string-equal name "true") :bool)
          ((string-equal name "false") :bool)
          ((string-equal name "null") (make-ptr-type :void))
-         (t (or (infer-env-lookup name) (make-tvar))))))
+         (t (or (infer-env-lookup name) (make-tvar))))))  ; infer-env-lookup already calls resolve-name
     ((listp form) (infer-list form))
     (t :int)))
 
@@ -867,10 +868,11 @@
   (data-releases nil)) ; list of (c-name . kind) for vector/hashmap free at scope exit
 
 (defun env-lookup (env name)
-  (if (null env) nil
-      (let ((found (assoc name (env-bindings env) :test #'equal)))
-        (if found (cdr found)
-            (env-lookup (env-parent env) name)))))
+  (let ((resolved (resolve-name name)))
+    (if (null env) nil
+        (let ((found (assoc resolved (env-bindings env) :test #'equal)))
+          (if found (cdr found)
+              (env-lookup (env-parent env) resolved))))))
 
 (defun env-bind (env name type)
   (push (cons name type) (env-bindings env))
@@ -948,6 +950,8 @@
 (defvar *string-literals* nil)  ; collected string constants
 (defvar *includes* nil)         ; extra #includes
 (defvar *macros* (make-hash-table :test 'equal))  ; name -> expander function
+(defvar *sysp-modules* (make-hash-table :test 'equal))  ; module-name -> list of exported symbol names
+(defvar *imports* (make-hash-table :test 'equal))  ; qualified-or-bare name -> real (unqualified) name
 (defvar *current-fn-name* nil)  ; for recur: name of function being compiled
 (defvar *current-let-target* nil)  ; for escape analysis: name of let variable being initialized
 (defvar *current-fn-params* nil) ; for recur: param names of current function
@@ -1262,6 +1266,76 @@
                     s))))
     (parse-sysp-source source (namestring path))))
 
+(defun resolve-name (name)
+  "Resolve a possibly-qualified name via *imports*. foo.bar → real unqualified name."
+  (or (gethash name *imports*) name))
+
+(defun collect-module-names (forms)
+  "Scan top-level forms for exported names (defn, struct, enum, const, defmacro, etc)."
+  (let ((names nil))
+    (dolist (form forms)
+      (when (listp form)
+        (let ((head (first form)))
+          (cond
+            ((sym= head "defn") (push (string (second form)) names))
+            ((sym= head "defn-ct") (push (string (second form)) names))
+            ((sym= head "struct")
+             (push (string (if (and (listp (second form))
+                                    (sym= (first (second form)) "generic"))
+                               (third form)
+                               (second form)))
+                   names))
+            ((sym= head "enum") (push (string (second form)) names))
+            ((or (sym= head "const") (sym= head "let"))
+             (push (string (second form)) names))
+            ((sym= head "defmacro") (push (string (second form)) names))
+            ((sym= head "extern") (push (string (second form)) names))
+            ((sym= head "deftype") (push (string (second form)) names))))))
+    (nreverse names)))
+
+(defun parse-use-options (form)
+  "Parse (use module ...) options. Returns (values module-name mode only-list).
+   mode is :all, :qualified, or :only."
+  (let* ((module-sym (second form))
+         (module-name (string-downcase (string module-sym)))
+         (opts (cddr form))
+         (mode :all)
+         (only-list nil))
+    (when opts
+      (let ((first-opt (first opts)))
+        (cond
+          ((and (keywordp first-opt) (string-equal (string first-opt) "ALL"))
+           (setf mode :all))
+          ((and (keywordp first-opt) (string-equal (string first-opt) "QUALIFIED"))
+           (setf mode :qualified))
+          ((and (keywordp first-opt) (string-equal (string first-opt) "AS"))
+           ;; (use foo :as foo) = qualified
+           (setf mode :qualified))
+          ((and (keywordp first-opt) (string-equal (string first-opt) "ONLY"))
+           (setf mode :only)
+           (let ((names-form (second opts)))
+             (when (listp names-form)
+               (setf only-list (mapcar (lambda (s) (string s)) names-form))))))))
+    (values module-name mode only-list)))
+
+(defun register-module-imports (module-name names mode only-list)
+  "Register names in *imports* based on import mode."
+  ;; Always register qualified names (module.name → name)
+  (dolist (name names)
+    (setf (gethash (format nil "~a.~a" module-name name) *imports*) name))
+  ;; Register unqualified based on mode
+  (case mode
+    (:all
+     (dolist (name names)
+       (setf (gethash name *imports*) name)))
+    (:qualified
+     ;; No unqualified imports — only module.name entries (already done above)
+     nil)
+    (:only
+     (dolist (name only-list)
+       (when (member name names :test #'equal)
+         (setf (gethash name *imports*) name))))))
+
 (defun expand-uses (forms base-dir)
   "Walk FORMS, replacing (use ...) with the included file's forms. Deduplicates by absolute path."
   (loop for form in forms
@@ -1282,12 +1356,28 @@
                                    (t (sysp-error form "use: argument must be a string or symbol, got ~s" arg))))
                        (abs-path (namestring (truename resolved))))
                   (if (gethash abs-path *included-files*)
-                      nil  ; already included — skip
+                      ;; Already included — but still parse options for import registration
+                      ;; (module names already in *sysp-modules* from first inclusion)
+                      (let ((module-name (string-downcase (string arg))))
+                        (multiple-value-bind (mn mode only-list) (parse-use-options form)
+                          (declare (ignore mn))
+                          (let ((names (gethash module-name *sysp-modules*)))
+                            (when names
+                              (register-module-imports module-name names mode only-list))))
+                        nil)
                       (progn
                         (setf (gethash abs-path *included-files*) t)
                         (let* ((child-forms (read-sysp-forms abs-path))
-                               (child-dir (make-pathname :directory (pathname-directory abs-path))))
-                          (expand-uses child-forms child-dir)))))
+                               (child-dir (make-pathname :directory (pathname-directory abs-path)))
+                               (expanded (expand-uses child-forms child-dir))
+                               (module-name (string-downcase (string arg)))
+                               (names (collect-module-names expanded)))
+                          ;; Register module and its imports
+                          (setf (gethash module-name *sysp-modules*) names)
+                          (multiple-value-bind (mn mode only-list) (parse-use-options form)
+                            (declare (ignore mn))
+                            (register-module-imports module-name names mode only-list))
+                          expanded))))
         else collect form))
 
 ;;; === Header Emission (.sysph) ===
@@ -1479,7 +1569,7 @@
 (defun macroexpand-1-sysp (form)
   "Expand one macro call. Returns (values expanded-form expanded-p)"
   (if (and (listp form) (symbolp (first form)))
-      (let ((expander (gethash (string-downcase (string (first form))) *macros*)))
+      (let ((expander (gethash (string-downcase (resolve-name (string (first form)))) *macros*)))
         (if expander
             (let ((expanded (funcall expander form)))
               ;; Propagate source location from original form to expanded form
@@ -2479,7 +2569,8 @@
     ((floatp form) (values (format nil "~f" form) :float))
     ((stringp form) (values (format nil "~s" form) :str))
     ((symbolp form)
-     (let ((name (string form)))
+     (let* ((raw-name (string form))
+            (name (resolve-name raw-name)))
        (cond
          ((string-equal name "true") (values "1" :bool))
          ((string-equal name "false") (values "0" :bool))
@@ -4583,13 +4674,14 @@
   (values "val_sym(_sysp_gensym++)" :value))
 
 (defun c-fn-name (fn-name)
-  "Get the C name for a function, checking overrides first."
-  (or (gethash fn-name *name-overrides*)
-      (sanitize-name fn-name)))
+  "Get the C name for a function, checking overrides first. Resolves qualified names."
+  (let ((resolved (resolve-name fn-name)))
+    (or (gethash resolved *name-overrides*)
+        (sanitize-name resolved))))
 
 (defun compile-call (form env)
   "Compile a function call, handling variadic and polymorphic functions."
-  (let* ((fn-name (string (first form)))
+  (let* ((fn-name (resolve-name (string (first form))))
          (args (rest form)))
     ;; Check for polymorphic function — instantiate with concrete types
     (when (gethash fn-name *poly-fns*)
@@ -6834,7 +6926,9 @@
   (setf *exports* nil)
   (setf *escape-info* (make-hash-table :test 'equal))
   (setf *uses-hashmap* nil)
-  (setf *pending-string-frees* nil))
+  (setf *pending-string-frees* nil)
+  (setf *sysp-modules* (make-hash-table :test 'equal))
+  (setf *imports* (make-hash-table :test 'equal)))
 
 ;;; === Escape Analysis ===
 

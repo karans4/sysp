@@ -1,0 +1,43 @@
+;; test-namespaces — test module namespacing (qualified, :only, :all)
+;;
+;; Tests:
+;; 1. :qualified — must use module.name to access
+;; 2. :only — only listed names imported unqualified, rest qualified
+;; 3. Default :all — everything unqualified (backward compat, tested by existing tests)
+;; 4. Qualified access always works regardless of mode
+
+(use testmod-a :qualified)
+(use testmod-b :only [greet-b])
+
+(include "stdio.h")
+(include "stdlib.h")
+
+(defn main [] :int
+  (do
+    ;; Qualified access to testmod-a (required since :qualified)
+    (printf "testmod-a.greet-a=%d\n" (testmod-a.greet-a))
+    (printf "testmod-a.helper-a=%d\n" (testmod-a.helper-a))
+
+    ;; testmod-b: greet-b imported unqualified via :only, helper-b only via qualified
+    (printf "greet-b=%d\n" (greet-b))
+    (printf "testmod-b.helper-b=%d\n" (testmod-b.helper-b))
+
+    ;; Can also use qualified even for :only imports
+    (printf "testmod-b.greet-b=%d\n" (testmod-b.greet-b))
+
+    ;; Verify values
+    (if (!= (testmod-a.greet-a) 1)
+      (do (printf "FAIL: testmod-a.greet-a expected 1\n") (exit 1))
+      0)
+    (if (!= (testmod-a.helper-a) 10)
+      (do (printf "FAIL: testmod-a.helper-a expected 10\n") (exit 1))
+      0)
+    (if (!= (greet-b) 2)
+      (do (printf "FAIL: greet-b expected 2\n") (exit 1))
+      0)
+    (if (!= (testmod-b.helper-b) 20)
+      (do (printf "FAIL: testmod-b.helper-b expected 20\n") (exit 1))
+      0)
+
+    (printf "All namespace tests passed!\n")
+    0))

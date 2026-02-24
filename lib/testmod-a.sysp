@@ -1,0 +1,5 @@
+;; testmod-a — test module A for namespace testing
+
+(defn greet-a [] :int 1)
+
+(defn helper-a [] :int 10)
