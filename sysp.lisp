@@ -30,6 +30,11 @@
 (defun rc-type-p (tp) (and (consp tp) (eq (car tp) :rc)))
 (defun rc-inner-type (tp) (second tp))
 
+;; Multiple return values: (:values T1 T2 ...) — struct-based MRV
+(defun make-values-type (elem-types) `(:values ,@elem-types))
+(defun values-type-p (tp) (and (consp tp) (eq (car tp) :values)))
+(defun values-type-elems (tp) (cdr tp))
+
 ;; Future types: (:future T spawn-id) — typed future from spawn
 (defun make-future-type (inner spawn-id) `(:future ,inner ,spawn-id))
 (defun future-type-p (tp) (and (consp tp) (eq (car tp) :future)))
@@ -362,6 +367,18 @@
       ((sym= head "tuple-ref")
        (make-tvar))
 
+      ;; nth: generic indexing — dispatch on collection type
+      ((sym= head "nth")
+       (let ((coll-type (infer-expr (second form))))
+         (when (third form) (infer-expr (third form)))
+         (case (type-kind coll-type)
+           (:vector (second coll-type))
+           (:str :char)
+           (:tuple (make-tvar))  ; can't resolve without literal index
+           (:array (second coll-type))
+           (:ptr (second coll-type))
+           (otherwise (make-tvar)))))
+
       ;; hash-map: result is (:hashmap K V)
       ((sym= head "hash-map")
        (if (null (cdr form))
@@ -545,6 +562,43 @@
       ((sym= head "sizeof")
        :int)
 
+      ;; values: multiple return values
+      ((sym= head "values")
+       (make-values-type (mapcar #'infer-expr (cdr form))))
+
+      ;; let-values: destructure MRV
+      ((sym= head "let-values")
+       (let* ((bindings (second form))  ; ([x y] (f))
+              (names (first bindings))
+              (init-form (second bindings))
+              (init-type (infer-expr init-form))
+              (old-env *infer-env*))
+         ;; Bind each name to its component type
+         (if (values-type-p init-type)
+             (loop for name in names
+                   for tp in (values-type-elems init-type)
+                   do (infer-env-bind (string name) tp))
+             ;; If not a values type, treat as single value
+             (when names
+               (infer-env-bind (string (first names)) init-type)))
+         ;; Infer body
+         (let ((result :void))
+           (dolist (f (cddr form))
+             (setf result (infer-expr f)))
+           result)))
+
+      ;; asm!: void in stmt position; in expr position, :out type if given
+      ((sym= head "asm!")
+       (let ((rest (cddr form)))
+         ;; Look for :out keyword to determine return type
+         (loop for (k v) on rest by #'cddr
+               when (and (keywordp k) (string-equal (string k) "OUT"))
+               do (return-from infer-list
+                    (if (listp v)
+                        (parse-type-annotation (second v))  ; [name :type]
+                        (parse-type-annotation v))))
+         :void))
+
       ;; Simple type returns for vector/array ops
       ((sym= head "vector-len") :int)
       ((sym= head "vector-set!") :void)
@@ -706,8 +760,8 @@
   (let* ((name (string (second form)))
          (params-raw (third form))
          (rest-forms (cdddr form))
-         (ret-annotation (when (keywordp (first rest-forms))
-                           (prog1 (parse-type-annotation (first rest-forms))
+         (ret-annotation (when (type-annotation-form-p (first rest-forms))
+                           (prog1 (parse-ret-annotation (first rest-forms))
                              (setf rest-forms (cdr rest-forms)))))
          (body-forms rest-forms)
          (old-env *infer-env*)
@@ -781,8 +835,8 @@
          (let* ((name (string (second form)))
                 (params-raw (third form))
                 (rest (cdddr form))
-                (ret-type (if (keywordp (first rest))
-                              (parse-type-annotation (first rest))
+                (ret-type (if (type-annotation-form-p (first rest))
+                              (parse-ret-annotation (first rest))
                               :void))
                 (param-types nil))
            (let ((lst (if (listp params-raw) (copy-list params-raw) nil)))
@@ -1406,12 +1460,14 @@
                        ;; Mono: strip body -> extern
                        (let* ((params (third form))
                               (rest (cdddr form))
-                              (ret-kw (when (keywordp (first rest)) (first rest))))
+                              (ret-ann (when (type-annotation-form-p (first rest)) (first rest))))
                          (format out "(extern ~a ~a~a)~%"
                                  (serialize-atom (second form))
                                  (serialize-params params)
-                                 (if ret-kw
-                                     (format nil " ~a" (serialize-atom ret-kw))
+                                 (if ret-ann
+                                     (format nil " ~a" (if (listp ret-ann)
+                                                           (serialize-form ret-ann)
+                                                           (serialize-atom ret-ann)))
                                      "")))))))
               ;; c-decl — skip (raw C, not part of sysp API)
               ((sym= head "c-decl") nil)
@@ -1798,9 +1854,8 @@
   ;; last: (last vec) => (vector-ref vec (- (vector-len vec) 1))
   (setf (gethash "last" *macros*)
         (lambda (form) (list 'vector-ref (second form) (list '- (list 'vector-len (second form)) 1))))
-  ;; nth: (nth vec i) => (vector-ref vec i)
-  (setf (gethash "nth" *macros*)
-        (lambda (form) (list 'vector-ref (second form) (third form))))
+  ;; nth is now a builtin in *expr-dispatch* — dispatches by type
+  ;; (kept as comment for history)
   ;; count: (count vec) => (vector-len vec)
   (setf (gethash "count" *macros*)
         (lambda (form) (list 'vector-len (second form))))
@@ -1889,6 +1944,7 @@
                                                        (parse-type-expr (third form))))
          ((string= head "list") (make-list-type (parse-type-expr (second form))))
          ((string= head "tuple") (make-tuple-type (mapcar #'parse-type-expr (rest form))))
+         ((string= head "values") (make-values-type (mapcar #'parse-type-expr (rest form))))
          ((string= head "union") `(:union ,@(mapcar #'parse-type-expr (rest form))))
          ((string= head "struct") (make-struct-type (string (second form))))
          ((string= head "enum") `(:enum ,(string (second form))))
@@ -1992,6 +2048,7 @@
     (:volatile (format nil "volatile ~a" (type-to-c (second tp))))
     (:rc (format nil "_RC_~a*" (type-to-c (rc-inner-type tp))))
     (:future (format nil "_spawn_~a*" (third tp)))  ; (:future T spawn-id) → _spawn_N*
+    (:values (values-type-c-name tp))
     (otherwise "int")))
 
 (defun mangle-type-name (tp)
@@ -2034,6 +2091,8 @@
     (:fn (fn-type-c-name tp))
     (:list (format nil "list_~a" (mangle-type-name (second tp))))
     (:variadic (format nil "var_~a" (mangle-type-name (second tp))))
+    ;; Multiple return values
+    (:values (values-type-c-name tp))
     ;; Union types
     (:union (format nil "Union_~{~a~^_~}" (mapcar #'mangle-type-name (cdr tp))))
     ;; RC-managed types
@@ -2070,7 +2129,23 @@
     (ensure-fn-type name args ret)
     name))
 
+(defun values-type-c-name (tp)
+  (let* ((elems (values-type-elems tp))
+         (name (format nil "Vals_~{~a~^_~}" (mapcar #'mangle-type-name elems))))
+    (ensure-values-struct name elems)
+    name))
+
 ;;; === Generated Type Structs ===
+
+(defun ensure-values-struct (name elem-types)
+  "Generate C struct for multiple return values: typedef struct { T0 _0; T1 _1; ... } Vals_T0_T1;"
+  (unless (gethash name *generated-types*)
+    (setf (gethash name *generated-types*) t)
+    (let ((fields (loop for tp in elem-types
+                        for i from 0
+                        collect (format nil "  ~a _~d;" (type-to-c tp) i))))
+      (push (format nil "typedef struct {~%~{~a~%~}} ~a;~%" fields name)
+            *type-decls*))))
 
 (defun ensure-vector-type (name elem-type)
   (unless (gethash name *generated-types*)
@@ -2528,7 +2603,10 @@
     ("str-join" . compile-str-join) ("str-starts?" . compile-str-starts)
     ("str-ends?" . compile-str-ends) ("str-trim" . compile-str-trim)
     ("str-replace" . compile-str-replace)
-    ("fmt" . compile-fmt)))
+    ("fmt" . compile-fmt)
+    ("nth" . compile-nth)
+    ("asm!" . compile-asm-expr)
+    ("values" . compile-values-expr)))
 
 (defun compile-list (form env)
   (let* ((head (first form))
@@ -3579,6 +3657,90 @@
                           :int)))
       (values (format nil "~a._~d" tup idx) elem-type))))
 
+(defun compile-values-expr (form env)
+  "(values a b ...) — multiple return values as struct compound literal"
+  (let* ((elems (rest form))
+         (compiled (mapcar (lambda (e) (multiple-value-list (compile-expr e env))) elems))
+         (elem-types (mapcar #'second compiled))
+         (vals-type (make-values-type elem-types))
+         (c-name (type-to-c vals-type)))
+    (values (format nil "(~a){~{~a~^, ~}}"
+                    c-name (mapcar #'first compiled))
+            vals-type)))
+
+(defun compile-let-values-stmt (form env)
+  "(let-values [(x y) (f args...)] body...)
+   Destructure a values-returning call into individual bindings."
+  (let* ((bindings (second form))
+         (names (mapcar #'string (first bindings)))
+         (init-form (second bindings))
+         (body-forms (cddr form))
+         (*pending-stmts* nil)
+         (*pending-string-frees* nil))
+    (multiple-value-bind (init-code init-type) (compile-expr init-form env)
+      (let* ((lifted-stmts *pending-stmts*)
+             (elem-types (if (values-type-p init-type)
+                             (values-type-elems init-type)
+                             ;; Fallback: single value in first binding
+                             (list init-type)))
+             (tmp (fresh-tmp))
+             (c-vals-type (type-to-c init-type))
+             ;; Declare temp for the values struct
+             (tmp-decl (format nil "  ~a ~a = ~a;" c-vals-type tmp init-code))
+             ;; Destructure into individual vars
+             (var-decls (loop for name in names
+                              for tp in elem-types
+                              for i from 0
+                              collect (progn
+                                        (env-bind env name tp)
+                                        (format nil "  ~a ~a = ~a._~d;"
+                                                (type-to-c tp)
+                                                (sanitize-name name)
+                                                tmp i))))
+             ;; Compile body
+             (body-stmts (when body-forms (compile-body body-forms env))))
+        (append lifted-stmts
+                (list tmp-decl)
+                var-decls
+                (or body-stmts nil))))))
+
+(defun compile-nth (form env)
+  "(nth coll idx) — generic indexing: dispatches on inferred type.
+   (:vector T) -> coll.data[idx], (:tuple ...) -> coll._N (literal N),
+   :str -> coll[idx], (:array T N) -> coll[idx]"
+  (multiple-value-bind (coll coll-type) (compile-expr (second form) env)
+    (let ((idx-form (third form)))
+      (case (type-kind coll-type)
+        (:vector
+         (multiple-value-bind (idx-code it) (compile-expr idx-form env)
+           (declare (ignore it))
+           (values (format nil "~a.data[~a]" coll idx-code)
+                   (second coll-type))))
+        (:str
+         (multiple-value-bind (idx-code it) (compile-expr idx-form env)
+           (declare (ignore it))
+           (values (format nil "~a[~a]" coll idx-code) :char)))
+        (:tuple
+         ;; Tuple requires literal integer index
+         (let* ((idx (if (numberp idx-form) idx-form
+                         (error "nth on tuple requires literal index, got ~a" idx-form)))
+                (elem-type (nth (1+ idx) coll-type)))
+           (values (format nil "~a._~d" coll idx) (or elem-type :int))))
+        (:array
+         (multiple-value-bind (idx-code it) (compile-expr idx-form env)
+           (declare (ignore it))
+           (values (format nil "~a[~a]" coll idx-code) (second coll-type))))
+        (:ptr
+         ;; Pointer/C-array indexing (let-array registers as (:ptr T))
+         (multiple-value-bind (idx-code it) (compile-expr idx-form env)
+           (declare (ignore it))
+           (values (format nil "~a[~a]" coll idx-code) (second coll-type))))
+        (otherwise
+         ;; Fallback: treat as vector-ref for backward compat
+         (multiple-value-bind (idx-code it) (compile-expr idx-form env)
+           (declare (ignore it))
+           (values (format nil "~a.data[~a]" coll idx-code) :int)))))))
+
 (defun compile-array-ref (form env)
   "(array-ref arr idx...) — multi-index: arr[i], arr[i][j], arr[i][j][k]"
   (multiple-value-bind (arr tp) (compile-expr (second form) env)
@@ -3659,8 +3821,8 @@
   (let* ((params-raw (second form))
          (rest-forms (cddr form))
          (params (parse-params params-raw))
-         (ret-annotation (when (keywordp (first rest-forms))
-                           (prog1 (parse-type-annotation (first rest-forms))
+         (ret-annotation (when (type-annotation-form-p (first rest-forms))
+                           (prog1 (parse-ret-annotation (first rest-forms))
                              (setf rest-forms (cdr rest-forms)))))
          (body-forms rest-forms)
          (lambda-name (format nil "_lambda_~d" (incf *lambda-counter*)))
@@ -4588,6 +4750,10 @@
      (list (format nil "#pragma ~a" (second form))))
     ((and (listp form) (sym= (first form) "kernel-launch"))
      (compile-kernel-launch-stmt form env))
+    ((and (listp form) (sym= (first form) "asm!"))
+     (compile-asm-stmt form env))
+    ((and (listp form) (sym= (first form) "let-values"))
+     (compile-let-values-stmt form env))
     ((and (listp form) (sym= (first form) "hash-set!"))
      (let ((*pending-stmts* nil))
        (multiple-value-bind (code tp) (compile-hash-set form env)
@@ -5454,6 +5620,28 @@
     (setf (gethash name *structs*)
           (mapcar (lambda (f) (cons (first f) (second f))) fields))))
 
+(defun type-annotation-form-p (form)
+  "Check if FORM is a type annotation: a keyword or a list starting with a keyword
+   (e.g., :int, (:values :int :int), (:ptr :int))."
+  (or (keywordp form)
+      (and (listp form) (keywordp (first form))
+           ;; Distinguish from body forms: type lists have only keywords/symbols/numbers
+           (every (lambda (x) (or (keywordp x) (numberp x) (listp x))) (rest form)))))
+
+(defun parse-ret-annotation (form)
+  "Parse a return type annotation, handling both keyword and list forms."
+  (if (keywordp form)
+      (parse-type-annotation form)
+      (parse-type-expr form)))
+
+(defun form-has-poly-marker-p (form)
+  "Check if a type annotation form contains :? or :poly anywhere."
+  (cond
+    ((eq form :poly) t)
+    ((and (keywordp form) (string-equal (symbol-name form) "?")) t)
+    ((listp form) (some #'form-has-poly-marker-p form))
+    (t nil)))
+
 (defun defn-is-poly-p (form)
   "Check if a defn form has any :? type annotations (polymorphic)."
   (let ((params-raw (third form))
@@ -5462,9 +5650,24 @@
         (and (listp params-raw)
              (some (lambda (x) (and (keywordp x) (string-equal (symbol-name x) "?")))
                    params-raw))
-        ;; Check return type annotation for :?
-        (and (keywordp (first rest-forms))
-             (string-equal (symbol-name (first rest-forms)) "?")))))
+        ;; Check return type annotation for :? (keyword or list form)
+        (and (first rest-forms)
+             (type-annotation-form-p (first rest-forms))
+             (form-has-poly-marker-p (first rest-forms))))))
+
+(defun subst-poly-type (type-form concrete-arg-types)
+  "Substitute :poly (resolved from :?) in a compound type with concrete types.
+   Each :poly gets replaced with the next concrete type."
+  (let ((idx 0))
+    (labels ((subst-rec (form)
+               (cond
+                 ((eq form :poly)
+                  (prog1 (or (nth idx concrete-arg-types) :int)
+                    (incf idx)))
+                 ((listp form)
+                  (cons (car form) (mapcar #'subst-rec (cdr form))))
+                 (t form))))
+      (subst-rec type-form))))
 
 (defun mangle-poly-name (base-name concrete-types)
   "Generate a mangled name for a monomorphized instance."
@@ -5504,19 +5707,29 @@
               (t nil))))
         (setf new-params (nreverse new-params))
         ;; Determine concrete return type
-        (let* ((concrete-ret (if (eq ret-ann :poly)
-                                 ;; For :? return, use the first concrete arg type as heuristic
-                                 ;; (works for identity-like functions)
-                                 (or (first concrete-arg-types) :int)
-                                 ret-ann))
-               (ret-keyword (if concrete-ret
-                                (intern (string-upcase (mangle-type-name concrete-ret)) :keyword)
-                                nil))
+        (let* ((concrete-ret (cond
+                               ((eq ret-ann :poly)
+                                ;; For :? return, use the first concrete arg type as heuristic
+                                (or (first concrete-arg-types) :int))
+                               ;; Compound return with :? (e.g., (:values :? :?))
+                               ((and (listp ret-ann) (form-has-poly-marker-p ret-ann))
+                                (subst-poly-type ret-ann concrete-arg-types))
+                               (t ret-ann)))
+               ;; Convert return type to form for synthetic defn
+               (ret-form (cond
+                           ((null concrete-ret) nil)
+                           ((values-type-p concrete-ret)
+                            ;; Emit as list annotation: (:values :int :str)
+                            (cons (intern "VALUES" :keyword)
+                                  (mapcar (lambda (tp)
+                                            (intern (string-upcase (mangle-type-name tp)) :keyword))
+                                          (values-type-elems concrete-ret))))
+                           (t (intern (string-upcase (mangle-type-name concrete-ret)) :keyword))))
                ;; Build the synthetic defn form
                (synthetic-form `(,(intern "defn" :sysp)
                                  ,(intern mangled :sysp)
                                  ,new-params
-                                 ,@(when ret-keyword (list ret-keyword))
+                                 ,@(when ret-form (list ret-form))
                                  ,@body-forms)))
           ;; Compile it
           (compile-defn synthetic-form))))
@@ -5536,8 +5749,8 @@
     (let* ((name (string (second form)))
            (params-raw (third form))
            (rest-forms (cdddr form))
-           (ret-ann (when (keywordp (first rest-forms))
-                      (prog1 (parse-type-annotation (first rest-forms))
+           (ret-ann (when (type-annotation-form-p (first rest-forms))
+                      (prog1 (parse-ret-annotation (first rest-forms))
                         (setf rest-forms (cdr rest-forms)))))
            (body-forms rest-forms))
       (setf (gethash name *poly-fns*) (list params-raw ret-ann body-forms))
@@ -5563,8 +5776,8 @@
               (parse-params params-raw inferred-arg-types)))
          (params (if params-rest (append params-fixed (list params-rest)) params-fixed))
          (variadic-p (not (null params-rest)))
-         (ret-annotation (when (keywordp (first rest-forms))
-                           (prog1 (parse-type-annotation (first rest-forms))
+         (ret-annotation (when (type-annotation-form-p (first rest-forms))
+                           (prog1 (parse-ret-annotation (first rest-forms))
                              (setf rest-forms (cdr rest-forms)))))
          (body-forms rest-forms)
          ;; Also register for compile-time use by macros
@@ -5732,6 +5945,98 @@
   (declare (ignore env))
   (let ((code (second form)))
     (list (format nil "  ~a" code))))
+
+(defun parse-asm-operands (rest env)
+  "Parse :in/:out operand lists from asm! extended form.
+   Returns (values out-constraints in-constraints clobbers).
+   Each constraint is (c-var constraint-str type)."
+  (let ((outs nil) (ins nil) (clobbers nil)
+        (items rest))
+    (loop while items do
+      (let ((key (pop items)))
+        (cond
+          ((and (keywordp key) (string-equal (string key) "OUT"))
+           (let ((spec (pop items)))
+             ;; spec is [name :type] or just a sysp var name
+             (if (listp spec)
+                 (let* ((name (string (first spec)))
+                        (tp (if (keywordp (second spec))
+                                (parse-type-annotation (second spec))
+                                :int)))
+                   (push (list name "=r" tp) outs))
+                 (multiple-value-bind (code tp) (compile-expr spec env)
+                   (push (list code "=r" tp) outs)))))
+          ((and (keywordp key) (string-equal (string key) "IN"))
+           (let ((spec (pop items)))
+             ;; spec can be [var1 var2 ...] or single var
+             (if (and (listp spec) (not (keywordp (first spec))))
+                 (dolist (v spec)
+                   (multiple-value-bind (code tp) (compile-expr v env)
+                     (declare (ignore tp))
+                     (push code ins)))
+                 (multiple-value-bind (code tp) (compile-expr spec env)
+                   (declare (ignore tp))
+                   (push code ins)))))
+          ((and (keywordp key) (string-equal (string key) "CLOBBER"))
+           (let ((spec (pop items)))
+             (if (listp spec)
+                 (dolist (c spec) (push (string c) clobbers))
+                 (push (string spec) clobbers)))))))
+    (values (nreverse outs) (nreverse ins) (nreverse clobbers))))
+
+(defun compile-asm-stmt (form env)
+  "(asm! \"instruction\") — simple form
+   (asm! \"pattern\" :out [result :int] :in [a b] :clobber [\"memory\"]) — extended form"
+  (let* ((template (second form))
+         (rest (cddr form)))
+    (if (null rest)
+        ;; Simple form: bare asm
+        (list (format nil "  __asm__ volatile(~s);" template))
+        ;; Extended form: GCC extended asm
+        (multiple-value-bind (outs ins clobbers) (parse-asm-operands rest env)
+          (let ((out-str (format nil "~{~s (~a)~^, ~}"
+                                (loop for (var constraint tp) in outs
+                                      collect constraint collect var)))
+                (in-str (format nil "~{~s (~a)~^, ~}"
+                               (loop for v in ins
+                                     collect "r" collect v)))
+                (clob-str (format nil "~{~s~^, ~}" clobbers)))
+            (list (format nil "  __asm__ volatile(~s : ~a : ~a~a);"
+                          template out-str in-str
+                          (if clobbers (format nil " : ~a" clob-str) ""))))))))
+
+(defun compile-asm-expr (form env)
+  "(asm! \"pattern\" :out [result :type] :in [vars...]) — expression form, returns :out value"
+  (let* ((template (second form))
+         (rest (cddr form)))
+    (if (null rest)
+        (values (format nil "({__asm__ volatile(~s); 0;})" template) :void)
+        (multiple-value-bind (outs ins clobbers) (parse-asm-operands rest env)
+          (if (null outs)
+              ;; No output: void
+              (values (format nil "({__asm__ volatile(~s :: ~{~s (~a)~^, ~}~a); 0;})"
+                              template
+                              (loop for v in ins collect "r" collect v)
+                              (if clobbers
+                                  (format nil " : ~{~s~^, ~}" clobbers)
+                                  ""))
+                      :void)
+              ;; Has output: return the first output value
+              (let* ((out-var (first (first outs)))
+                     (out-type (third (first outs)))
+                     (tmp (fresh-tmp))
+                     (out-str (format nil "~s (~a)"
+                                      "=r" tmp))
+                     (in-str (format nil "~{~s (~a)~^, ~}"
+                                    (loop for v in ins collect "r" collect v)))
+                     (clob-str (format nil "~{~s~^, ~}" clobbers)))
+                (declare (ignore out-var))
+                (push (format nil "  ~a ~a;" (type-to-c out-type) tmp) *pending-stmts*)
+                (push (format nil "  __asm__ volatile(~s : ~a : ~a~a);"
+                              template out-str in-str
+                              (if clobbers (format nil " : ~a" clob-str) ""))
+                      *pending-stmts*)
+                (values tmp out-type)))))))
 
 (defun compile-c-expr (form env)
   "(c-expr \"raw C\" :type) — raw C expression with type annotation."
@@ -6601,7 +6906,8 @@
                                          "str-len" "str-ref" "str-eq?" "str-contains?" "str-find"
                                          "str-concat" "str-slice" "str-upper" "str-lower"
                                          "str-split" "str-from-int" "str-from-float"
-                                         "str-join" "str-starts?" "str-ends?" "str-trim" "str-replace")
+                                         "str-join" "str-starts?" "str-ends?" "str-trim" "str-replace"
+                                         "nth" "asm!" "values" "let-values")
                                        :test #'equal))
                                  ;; Also safe: any known macro (expands inline)
                                  (not (gethash h *macros*))))

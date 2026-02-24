@@ -1,0 +1,21 @@
+;; test-asm.sysp — inline assembly
+
+(use core)
+
+(defn main [] :int
+  ;; Simple asm statement (nop)
+  (asm! "nop")
+
+  ;; Extended asm: add two numbers
+  (let a 10)
+  (let b 32)
+  (let-mut result 0)
+  (asm! "add %0, %1, %2"
+    :out [result :int]
+    :in [a b])
+  (println result)  ;; 42
+
+  ;; Asm with clobber
+  (asm! "nop" :clobber ["memory"])
+
+  0)

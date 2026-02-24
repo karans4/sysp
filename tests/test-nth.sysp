@@ -1,0 +1,28 @@
+;; test-nth.sysp — generic nth indexing
+
+(use core)
+
+(defn main [] :int
+  ;; Vector nth
+  (let v (vector 10 20 30))
+  (println (nth v 0))   ;; 10
+  (println (nth v 2))   ;; 30
+
+  ;; String nth
+  (let s "hello")
+  (let c (nth s 1))
+  (printf "%c\n" c)     ;; e
+
+  ;; Tuple nth
+  (let t (tuple 42 100))
+  (println (nth t 0))   ;; 42
+  (println (nth t 1))   ;; 100
+
+  ;; Array nth
+  (let-array a :int 3)
+  (array-set! a 0 7)
+  (array-set! a 1 8)
+  (array-set! a 2 9)
+  (println (nth a 2))   ;; 9
+
+  0)

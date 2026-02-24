@@ -1,0 +1,29 @@
+;; test-values.sysp — multiple return values
+
+(use core)
+
+;; Function returning multiple values
+(defn divmod [a :int b :int] (:values :int :int)
+  (values (/ a b) (% a b)))
+
+;; Poly function with values
+(defn swap [x :? y :?] (:values :? :?)
+  (values y x))
+
+(defn main [] :int
+  ;; Basic values + let-values
+  (let-values [(q r) (divmod 17 5)]
+    (println q)    ;; 3
+    (println r))   ;; 2
+
+  ;; Through polymorphic fn
+  (let-values [(a b) (swap 10 20)]
+    (println a)    ;; 20
+    (println b))   ;; 10
+
+  ;; Values in if branches
+  (let-values [(x y) (if true (values 1 2) (values 3 4))]
+    (println x)    ;; 1
+    (println y))   ;; 2
+
+  0)
