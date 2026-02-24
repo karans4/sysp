@@ -1,0 +1,51 @@
+;; Test dot syntax for struct field access
+
+(struct Point [x :int, y :int])
+
+;; Test 1: dot access on direct struct
+(defn test-dot-access () :int
+  (let p (Point 10 20))
+  (+ p.x p.y))
+
+;; Test 2: dot set on direct struct
+(defn test-dot-set () :int
+  (let-mut p (Point 0 0))
+  (set! p.x 42)
+  (set! p.y 58)
+  (+ p.x p.y))
+
+;; Test 3: chained dot access
+(struct Rect [origin :Point, w :int, h :int])
+
+(defn test-chained-dot () :int
+  (let r (Rect (Point 5 10) 100 200))
+  (+ r.origin.x r.origin.y))
+
+;; Test 4: pointer-to-struct auto-deref
+(defn test-ptr-deref () :int
+  (let-mut p (Point 7 3))
+  (let ptr (addr-of p))
+  (+ ptr.x ptr.y))
+
+;; Test 5: set through pointer
+(defn test-ptr-set () :int
+  (let-mut p (Point 0 0))
+  (let ptr (addr-of p))
+  (set! ptr.x 11)
+  (set! ptr.y 22)
+  (+ ptr.x ptr.y))
+
+(defn main () :int
+  (let r1 (test-dot-access))
+  (let r2 (test-dot-set))
+  (let r3 (test-chained-dot))
+  (let r4 (test-ptr-deref))
+  (let r5 (test-ptr-set))
+  (printf "dot-access: %d (expect 30)\n" r1)
+  (printf "dot-set: %d (expect 100)\n" r2)
+  (printf "chained-dot: %d (expect 15)\n" r3)
+  (printf "ptr-deref: %d (expect 10)\n" r4)
+  (printf "ptr-set: %d (expect 33)\n" r5)
+  (if (and (== r1 30) (== r2 100) (== r3 15) (== r4 10) (== r5 33))
+      (do (printf "ALL PASSED\n") 0)
+      (do (printf "FAILED\n") 1)))

@@ -1,93 +1,147 @@
 #!/bin/bash
 # sysp test runner - compiles and runs all tests with memory checking
+# All phases run in parallel using background jobs + wait
 
-set -e
-
-TESTS="test-cons test-refcount test-qq test-macros test-macros2 test-infer test-nesting test-numerics test-types test-recur test-union test-deftype test-branch-union test-inline test-match test-mono test-arc test-limitations test-modules test-closures test-threads test-conditions test-ffi test-c99 test-escape test-polish test-hof test-hashmap test-collections test-strings test-variadic test-nth test-asm test-values test-namespaces"
+TESTS="test-cons test-refcount test-qq test-macros test-macros2 test-infer test-nesting test-numerics test-types test-recur test-union test-deftype test-branch-union test-inline test-match test-mono test-arc test-limitations test-modules test-closures test-threads test-conditions test-ffi test-c99 test-escape test-polish test-hof test-hashmap test-collections test-strings test-variadic test-nth test-asm test-values test-namespaces test-dot"
 CFLAGS="-std=c99 -pedantic -Wall -Wextra -lpthread"
 SYSP="sbcl --script sysp.lisp"
 TEST_DIR="tests"
 BUILD_DIR="tests/build"
-FAILED=0
-PASSED=0
 
-# Create build directory
 mkdir -p "$BUILD_DIR"
 
 echo "=== sysp Test Suite ==="
 echo
 
-# Compile phase
+# --- Compile phase (parallel: sysp + gcc per test) ---
 echo "--- Compiling tests ---"
-for test in $TESTS; do
-    src="$TEST_DIR/$test.sysp"
-    c_out="$BUILD_DIR/$test.c"
-    bin="$BUILD_DIR/$test"
+compile_one() {
+    local test="$1"
+    local src="$TEST_DIR/$test.sysp"
+    local c_out="$BUILD_DIR/$test.c"
+    local bin="$BUILD_DIR/$test"
+    local log="$BUILD_DIR/$test.compile.log"
 
-    if [ -f "$src" ]; then
-        echo -n "Compiling $src... "
-        if $SYSP "$src" "$c_out" 2>/dev/null; then
-            echo "OK"
-        else
-            echo "FAILED (sysp)"
-            FAILED=$((FAILED + 1))
-            continue
-        fi
-
-        echo -n "  gcc $test.c... "
-        if gcc $CFLAGS "$c_out" -o "$bin" 2>/dev/null; then
-            echo "OK"
-        else
-            echo "FAILED (gcc)"
-            FAILED=$((FAILED + 1))
-        fi
-    else
-        echo "Skipping $test (file not found)"
+    if [ ! -f "$src" ]; then
+        echo "SKIP $test" > "$log"
+        return 0
     fi
+
+    if ! $SYSP "$src" "$c_out" 2>/dev/null; then
+        echo "FAIL_SYSP $test" > "$log"
+        return 1
+    fi
+
+    if ! gcc $CFLAGS "$c_out" -o "$bin" 2>/dev/null; then
+        echo "FAIL_GCC $test" > "$log"
+        return 1
+    fi
+
+    echo "OK $test" > "$log"
+    return 0
+}
+
+pids=()
+for test in $TESTS; do
+    compile_one "$test" &
+    pids+=($!)
+done
+wait "${pids[@]}" 2>/dev/null
+
+FAILED=0
+for test in $TESTS; do
+    log="$BUILD_DIR/$test.compile.log"
+    status=$(cat "$log" 2>/dev/null | cut -d' ' -f1)
+    case "$status" in
+        OK)       echo "  $test: OK" ;;
+        FAIL_SYSP) echo "  $test: FAILED (sysp)"; FAILED=$((FAILED + 1)) ;;
+        FAIL_GCC)  echo "  $test: FAILED (gcc)";  FAILED=$((FAILED + 1)) ;;
+        SKIP)      echo "  $test: skipped" ;;
+        *)         echo "  $test: FAILED (unknown)"; FAILED=$((FAILED + 1)) ;;
+    esac
 done
 echo
 
-# Run phase
+# --- Run phase (parallel) ---
 echo "--- Running tests ---"
-for test in $TESTS; do
-    bin="$BUILD_DIR/$test"
-    out="$BUILD_DIR/$test.out"
+PASSED=0
 
-    if [ -x "$bin" ]; then
-        echo -n "Running $test... "
-        if "$bin" > "$out" 2>&1; then
-            echo "OK"
-            PASSED=$((PASSED + 1))
-        else
-            echo "FAILED (exit code $?)"
-            FAILED=$((FAILED + 1))
-            cat "$out"
-        fi
+run_one() {
+    local test="$1"
+    local bin="$BUILD_DIR/$test"
+    local out="$BUILD_DIR/$test.out"
+    local status_file="$BUILD_DIR/$test.run.status"
+
+    if [ ! -x "$bin" ]; then
+        echo "SKIP" > "$status_file"
+        return 0
     fi
+
+    if "$bin" > "$out" 2>&1; then
+        echo "OK" > "$status_file"
+    else
+        echo "FAIL" > "$status_file"
+    fi
+}
+
+pids=()
+for test in $TESTS; do
+    run_one "$test" &
+    pids+=($!)
+done
+wait "${pids[@]}" 2>/dev/null
+
+for test in $TESTS; do
+    status=$(cat "$BUILD_DIR/$test.run.status" 2>/dev/null)
+    case "$status" in
+        OK)   echo "  $test: OK"; PASSED=$((PASSED + 1)) ;;
+        FAIL) echo "  $test: FAILED"; FAILED=$((FAILED + 1)); cat "$BUILD_DIR/$test.out" ;;
+        SKIP) ;;
+    esac
 done
 echo
 
-# Valgrind phase (if available)
+# --- Valgrind phase (parallel, if available) ---
 if command -v valgrind &> /dev/null; then
     echo "--- Memory checking with valgrind ---"
-    for test in $TESTS; do
-        bin="$BUILD_DIR/$test"
-        log="$BUILD_DIR/$test.valgrind"
 
-        if [ -x "$bin" ]; then
-            echo -n "Valgrind $test... "
-            if valgrind --leak-check=full --error-exitcode=1 "$bin" > "$log" 2>&1; then
-                echo "OK (no leaks)"
-            else
-                # Check if it's a known leak issue (unbound temporaries)
-                if grep -q "definitely lost" "$log"; then
-                    LEAK_BYTES=$(grep "definitely lost" "$log" | head -1 | grep -oP '\d+ bytes' | head -1)
-                    echo "LEAK ($LEAK_BYTES)"
-                else
-                    echo "ERROR"
-                fi
-            fi
+    valgrind_one() {
+        local test="$1"
+        local bin="$BUILD_DIR/$test"
+        local log="$BUILD_DIR/$test.valgrind"
+        local status_file="$BUILD_DIR/$test.vg.status"
+
+        if [ ! -x "$bin" ]; then
+            echo "SKIP" > "$status_file"
+            return 0
         fi
+
+        if valgrind --leak-check=full --error-exitcode=1 "$bin" > "$log" 2>&1; then
+            echo "OK" > "$status_file"
+        elif grep -q "definitely lost" "$log"; then
+            leak=$(grep "definitely lost" "$log" | head -1 | grep -oP '\d+ bytes' | head -1)
+            echo "LEAK $leak" > "$status_file"
+        else
+            echo "ERROR" > "$status_file"
+        fi
+    }
+
+    pids=()
+    for test in $TESTS; do
+        valgrind_one "$test" &
+        pids+=($!)
+    done
+    wait "${pids[@]}" 2>/dev/null
+
+    for test in $TESTS; do
+        status_line=$(cat "$BUILD_DIR/$test.vg.status" 2>/dev/null)
+        status=$(echo "$status_line" | cut -d' ' -f1)
+        case "$status" in
+            OK)   echo "  $test: OK (no leaks)" ;;
+            LEAK) echo "  $test: LEAK ($(echo "$status_line" | cut -d' ' -f2-))" ;;
+            ERROR) echo "  $test: ERROR" ;;
+            SKIP) ;;
+        esac
     done
     echo
 else

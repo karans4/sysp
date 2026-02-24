@@ -138,6 +138,23 @@
                                :float :double :f32 :f64
                                :size :ptrdiff :intptr :uintptr)))
 
+(defun integer-type-p (tp)
+  "Check if type is an integer (not float)."
+  (member (resolve-type tp) '(:int :i8 :i16 :i32 :i64
+                               :uint :u8 :u16 :u32 :u64
+                               :long :long-long :ulong :ulong-long
+                               :char :uchar :short :ushort
+                               :size :ptrdiff :intptr :uintptr)))
+
+(defun maybe-coerce (code from-type to-type)
+  "Wrap code in a C cast if from-type and to-type are different integer types.
+   Returns code unchanged if types match or aren't both integers."
+  (if (and to-type
+           (not (eq (resolve-type from-type) (resolve-type to-type)))
+           (integer-type-p from-type)
+           (integer-type-p to-type))
+      (format nil "((~a)~a)" (type-to-c to-type) code)
+      code))
 
 ;; Unify two types. Returns t on success, nil on failure.
 (defun unify (t1 t2)
@@ -291,7 +308,12 @@
          ((string-equal name "true") :bool)
          ((string-equal name "false") :bool)
          ((string-equal name "null") (make-ptr-type :void))
-         (t (or (infer-env-lookup name) (make-tvar))))))  ; infer-env-lookup already calls resolve-name
+         (t (or (infer-env-lookup name)
+                ;; Dot syntax: expand a.b to (get a b) and infer that
+                (when (find #\. name)
+                  (let ((expanded (expand-dot-symbol form)))
+                    (when expanded (infer-expr expanded))))
+                (make-tvar))))))
     ((listp form) (infer-list form))
     (t :int)))
 
@@ -326,7 +348,8 @@
       ((member (string head) '("and" "or" "not") :test #'string-equal) :bool)
 
       ;; Bitwise: operands are int, result is int
-      ((member (string head) '("bit-and" "bit-or" "bit-xor" "bit-not" "shl" "shr")
+      ((member (string head) '("bit-and" "bit-or" "bit-xor" "bit-not" "shl" "shr"
+                                "&" "|" "^" "~" "<<" ">>")
                :test #'string-equal) :int)
 
       ;; if expression: unify both branches
@@ -1187,17 +1210,25 @@
                (multiple-value-bind (inner has) (ps-read-form ps)
                  (declare (ignore has))
                  (list (intern "quasiquote" :sysp) inner)))
-              ;; Unquote
+              ;; Unquote (~expr, ~@expr) vs bit-not operator (~ expr — space after)
               ((char= c #\~)
-               (ps-advance ps)
-               (if (and (not (ps-eof-p ps)) (char= (ps-peek ps) #\@))
-                   (progn (ps-advance ps)
-                          (multiple-value-bind (inner has) (ps-read-form ps)
-                            (declare (ignore has))
-                            (list (intern "splice" :sysp) inner)))
-                   (multiple-value-bind (inner has) (ps-read-form ps)
-                     (declare (ignore has))
-                     (list (intern "unquote" :sysp) inner))))
+               (let ((next-c (if (< (1+ (pstate-pos ps)) (length (pstate-source ps)))
+                                 (char (pstate-source ps) (1+ (pstate-pos ps)))
+                                 nil)))
+                 (if (or (null next-c) (member next-c '(#\Space #\Newline #\Tab #\) #\])))
+                     ;; Space/delimiter after ~ : it's the bit-not symbol
+                     (progn (ps-advance ps) (intern "~" :sysp))
+                     ;; No space: unquote
+                     (progn
+                       (ps-advance ps)
+                       (if (and (not (ps-eof-p ps)) (char= (ps-peek ps) #\@))
+                           (progn (ps-advance ps)
+                                  (multiple-value-bind (inner has) (ps-read-form ps)
+                                    (declare (ignore has))
+                                    (list (intern "splice" :sysp) inner)))
+                           (multiple-value-bind (inner has) (ps-read-form ps)
+                             (declare (ignore has))
+                             (list (intern "unquote" :sysp) inner)))))))
               ;; Character literal
               ((and (char= c #\#) (not (ps-eof-p ps))
                     (< (1+ (pstate-pos ps)) (length (pstate-source ps)))
@@ -1270,6 +1301,27 @@
 (defun resolve-name (name)
   "Resolve a possibly-qualified name via *imports*. foo.bar → real unqualified name."
   (or (gethash name *imports*) name))
+
+(defun split-string (str sep)
+  "Split STR on character SEP, return list of substrings."
+  (let ((parts nil) (start 0))
+    (loop for i from 0 below (length str)
+          when (char= (char str i) sep)
+          do (push (subseq str start i) parts)
+             (setf start (1+ i)))
+    (push (subseq str start) parts)
+    (nreverse parts)))
+
+(defun expand-dot-symbol (form)
+  "Expand a.b.c → (GET (GET a b) c). Returns nil if not a dot expression."
+  (let* ((name (string form))
+         (parts (split-string name #\.)))
+    (when (and (> (length parts) 1)
+               (every (lambda (p) (plusp (length p))) parts))
+      (let ((result (intern (first parts))))
+        (dolist (field (rest parts))
+          (setf result (list (intern "GET") result (intern field))))
+        result))))
 
 (defun collect-module-names (forms)
   "Scan top-level forms for exported names (defn, struct, enum, const, defmacro, etc)."
@@ -2538,15 +2590,22 @@
          ((string-equal name "false") (values "0" :bool))
          ((string-equal name "null") (values "NULL" (make-ptr-type :void)))
          (t (let ((tp (env-lookup env name)))
-              (if tp
-                  (values (sanitize-name name) tp)
-                  ;; Check if it's an enum variant
-                  (let ((enum-info (lookup-enum-variant name)))
-                    (if enum-info
-                        (values (sanitize-name name)
-                                (make-enum-type (car enum-info)))
-                        (values (sanitize-name name)
-                                :unknown)))))))))
+              (cond
+                (tp (values (sanitize-name name) tp))
+                ;; Dot syntax: a.b.c → (get (get a b) c) when not a module-qualified import
+                ((and (string= name raw-name) (find #\. raw-name))
+                 (let ((expanded (expand-dot-symbol form)))
+                   (if expanded
+                       (return-from compile-expr-inner (compile-expr expanded env))
+                       ;; Bad dot expression, fall through to unknown
+                       (values (sanitize-name name) :unknown))))
+                ;; Check if it's an enum variant
+                (t (let ((enum-info (lookup-enum-variant name)))
+                     (if enum-info
+                         (values (sanitize-name name)
+                                 (make-enum-type (car enum-info)))
+                         (values (sanitize-name name)
+                                 :unknown))))))))))
     ((listp form)
      ;; Try macro expansion first
      (multiple-value-bind (expanded was-expanded) (macroexpand-1-sysp form)
@@ -2604,7 +2663,8 @@
 (defparameter *binop-ops*
   '(("+" . "+") ("-" . "-") ("*" . "*") ("/" . "/") ("%" . "%") ("mod" . "%")
     ("<" . "<") (">" . ">") ("<=" . "<=") (">=" . ">=") ("==" . "==") ("!=" . "!=")
-    ("bit-and" . "&") ("bit-or" . "|") ("bit-xor" . "^") ("shl" . "<<") ("shr" . ">>")))
+    ("bit-and" . "&") ("bit-or" . "|") ("bit-xor" . "^") ("shl" . "<<") ("shr" . ">>")
+    ("&" . "&") ("|" . "|") ("^" . "^") ("<<" . "<<") (">>" . ">>")))
 
 (defparameter *logical-ops* '(("and" . "&&") ("or" . "||")))
 
@@ -2631,7 +2691,7 @@
     ("quote" . compile-quote) ("quasiquote" . compile-quasiquote)
     ("sym" . compile-sym-literal) ("sym-eq?" . compile-sym-eq)
     ("gensym" . compile-gensym-expr)
-    ("not" . compile-not) ("bit-not" . compile-bit-not)
+    ("not" . compile-not) ("bit-not" . compile-bit-not) ("~" . compile-bit-not)
     ("match" . compile-match-expr)
     ("new" . compile-new-expr)
     ("ptr-alloc" . compile-ptr-alloc)
@@ -2741,9 +2801,9 @@
                 ;; Comparison and logical operators always return bool (int in C)
                 ((member op '("<" ">" "<=" ">=" "==" "!=" "&&" "||") :test #'string=)
                  :bool)
-                ;; Bitwise operators return int (operate on integer types)
+                ;; Bitwise operators: use arithmetic promotion (u8 & u8 → u8)
                 ((member op '("&" "|" "^" "<<" ">>") :test #'string=)
-                 :int)
+                 (sysp-arithmetic-type lt rt))
                 ;; Arithmetic operators: use C99 promotion rules
                 (t (sysp-arithmetic-type lt rt)))))
         (values (format nil "(~a ~a ~a)" lhs op rhs) result-type)))))
@@ -2757,7 +2817,7 @@
           (setf acc-type
                 (cond
                   ((member op '("<" ">" "<=" ">=" "==" "!=" "&&" "||") :test #'string=) :bool)
-                  ((member op '("&" "|" "^" "<<" ">>") :test #'string=) :int)
+                  ((member op '("&" "|" "^" "<<" ">>") :test #'string=) (sysp-arithmetic-type acc-type rt))
                   (t (sysp-arithmetic-type acc-type rt))))
           (setf acc (format nil "(~a ~a ~a)" acc op rhs))))
       (values acc acc-type))))
@@ -2971,20 +3031,20 @@
     (if (= (length args) 3)
         ;; (ptr-set! p i val)
         (multiple-value-bind (p-code pt) (compile-expr (first args) env)
-          (declare (ignore pt))
           (multiple-value-bind (i-code it) (compile-expr (second args) env)
             (declare (ignore it))
             (multiple-value-bind (v-code vt) (compile-expr (third args) env)
-              (declare (ignore vt))
-              (append *pending-stmts*
-                      (list (format nil "  ~a[~a] = ~a;" p-code i-code v-code))))))
+              (let* ((elem-type (when (and (consp pt) (eq (car pt) :ptr)) (second pt)))
+                     (coerced (if elem-type (maybe-coerce v-code vt elem-type) v-code)))
+                (append *pending-stmts*
+                        (list (format nil "  ~a[~a] = ~a;" p-code i-code coerced)))))))
         ;; (ptr-set! p val)
         (multiple-value-bind (p-code pt) (compile-expr (first args) env)
-          (declare (ignore pt))
           (multiple-value-bind (v-code vt) (compile-expr (second args) env)
-            (declare (ignore vt))
-            (append *pending-stmts*
-                    (list (format nil "  *~a = ~a;" p-code v-code))))))))
+            (let* ((elem-type (when (and (consp pt) (eq (car pt) :ptr)) (second pt)))
+                   (coerced (if elem-type (maybe-coerce v-code vt elem-type) v-code)))
+              (append *pending-stmts*
+                      (list (format nil "  *~a = ~a;" p-code coerced)))))))))
 
 (defun compile-ptr-add (form env)
   "(ptr+ ptr offset) — pointer arithmetic, returns same pointer type."
@@ -3170,22 +3230,34 @@
             (values type (append let-stmts (or body-stmts nil) last-stmts)))))))
 
 (defun compile-get (form env)
-  "(get struct field) — auto-derefs through RC wrapper"
+  "(get struct field) — auto-derefs through RC wrapper and pointer-to-struct"
   (multiple-value-bind (obj tp) (compile-expr (second form) env)
     (let* ((field-name (string (third form)))
            ;; For RC types, look up the inner struct
            (is-rc (rc-type-p tp))
-           (struct-type (if is-rc (rc-inner-type tp) tp))
+           ;; For pointer-to-struct, auto-deref
+           (is-ptr-struct (and (not is-rc)
+                               (eq (type-kind tp) :ptr)
+                               (consp (second tp))
+                               (eq (type-kind (second tp)) :struct)))
+           (struct-type (cond (is-rc (rc-inner-type tp))
+                              (is-ptr-struct (second tp))
+                              (t tp)))
            (struct-name (when (eq (type-kind struct-type) :struct) (second struct-type)))
            (field-type (if (and struct-name (gethash struct-name *structs*))
                            (let ((fields (gethash struct-name *structs*)))
                              (cdr (assoc field-name fields :test #'equal)))
                            :int)))
-      (if is-rc
-          (values (format nil "~a->data.~a" obj (sanitize-name field-name))
-                  (or field-type :int))
-          (values (format nil "~a.~a" obj (sanitize-name field-name))
-                  (or field-type :int))))))
+      (cond
+        (is-rc
+         (values (format nil "~a->data.~a" obj (sanitize-name field-name))
+                 (or field-type :int)))
+        (is-ptr-struct
+         (values (format nil "~a->~a" obj (sanitize-name field-name))
+                 (or field-type :int)))
+        (t
+         (values (format nil "~a.~a" obj (sanitize-name field-name))
+                 (or field-type :int)))))))
 
 (defun compile-vector (form env)
   "(vector elem ...) - stack compound literal if non-escaping, heap if escaping"
@@ -4347,17 +4419,31 @@
   "(set! name expr) as expression"
   (let ((target (second form)))
     (cond
-      ;; (set! (get struct field) val) -> struct.field = val (or ->data.field for RC)
+      ;; (set! (get struct field) val) -> struct.field = val (or ->data.field for RC, -> for ptr-to-struct)
       ((and (listp target) (sym= (first target) "get"))
        (multiple-value-bind (obj tp) (compile-expr (second target) env)
          (let* ((field (string (third target)))
                 (is-rc (rc-type-p tp))
-                (accessor (if is-rc
-                              (format nil "~a->data.~a" obj (sanitize-name field))
-                              (format nil "~a.~a" obj (sanitize-name field)))))
+                (is-ptr-struct (and (not is-rc)
+                                    (eq (type-kind tp) :ptr)
+                                    (consp (second tp))
+                                    (eq (type-kind (second tp)) :struct)))
+                (accessor (cond (is-rc
+                                 (format nil "~a->data.~a" obj (sanitize-name field)))
+                                (is-ptr-struct
+                                 (format nil "~a->~a" obj (sanitize-name field)))
+                                (t
+                                 (format nil "~a.~a" obj (sanitize-name field))))))
            (multiple-value-bind (val-code val-type) (compile-expr (third form) env)
-             (values (format nil "(~a = ~a)" accessor val-code)
-                     val-type)))))
+             (let* ((struct-type (cond (is-rc (rc-inner-type tp))
+                                       (is-ptr-struct (second tp))
+                                       (t tp)))
+                    (struct-name (when (eq (type-kind struct-type) :struct) (second struct-type)))
+                    (field-type (when struct-name
+                                  (cdr (assoc field (gethash struct-name *structs*) :test #'equal))))
+                    (coerced (if field-type (maybe-coerce val-code val-type field-type) val-code)))
+               (values (format nil "(~a = ~a)" accessor coerced)
+                       (or field-type val-type)))))))
       ;; (set! (deref ptr) val) -> *ptr = val
       ((and (listp target) (sym= (first target) "deref"))
        (multiple-value-bind (ptr-code pt) (compile-expr (second target) env)
@@ -4376,6 +4462,12 @@
       ;; (set! (hash-get m k) val) -> hash-set!(m, k, val)
       ((and (listp target) (sym= (first target) "hash-get"))
        (compile-expr (list (intern "hash-set!") (second target) (third target) (third form)) env))
+      ;; Dot syntax: (set! a.b val) → (set! (get a b) val)
+      ((and (symbolp target) (find #\. (string target)))
+       (let ((expanded (expand-dot-symbol target)))
+         (if expanded
+             (compile-set-expr (list (intern "SET!") expanded (third form)) env)
+             (sysp-error form "invalid dot syntax in set! target: ~a" target))))
       ;; simple variable
       (t (let ((name (string target)))
            (when (and (env-lookup env name) (not (env-mutable-p env name)))
@@ -4728,19 +4820,27 @@
                   (values (format nil "~a(~{~a~^, ~})" (c-fn-name fn-name) all-args)
                           ret-type)))
               ;; Non-variadic: compile all args directly
-              (let ((compiled-args (mapcar (lambda (a) (first (multiple-value-list (compile-expr a env)))) args))
+              (let ((compiled-args-with-types
+                      (mapcar (lambda (a) (multiple-value-list (compile-expr a env))) args))
                     (is-fn-var (and (not (gethash fn-name *direct-fns*))
                                     fn-type
                                     (eq (type-kind fn-type) :fn))))
-                (if is-fn-var
-                    ;; Call through Fn struct: f.fn(f.env, args...)
-                    (let ((c-name (sanitize-name fn-name)))
-                      (values (format nil "~a.fn(~a.env~{, ~a~})"
-                                      c-name c-name compiled-args)
-                              ret-type))
-                    ;; Direct function call
-                    (values (format nil "~a(~{~a~^, ~})" (c-fn-name fn-name) compiled-args)
-                            ret-type))))))))
+                ;; Auto-coerce args to match parameter types (e.g. int → size_t)
+                (let ((compiled-args
+                        (loop for (code tp) in compiled-args-with-types
+                              for i from 0
+                              collect (if (and fn-arg-types (< i (length fn-arg-types)))
+                                          (maybe-coerce code tp (nth i fn-arg-types))
+                                          code))))
+                  (if is-fn-var
+                      ;; Call through Fn struct: f.fn(f.env, args...)
+                      (let ((c-name (sanitize-name fn-name)))
+                        (values (format nil "~a.fn(~a.env~{, ~a~})"
+                                        c-name c-name compiled-args)
+                                ret-type))
+                      ;; Direct function call
+                      (values (format nil "~a(~{~a~^, ~})" (c-fn-name fn-name) compiled-args)
+                              ret-type)))))))))
 
 (defun compile-struct-construct (name args env)
   "Compile struct construction — positional or named (designated initializer).
@@ -7046,7 +7146,7 @@
                                          "hash-get" "hash-set!" "hash-has?" "hash-del!"
                                          "hash-len" "hash-keys" "hash-vals" "hash-free"
                                          "inc" "dec" "bit-and" "bit-or" "bit-xor" "bit-not"
-                                         "bit-shl" "bit-shr" "new" "recur" "break" "continue"
+                                         "bit-shl" "bit-shr" "&" "|" "^" "~" "<<" ">>" "new" "recur" "break" "continue"
                                          "block" "runtype" "as" "vector" "hash-map"
                                          "str-len" "str-ref" "str-eq?" "str-contains?" "str-find"
                                          "str-concat" "str-slice" "str-upper" "str-lower"

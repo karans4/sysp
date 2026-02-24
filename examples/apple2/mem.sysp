@@ -4,7 +4,7 @@
   (do
     ;; $C010: keyboard strobe — any read clears bit 7 of $C000
     (when (== addr 49168)
-      (ptr-set! mem 49152 (cast :u8 (bit-and (cast :int (ptr-deref mem 49152)) 127))))
+      (ptr-set! mem 49152 (cast :u8 (& (cast :int (ptr-deref mem 49152)) 127))))
     (cast :int (ptr-deref mem addr))))
 
 (defn mem-write [mem :ptr-u8, addr :int, val :int] :void
@@ -12,4 +12,4 @@
 
 (defn mem-read16 [mem :ptr-u8, addr :int] :int
   (+ (mem-read mem addr)
-     (shl (mem-read mem (+ addr 1)) 8)))
+     (<< (mem-read mem (+ addr 1)) 8)))

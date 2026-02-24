@@ -18,24 +18,24 @@
 ;; ============================================================
 
 (defn cpu-flag-set [cpu :ptr-CPU, flag :int] :int
-  (if (!= (bit-and (cast :int (get (deref cpu) status)) flag) 0) 1 0))
+  (if (!= (& cpu.status flag) 0) 1 0))
 
 (defn cpu-set-flag [cpu :ptr-CPU, flag :int] :void
-  (set! (get (deref cpu) status)
-        (cast :u8 (bit-or (cast :int (get (deref cpu) status)) flag))))
+  (set! cpu.status
+        (| cpu.status flag)))
 
 (defn cpu-clear-flag [cpu :ptr-CPU, flag :int] :void
-  (set! (get (deref cpu) status)
-        (cast :u8 (bit-and (cast :int (get (deref cpu) status)) (bit-not flag)))))
+  (set! cpu.status
+        (& cpu.status (~ flag))))
 
 (defn cpu-update-nz [cpu :ptr-CPU, val :int] :void
   (do
     ;; Zero flag
-    (if (== (bit-and val 255) 0)
+    (if (== (& val 255) 0)
         (cpu-set-flag cpu FLAG_Z)
         (cpu-clear-flag cpu FLAG_Z))
     ;; Negative flag
-    (if (!= (bit-and val 128) 0)
+    (if (!= (& val 128) 0)
         (cpu-set-flag cpu FLAG_N)
         (cpu-clear-flag cpu FLAG_N))))
 
@@ -45,28 +45,28 @@
 
 (defn cpu-push [cpu :ptr-CPU, mem :ptr-u8, val :int] :void
   (do
-    (let sp-addr (+ 256 (cast :int (get (deref cpu) sp))))
+    (let sp-addr (+ 256 cpu.sp))
     (mem-write mem sp-addr val)
-    (set! (get (deref cpu) sp)
-          (cast :u8 (bit-and (- (cast :int (get (deref cpu) sp)) 1) 255)))))
+    (set! cpu.sp
+          (& (- cpu.sp 1) 255))))
 
 (defn cpu-pull [cpu :ptr-CPU, mem :ptr-u8] :int
   (do
-    (set! (get (deref cpu) sp)
-          (cast :u8 (bit-and (+ (cast :int (get (deref cpu) sp)) 1) 255)))
-    (let sp-addr (+ 256 (cast :int (get (deref cpu) sp))))
+    (set! cpu.sp
+          (& (+ cpu.sp 1) 255))
+    (let sp-addr (+ 256 cpu.sp))
     (mem-read mem sp-addr)))
 
 (defn cpu-push16 [cpu :ptr-CPU, mem :ptr-u8, val :int] :void
   (do
-    (cpu-push cpu mem (bit-and (shr val 8) 255))
-    (cpu-push cpu mem (bit-and val 255))))
+    (cpu-push cpu mem (& (>> val 8) 255))
+    (cpu-push cpu mem (& val 255))))
 
 (defn cpu-pull16 [cpu :ptr-CPU, mem :ptr-u8] :int
   (do
     (let lo (cpu-pull cpu mem))
     (let hi (cpu-pull cpu mem))
-    (bit-or lo (shl hi 8))))
+    (| lo (<< hi 8))))
 
 ;; ============================================================
 ;; Addressing modes — each returns effective address, advances PC
@@ -75,71 +75,71 @@
 ;; Immediate: operand is at PC+1, advance PC by 2
 (defn addr-imm [cpu :ptr-CPU] :int
   (do
-    (let addr (bit-and (+ (get (deref cpu) pc) 1) 65535))
-    (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 2) 65535))
+    (let addr (& (+ cpu.pc 1) 65535))
+    (set! cpu.pc (& (+ cpu.pc 2) 65535))
     addr))
 
 ;; Zero page: operand byte at PC+1 is the ZP address
 (defn addr-zp [cpu :ptr-CPU, mem :ptr-u8] :int
   (do
-    (let addr (mem-read mem (bit-and (+ (get (deref cpu) pc) 1) 65535)))
-    (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 2) 65535))
-    (bit-and addr 255)))
+    (let addr (mem-read mem (& (+ cpu.pc 1) 65535)))
+    (set! cpu.pc (& (+ cpu.pc 2) 65535))
+    (& addr 255)))
 
 ;; Zero page + X
 (defn addr-zpx [cpu :ptr-CPU, mem :ptr-u8] :int
   (do
-    (let base (mem-read mem (bit-and (+ (get (deref cpu) pc) 1) 65535)))
-    (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 2) 65535))
-    (bit-and (+ base (cast :int (get (deref cpu) x))) 255)))
+    (let base (mem-read mem (& (+ cpu.pc 1) 65535)))
+    (set! cpu.pc (& (+ cpu.pc 2) 65535))
+    (& (+ base cpu.x) 255)))
 
 ;; Zero page + Y
 (defn addr-zpy [cpu :ptr-CPU, mem :ptr-u8] :int
   (do
-    (let base (mem-read mem (bit-and (+ (get (deref cpu) pc) 1) 65535)))
-    (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 2) 65535))
-    (bit-and (+ base (cast :int (get (deref cpu) y))) 255)))
+    (let base (mem-read mem (& (+ cpu.pc 1) 65535)))
+    (set! cpu.pc (& (+ cpu.pc 2) 65535))
+    (& (+ base cpu.y) 255)))
 
 ;; Absolute: 16-bit address at PC+1
 (defn addr-abs [cpu :ptr-CPU, mem :ptr-u8] :int
   (do
-    (let addr (mem-read16 mem (bit-and (+ (get (deref cpu) pc) 1) 65535)))
-    (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 3) 65535))
+    (let addr (mem-read16 mem (& (+ cpu.pc 1) 65535)))
+    (set! cpu.pc (& (+ cpu.pc 3) 65535))
     addr))
 
 ;; Absolute + X
 (defn addr-abx [cpu :ptr-CPU, mem :ptr-u8] :int
   (do
-    (let base (mem-read16 mem (bit-and (+ (get (deref cpu) pc) 1) 65535)))
-    (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 3) 65535))
-    (bit-and (+ base (cast :int (get (deref cpu) x))) 65535)))
+    (let base (mem-read16 mem (& (+ cpu.pc 1) 65535)))
+    (set! cpu.pc (& (+ cpu.pc 3) 65535))
+    (& (+ base cpu.x) 65535)))
 
 ;; Absolute + Y
 (defn addr-aby [cpu :ptr-CPU, mem :ptr-u8] :int
   (do
-    (let base (mem-read16 mem (bit-and (+ (get (deref cpu) pc) 1) 65535)))
-    (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 3) 65535))
-    (bit-and (+ base (cast :int (get (deref cpu) y))) 65535)))
+    (let base (mem-read16 mem (& (+ cpu.pc 1) 65535)))
+    (set! cpu.pc (& (+ cpu.pc 3) 65535))
+    (& (+ base cpu.y) 65535)))
 
 ;; Indirect X: (zp+X) points to 16-bit address in zero page
 (defn addr-izx [cpu :ptr-CPU, mem :ptr-u8] :int
   (do
-    (let base (mem-read mem (bit-and (+ (get (deref cpu) pc) 1) 65535)))
-    (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 2) 65535))
-    (let zp-addr (bit-and (+ base (cast :int (get (deref cpu) x))) 255))
+    (let base (mem-read mem (& (+ cpu.pc 1) 65535)))
+    (set! cpu.pc (& (+ cpu.pc 2) 65535))
+    (let zp-addr (& (+ base cpu.x) 255))
     (let lo (mem-read mem zp-addr))
-    (let hi (mem-read mem (bit-and (+ zp-addr 1) 255)))
-    (bit-or lo (shl hi 8))))
+    (let hi (mem-read mem (& (+ zp-addr 1) 255)))
+    (| lo (<< hi 8))))
 
 ;; Indirect Y: (zp) points to 16-bit base, add Y
 (defn addr-izy [cpu :ptr-CPU, mem :ptr-u8] :int
   (do
-    (let zp-addr (mem-read mem (bit-and (+ (get (deref cpu) pc) 1) 65535)))
-    (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 2) 65535))
-    (let lo (mem-read mem (bit-and zp-addr 255)))
-    (let hi (mem-read mem (bit-and (+ zp-addr 1) 255)))
-    (let base (bit-or lo (shl hi 8)))
-    (bit-and (+ base (cast :int (get (deref cpu) y))) 65535)))
+    (let zp-addr (mem-read mem (& (+ cpu.pc 1) 65535)))
+    (set! cpu.pc (& (+ cpu.pc 2) 65535))
+    (let lo (mem-read mem (& zp-addr 255)))
+    (let hi (mem-read mem (& (+ zp-addr 1) 255)))
+    (let base (| lo (<< hi 8)))
+    (& (+ base cpu.y) 65535)))
 
 ;; ============================================================
 ;; cpu-exec-load-store: LDA LDX LDY STA STX STY
@@ -153,49 +153,49 @@
       [(== op 169) ;; LDA imm
        (do (let addr (addr-imm cpu))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 2))]
       [(== op 165) ;; LDA zp
        (do (let addr (addr-zp cpu mem))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 3))]
       [(== op 181) ;; LDA zpx
        (do (let addr (addr-zpx cpu mem))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 173) ;; LDA abs
        (do (let addr (addr-abs cpu mem))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 189) ;; LDA abx
        (do (let addr (addr-abx cpu mem))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 185) ;; LDA aby
        (do (let addr (addr-aby cpu mem))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 161) ;; LDA izx
        (do (let addr (addr-izx cpu mem))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 6))]
       [(== op 177) ;; LDA izy
        (do (let addr (addr-izy cpu mem))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 5))]
 
@@ -203,31 +203,31 @@
       [(== op 162) ;; LDX imm
        (do (let addr (addr-imm cpu))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) x) (cast :u8 val))
+           (set! cpu.x val)
            (cpu-update-nz cpu val)
            (set! cycles 2))]
       [(== op 166) ;; LDX zp
        (do (let addr (addr-zp cpu mem))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) x) (cast :u8 val))
+           (set! cpu.x val)
            (cpu-update-nz cpu val)
            (set! cycles 3))]
       [(== op 182) ;; LDX zpy
        (do (let addr (addr-zpy cpu mem))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) x) (cast :u8 val))
+           (set! cpu.x val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 174) ;; LDX abs
        (do (let addr (addr-abs cpu mem))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) x) (cast :u8 val))
+           (set! cpu.x val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 190) ;; LDX aby
        (do (let addr (addr-aby cpu mem))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) x) (cast :u8 val))
+           (set! cpu.x val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
 
@@ -235,90 +235,90 @@
       [(== op 160) ;; LDY imm
        (do (let addr (addr-imm cpu))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) y) (cast :u8 val))
+           (set! cpu.y val)
            (cpu-update-nz cpu val)
            (set! cycles 2))]
       [(== op 164) ;; LDY zp
        (do (let addr (addr-zp cpu mem))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) y) (cast :u8 val))
+           (set! cpu.y val)
            (cpu-update-nz cpu val)
            (set! cycles 3))]
       [(== op 180) ;; LDY zpx
        (do (let addr (addr-zpx cpu mem))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) y) (cast :u8 val))
+           (set! cpu.y val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 172) ;; LDY abs
        (do (let addr (addr-abs cpu mem))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) y) (cast :u8 val))
+           (set! cpu.y val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 188) ;; LDY abx
        (do (let addr (addr-abx cpu mem))
            (let val (mem-read mem addr))
-           (set! (get (deref cpu) y) (cast :u8 val))
+           (set! cpu.y val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
 
       ;; --- STA ---
       [(== op 133) ;; STA zp
        (do (let addr (addr-zp cpu mem))
-           (mem-write mem addr (cast :int (get (deref cpu) a)))
+           (mem-write mem addr cpu.a)
            (set! cycles 3))]
       [(== op 149) ;; STA zpx
        (do (let addr (addr-zpx cpu mem))
-           (mem-write mem addr (cast :int (get (deref cpu) a)))
+           (mem-write mem addr cpu.a)
            (set! cycles 4))]
       [(== op 141) ;; STA abs
        (do (let addr (addr-abs cpu mem))
-           (mem-write mem addr (cast :int (get (deref cpu) a)))
+           (mem-write mem addr cpu.a)
            (set! cycles 4))]
       [(== op 157) ;; STA abx
        (do (let addr (addr-abx cpu mem))
-           (mem-write mem addr (cast :int (get (deref cpu) a)))
+           (mem-write mem addr cpu.a)
            (set! cycles 5))]
       [(== op 153) ;; STA aby
        (do (let addr (addr-aby cpu mem))
-           (mem-write mem addr (cast :int (get (deref cpu) a)))
+           (mem-write mem addr cpu.a)
            (set! cycles 5))]
       [(== op 129) ;; STA izx
        (do (let addr (addr-izx cpu mem))
-           (mem-write mem addr (cast :int (get (deref cpu) a)))
+           (mem-write mem addr cpu.a)
            (set! cycles 6))]
       [(== op 145) ;; STA izy
        (do (let addr (addr-izy cpu mem))
-           (mem-write mem addr (cast :int (get (deref cpu) a)))
+           (mem-write mem addr cpu.a)
            (set! cycles 6))]
 
       ;; --- STX ---
       [(== op 134) ;; STX zp
        (do (let addr (addr-zp cpu mem))
-           (mem-write mem addr (cast :int (get (deref cpu) x)))
+           (mem-write mem addr cpu.x)
            (set! cycles 3))]
       [(== op 150) ;; STX zpy
        (do (let addr (addr-zpy cpu mem))
-           (mem-write mem addr (cast :int (get (deref cpu) x)))
+           (mem-write mem addr cpu.x)
            (set! cycles 4))]
       [(== op 142) ;; STX abs
        (do (let addr (addr-abs cpu mem))
-           (mem-write mem addr (cast :int (get (deref cpu) x)))
+           (mem-write mem addr cpu.x)
            (set! cycles 4))]
 
       ;; --- STY ---
       [(== op 132) ;; STY zp
        (do (let addr (addr-zp cpu mem))
-           (mem-write mem addr (cast :int (get (deref cpu) y)))
+           (mem-write mem addr cpu.y)
            (set! cycles 3))]
       [(== op 148) ;; STY zpx
        (do (let addr (addr-zpx cpu mem))
-           (mem-write mem addr (cast :int (get (deref cpu) y)))
+           (mem-write mem addr cpu.y)
            (set! cycles 4))]
       [(== op 140) ;; STY abs
        (do (let addr (addr-abs cpu mem))
-           (mem-write mem addr (cast :int (get (deref cpu) y)))
+           (mem-write mem addr cpu.y)
            (set! cycles 4))]
 
       [else (set! cycles -1)])
@@ -330,23 +330,23 @@
 
 (defn cpu-do-adc [cpu :ptr-CPU, val :int] :void
   (do
-    (let a-val (cast :int (get (deref cpu) a)))
+    (let a-val cpu.a)
     (let carry (cpu-flag-set cpu FLAG_C))
     (if (!= (cpu-flag-set cpu FLAG_D) 0)
       ;; BCD decimal mode ADC
       (do
         ;; Low nibble with carry
-        (let-mut al (+ (bit-and a-val 15) (+ (bit-and val 15) carry)))
+        (let-mut al (+ (& a-val 15) (+ (& val 15) carry)))
         (when (>= al 10)
-          (set! al (+ (bit-and (+ al 6) 15) 16)))
+          (set! al (+ (& (+ al 6) 15) 16)))
         ;; Combine high nibbles + corrected low
-        (let-mut sum (+ (bit-and a-val 240) (+ (bit-and val 240) al)))
+        (let-mut sum (+ (& a-val 240) (+ (& val 240) al)))
         ;; V flag from intermediate (before high nibble correction)
-        (if (!= (bit-and (bit-and (bit-not (bit-xor a-val val)) (bit-xor a-val sum)) 128) 0)
+        (if (!= (& (& (~ (^ a-val val)) (^ a-val sum)) 128) 0)
             (cpu-set-flag cpu FLAG_V)
             (cpu-clear-flag cpu FLAG_V))
         ;; N flag from intermediate
-        (if (!= (bit-and sum 128) 0)
+        (if (!= (& sum 128) 0)
             (cpu-set-flag cpu FLAG_N)
             (cpu-clear-flag cpu FLAG_N))
         ;; High nibble BCD correction
@@ -357,26 +357,26 @@
             (cpu-set-flag cpu FLAG_C)
             (cpu-clear-flag cpu FLAG_C))
         ;; Z from binary (non-BCD) result
-        (if (== (bit-and (+ a-val (+ val carry)) 255) 0)
+        (if (== (& (+ a-val (+ val carry)) 255) 0)
             (cpu-set-flag cpu FLAG_Z)
             (cpu-clear-flag cpu FLAG_Z))
-        (set! (get (deref cpu) a) (cast :u8 (bit-and sum 255))))
+        (set! cpu.a (& sum 255)))
       ;; Binary mode ADC
       (do
         (let sum (+ a-val (+ val carry)))
-        (let result (bit-and sum 255))
+        (let result (& sum 255))
         (if (> sum 255)
             (cpu-set-flag cpu FLAG_C)
             (cpu-clear-flag cpu FLAG_C))
-        (if (!= (bit-and (bit-and (bit-xor a-val result) (bit-xor val result)) 128) 0)
+        (if (!= (& (& (^ a-val result) (^ val result)) 128) 0)
             (cpu-set-flag cpu FLAG_V)
             (cpu-clear-flag cpu FLAG_V))
-        (set! (get (deref cpu) a) (cast :u8 result))
+        (set! cpu.a result)
         (cpu-update-nz cpu result)))))
 
 (defn cpu-do-sbc [cpu :ptr-CPU, val :int] :void
   (do
-    (let a-val (cast :int (get (deref cpu) a)))
+    (let a-val cpu.a)
     (let carry (cpu-flag-set cpu FLAG_C))
     (if (!= (cpu-flag-set cpu FLAG_D) 0)
       ;; BCD decimal mode SBC — all flags from binary result
@@ -387,27 +387,27 @@
         (if (>= bin 0)
             (cpu-set-flag cpu FLAG_C)
             (cpu-clear-flag cpu FLAG_C))
-        (let bin-u8 (bit-and bin 255))
+        (let bin-u8 (& bin 255))
         (if (== bin-u8 0)
             (cpu-set-flag cpu FLAG_Z)
             (cpu-clear-flag cpu FLAG_Z))
-        (if (!= (bit-and bin-u8 128) 0)
+        (if (!= (& bin-u8 128) 0)
             (cpu-set-flag cpu FLAG_N)
             (cpu-clear-flag cpu FLAG_N))
-        (if (!= (bit-and (bit-and (bit-xor a-val val) (bit-xor a-val bin-u8)) 128) 0)
+        (if (!= (& (& (^ a-val val) (^ a-val bin-u8)) 128) 0)
             (cpu-set-flag cpu FLAG_V)
             (cpu-clear-flag cpu FLAG_V))
         ;; BCD correction for accumulator result only
-        (let-mut al (- (bit-and a-val 15) (+ (bit-and val 15) borrow)))
-        (let-mut ah (- (shr a-val 4) (shr val 4)))
+        (let-mut al (- (& a-val 15) (+ (& val 15) borrow)))
+        (let-mut ah (- (>> a-val 4) (>> val 4)))
         (when (< al 0)
           (do (set! al (- al 6))
               (set! ah (- ah 1))))
         (when (< ah 0)
           (set! ah (- ah 6)))
-        (set! (get (deref cpu) a) (cast :u8 (bit-and (bit-or (shl (bit-and ah 15) 4) (bit-and al 15)) 255))))
+        (set! cpu.a (& (| (<< (& ah 15) 4) (& al 15)) 255)))
       ;; Binary mode SBC = ADC with ones complement
-      (cpu-do-adc cpu (bit-and (bit-xor val 255) 255)))))
+      (cpu-do-adc cpu (& (^ val 255) 255)))))
 
 (defn cpu-do-cmp [cpu :ptr-CPU, reg-val :int, val :int] :void
   (do
@@ -415,7 +415,7 @@
     (if (>= reg-val val)
         (cpu-set-flag cpu FLAG_C)
         (cpu-clear-flag cpu FLAG_C))
-    (cpu-update-nz cpu (bit-and diff 255))))
+    (cpu-update-nz cpu (& diff 255))))
 
 (defn cpu-exec-arithmetic [cpu :ptr-CPU, mem :ptr-u8, op :int] :int
   (do
@@ -492,87 +492,87 @@
       ;; --- CMP ---
       [(== op 201) ;; CMP imm
        (do (let addr (addr-imm cpu))
-           (cpu-do-cmp cpu (cast :int (get (deref cpu) a)) (mem-read mem addr))
+           (cpu-do-cmp cpu cpu.a (mem-read mem addr))
            (set! cycles 2))]
       [(== op 197) ;; CMP zp
        (do (let addr (addr-zp cpu mem))
-           (cpu-do-cmp cpu (cast :int (get (deref cpu) a)) (mem-read mem addr))
+           (cpu-do-cmp cpu cpu.a (mem-read mem addr))
            (set! cycles 3))]
       [(== op 213) ;; CMP zpx
        (do (let addr (addr-zpx cpu mem))
-           (cpu-do-cmp cpu (cast :int (get (deref cpu) a)) (mem-read mem addr))
+           (cpu-do-cmp cpu cpu.a (mem-read mem addr))
            (set! cycles 4))]
       [(== op 205) ;; CMP abs
        (do (let addr (addr-abs cpu mem))
-           (cpu-do-cmp cpu (cast :int (get (deref cpu) a)) (mem-read mem addr))
+           (cpu-do-cmp cpu cpu.a (mem-read mem addr))
            (set! cycles 4))]
       [(== op 221) ;; CMP abx
        (do (let addr (addr-abx cpu mem))
-           (cpu-do-cmp cpu (cast :int (get (deref cpu) a)) (mem-read mem addr))
+           (cpu-do-cmp cpu cpu.a (mem-read mem addr))
            (set! cycles 4))]
       [(== op 217) ;; CMP aby
        (do (let addr (addr-aby cpu mem))
-           (cpu-do-cmp cpu (cast :int (get (deref cpu) a)) (mem-read mem addr))
+           (cpu-do-cmp cpu cpu.a (mem-read mem addr))
            (set! cycles 4))]
       [(== op 193) ;; CMP izx
        (do (let addr (addr-izx cpu mem))
-           (cpu-do-cmp cpu (cast :int (get (deref cpu) a)) (mem-read mem addr))
+           (cpu-do-cmp cpu cpu.a (mem-read mem addr))
            (set! cycles 6))]
       [(== op 209) ;; CMP izy
        (do (let addr (addr-izy cpu mem))
-           (cpu-do-cmp cpu (cast :int (get (deref cpu) a)) (mem-read mem addr))
+           (cpu-do-cmp cpu cpu.a (mem-read mem addr))
            (set! cycles 5))]
 
       ;; --- CPX ---
       [(== op 224) ;; CPX imm
        (do (let addr (addr-imm cpu))
-           (cpu-do-cmp cpu (cast :int (get (deref cpu) x)) (mem-read mem addr))
+           (cpu-do-cmp cpu cpu.x (mem-read mem addr))
            (set! cycles 2))]
       [(== op 228) ;; CPX zp
        (do (let addr (addr-zp cpu mem))
-           (cpu-do-cmp cpu (cast :int (get (deref cpu) x)) (mem-read mem addr))
+           (cpu-do-cmp cpu cpu.x (mem-read mem addr))
            (set! cycles 3))]
       [(== op 236) ;; CPX abs
        (do (let addr (addr-abs cpu mem))
-           (cpu-do-cmp cpu (cast :int (get (deref cpu) x)) (mem-read mem addr))
+           (cpu-do-cmp cpu cpu.x (mem-read mem addr))
            (set! cycles 4))]
 
       ;; --- CPY ---
       [(== op 192) ;; CPY imm
        (do (let addr (addr-imm cpu))
-           (cpu-do-cmp cpu (cast :int (get (deref cpu) y)) (mem-read mem addr))
+           (cpu-do-cmp cpu cpu.y (mem-read mem addr))
            (set! cycles 2))]
       [(== op 196) ;; CPY zp
        (do (let addr (addr-zp cpu mem))
-           (cpu-do-cmp cpu (cast :int (get (deref cpu) y)) (mem-read mem addr))
+           (cpu-do-cmp cpu cpu.y (mem-read mem addr))
            (set! cycles 3))]
       [(== op 204) ;; CPY abs
        (do (let addr (addr-abs cpu mem))
-           (cpu-do-cmp cpu (cast :int (get (deref cpu) y)) (mem-read mem addr))
+           (cpu-do-cmp cpu cpu.y (mem-read mem addr))
            (set! cycles 4))]
 
       ;; --- INC (memory) ---
       [(== op 230) ;; INC zp
        (do (let addr (addr-zp cpu mem))
-           (let val (bit-and (+ (mem-read mem addr) 1) 255))
+           (let val (& (+ (mem-read mem addr) 1) 255))
            (mem-write mem addr val)
            (cpu-update-nz cpu val)
            (set! cycles 5))]
       [(== op 246) ;; INC zpx
        (do (let addr (addr-zpx cpu mem))
-           (let val (bit-and (+ (mem-read mem addr) 1) 255))
+           (let val (& (+ (mem-read mem addr) 1) 255))
            (mem-write mem addr val)
            (cpu-update-nz cpu val)
            (set! cycles 6))]
       [(== op 238) ;; INC abs
        (do (let addr (addr-abs cpu mem))
-           (let val (bit-and (+ (mem-read mem addr) 1) 255))
+           (let val (& (+ (mem-read mem addr) 1) 255))
            (mem-write mem addr val)
            (cpu-update-nz cpu val)
            (set! cycles 6))]
       [(== op 254) ;; INC abx
        (do (let addr (addr-abx cpu mem))
-           (let val (bit-and (+ (mem-read mem addr) 1) 255))
+           (let val (& (+ (mem-read mem addr) 1) 255))
            (mem-write mem addr val)
            (cpu-update-nz cpu val)
            (set! cycles 7))]
@@ -580,58 +580,58 @@
       ;; --- DEC (memory) ---
       [(== op 198) ;; DEC zp
        (do (let addr (addr-zp cpu mem))
-           (let val (bit-and (- (mem-read mem addr) 1) 255))
+           (let val (& (- (mem-read mem addr) 1) 255))
            (mem-write mem addr val)
            (cpu-update-nz cpu val)
            (set! cycles 5))]
       [(== op 214) ;; DEC zpx
        (do (let addr (addr-zpx cpu mem))
-           (let val (bit-and (- (mem-read mem addr) 1) 255))
+           (let val (& (- (mem-read mem addr) 1) 255))
            (mem-write mem addr val)
            (cpu-update-nz cpu val)
            (set! cycles 6))]
       [(== op 206) ;; DEC abs
        (do (let addr (addr-abs cpu mem))
-           (let val (bit-and (- (mem-read mem addr) 1) 255))
+           (let val (& (- (mem-read mem addr) 1) 255))
            (mem-write mem addr val)
            (cpu-update-nz cpu val)
            (set! cycles 6))]
       [(== op 222) ;; DEC abx
        (do (let addr (addr-abx cpu mem))
-           (let val (bit-and (- (mem-read mem addr) 1) 255))
+           (let val (& (- (mem-read mem addr) 1) 255))
            (mem-write mem addr val)
            (cpu-update-nz cpu val)
            (set! cycles 7))]
 
       ;; --- INX ---
       [(== op 232)
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
-           (let val (bit-and (+ (cast :int (get (deref cpu) x)) 1) 255))
-           (set! (get (deref cpu) x) (cast :u8 val))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
+           (let val (& (+ cpu.x 1) 255))
+           (set! cpu.x val)
            (cpu-update-nz cpu val)
            (set! cycles 2))]
 
       ;; --- INY ---
       [(== op 200)
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
-           (let val (bit-and (+ (cast :int (get (deref cpu) y)) 1) 255))
-           (set! (get (deref cpu) y) (cast :u8 val))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
+           (let val (& (+ cpu.y 1) 255))
+           (set! cpu.y val)
            (cpu-update-nz cpu val)
            (set! cycles 2))]
 
       ;; --- DEX ---
       [(== op 202)
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
-           (let val (bit-and (- (cast :int (get (deref cpu) x)) 1) 255))
-           (set! (get (deref cpu) x) (cast :u8 val))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
+           (let val (& (- cpu.x 1) 255))
+           (set! cpu.x val)
            (cpu-update-nz cpu val)
            (set! cycles 2))]
 
       ;; --- DEY ---
       [(== op 136)
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
-           (let val (bit-and (- (cast :int (get (deref cpu) y)) 1) 255))
-           (set! (get (deref cpu) y) (cast :u8 val))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
+           (let val (& (- cpu.y 1) 255))
+           (set! cpu.y val)
            (cpu-update-nz cpu val)
            (set! cycles 2))]
 
@@ -649,150 +649,150 @@
       ;; --- AND ---
       [(== op 41) ;; AND imm
        (do (let addr (addr-imm cpu))
-           (let val (bit-and (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (& cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 2))]
       [(== op 37) ;; AND zp
        (do (let addr (addr-zp cpu mem))
-           (let val (bit-and (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (& cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 3))]
       [(== op 53) ;; AND zpx
        (do (let addr (addr-zpx cpu mem))
-           (let val (bit-and (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (& cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 45) ;; AND abs
        (do (let addr (addr-abs cpu mem))
-           (let val (bit-and (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (& cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 61) ;; AND abx
        (do (let addr (addr-abx cpu mem))
-           (let val (bit-and (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (& cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 57) ;; AND aby
        (do (let addr (addr-aby cpu mem))
-           (let val (bit-and (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (& cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 33) ;; AND izx
        (do (let addr (addr-izx cpu mem))
-           (let val (bit-and (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (& cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 6))]
       [(== op 49) ;; AND izy
        (do (let addr (addr-izy cpu mem))
-           (let val (bit-and (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (& cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 5))]
 
       ;; --- ORA ---
       [(== op 9) ;; ORA imm
        (do (let addr (addr-imm cpu))
-           (let val (bit-or (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (| cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 2))]
       [(== op 5) ;; ORA zp
        (do (let addr (addr-zp cpu mem))
-           (let val (bit-or (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (| cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 3))]
       [(== op 21) ;; ORA zpx
        (do (let addr (addr-zpx cpu mem))
-           (let val (bit-or (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (| cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 13) ;; ORA abs
        (do (let addr (addr-abs cpu mem))
-           (let val (bit-or (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (| cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 29) ;; ORA abx  (0x1D = 29)
        (do (let addr (addr-abx cpu mem))
-           (let val (bit-or (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (| cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 25) ;; ORA aby
        (do (let addr (addr-aby cpu mem))
-           (let val (bit-or (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (| cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 1) ;; ORA izx
        (do (let addr (addr-izx cpu mem))
-           (let val (bit-or (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (| cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 6))]
       [(== op 17) ;; ORA izy  (0x11 = 17)
        (do (let addr (addr-izy cpu mem))
-           (let val (bit-or (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (| cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 5))]
 
       ;; --- EOR ---
       [(== op 73) ;; EOR imm
        (do (let addr (addr-imm cpu))
-           (let val (bit-xor (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (^ cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 2))]
       [(== op 69) ;; EOR zp
        (do (let addr (addr-zp cpu mem))
-           (let val (bit-xor (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (^ cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 3))]
       [(== op 85) ;; EOR zpx
        (do (let addr (addr-zpx cpu mem))
-           (let val (bit-xor (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (^ cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 77) ;; EOR abs
        (do (let addr (addr-abs cpu mem))
-           (let val (bit-xor (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (^ cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 93) ;; EOR abx  (0x5D = 93)
        (do (let addr (addr-abx cpu mem))
-           (let val (bit-xor (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (^ cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 89) ;; EOR aby
        (do (let addr (addr-aby cpu mem))
-           (let val (bit-xor (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (^ cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 65) ;; EOR izx
        (do (let addr (addr-izx cpu mem))
-           (let val (bit-xor (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (^ cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 6))]
       [(== op 81) ;; EOR izy
        (do (let addr (addr-izy cpu mem))
-           (let val (bit-xor (cast :int (get (deref cpu) a)) (mem-read mem addr)))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (let val (^ cpu.a (mem-read mem addr)))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 5))]
 
@@ -800,31 +800,31 @@
       [(== op 36) ;; BIT zp
        (do (let addr (addr-zp cpu mem))
            (let val (mem-read mem addr))
-           (let result (bit-and (cast :int (get (deref cpu) a)) val))
+           (let result (& cpu.a val))
            ;; Z from AND result
            (if (== result 0)
                (cpu-set-flag cpu FLAG_Z)
                (cpu-clear-flag cpu FLAG_Z))
            ;; N from bit 7 of memory value
-           (if (!= (bit-and val 128) 0)
+           (if (!= (& val 128) 0)
                (cpu-set-flag cpu FLAG_N)
                (cpu-clear-flag cpu FLAG_N))
            ;; V from bit 6 of memory value
-           (if (!= (bit-and val 64) 0)
+           (if (!= (& val 64) 0)
                (cpu-set-flag cpu FLAG_V)
                (cpu-clear-flag cpu FLAG_V))
            (set! cycles 3))]
       [(== op 44) ;; BIT abs
        (do (let addr (addr-abs cpu mem))
            (let val (mem-read mem addr))
-           (let result (bit-and (cast :int (get (deref cpu) a)) val))
+           (let result (& cpu.a val))
            (if (== result 0)
                (cpu-set-flag cpu FLAG_Z)
                (cpu-clear-flag cpu FLAG_Z))
-           (if (!= (bit-and val 128) 0)
+           (if (!= (& val 128) 0)
                (cpu-set-flag cpu FLAG_N)
                (cpu-clear-flag cpu FLAG_N))
-           (if (!= (bit-and val 64) 0)
+           (if (!= (& val 64) 0)
                (cpu-set-flag cpu FLAG_V)
                (cpu-clear-flag cpu FLAG_V))
            (set! cycles 4))]
@@ -842,24 +842,24 @@
     (cond
       ;; --- ASL accumulator ---
       [(== op 10)
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
-           (let val (cast :int (get (deref cpu) a)))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
+           (let val cpu.a)
            ;; Old bit 7 -> carry
-           (if (!= (bit-and val 128) 0)
+           (if (!= (& val 128) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (shl val 1) 255))
-           (set! (get (deref cpu) a) (cast :u8 result))
+           (let result (& (<< val 1) 255))
+           (set! cpu.a result)
            (cpu-update-nz cpu result)
            (set! cycles 2))]
       ;; --- ASL zp ---
       [(== op 6)
        (do (let addr (addr-zp cpu mem))
            (let val (mem-read mem addr))
-           (if (!= (bit-and val 128) 0)
+           (if (!= (& val 128) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (shl val 1) 255))
+           (let result (& (<< val 1) 255))
            (mem-write mem addr result)
            (cpu-update-nz cpu result)
            (set! cycles 5))]
@@ -867,10 +867,10 @@
       [(== op 22)
        (do (let addr (addr-zpx cpu mem))
            (let val (mem-read mem addr))
-           (if (!= (bit-and val 128) 0)
+           (if (!= (& val 128) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (shl val 1) 255))
+           (let result (& (<< val 1) 255))
            (mem-write mem addr result)
            (cpu-update-nz cpu result)
            (set! cycles 6))]
@@ -878,10 +878,10 @@
       [(== op 14)
        (do (let addr (addr-abs cpu mem))
            (let val (mem-read mem addr))
-           (if (!= (bit-and val 128) 0)
+           (if (!= (& val 128) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (shl val 1) 255))
+           (let result (& (<< val 1) 255))
            (mem-write mem addr result)
            (cpu-update-nz cpu result)
            (set! cycles 6))]
@@ -889,34 +889,34 @@
       [(== op 30)
        (do (let addr (addr-abx cpu mem))
            (let val (mem-read mem addr))
-           (if (!= (bit-and val 128) 0)
+           (if (!= (& val 128) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (shl val 1) 255))
+           (let result (& (<< val 1) 255))
            (mem-write mem addr result)
            (cpu-update-nz cpu result)
            (set! cycles 7))]
 
       ;; --- LSR accumulator ---
       [(== op 74)
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
-           (let val (cast :int (get (deref cpu) a)))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
+           (let val cpu.a)
            ;; Old bit 0 -> carry
-           (if (!= (bit-and val 1) 0)
+           (if (!= (& val 1) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (shr val 1) 255))
-           (set! (get (deref cpu) a) (cast :u8 result))
+           (let result (& (>> val 1) 255))
+           (set! cpu.a result)
            (cpu-update-nz cpu result)
            (set! cycles 2))]
       ;; --- LSR zp ---
       [(== op 70)
        (do (let addr (addr-zp cpu mem))
            (let val (mem-read mem addr))
-           (if (!= (bit-and val 1) 0)
+           (if (!= (& val 1) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (shr val 1) 255))
+           (let result (& (>> val 1) 255))
            (mem-write mem addr result)
            (cpu-update-nz cpu result)
            (set! cycles 5))]
@@ -924,10 +924,10 @@
       [(== op 86)
        (do (let addr (addr-zpx cpu mem))
            (let val (mem-read mem addr))
-           (if (!= (bit-and val 1) 0)
+           (if (!= (& val 1) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (shr val 1) 255))
+           (let result (& (>> val 1) 255))
            (mem-write mem addr result)
            (cpu-update-nz cpu result)
            (set! cycles 6))]
@@ -935,10 +935,10 @@
       [(== op 78)
        (do (let addr (addr-abs cpu mem))
            (let val (mem-read mem addr))
-           (if (!= (bit-and val 1) 0)
+           (if (!= (& val 1) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (shr val 1) 255))
+           (let result (& (>> val 1) 255))
            (mem-write mem addr result)
            (cpu-update-nz cpu result)
            (set! cycles 6))]
@@ -946,24 +946,24 @@
       [(== op 94)
        (do (let addr (addr-abx cpu mem))
            (let val (mem-read mem addr))
-           (if (!= (bit-and val 1) 0)
+           (if (!= (& val 1) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (shr val 1) 255))
+           (let result (& (>> val 1) 255))
            (mem-write mem addr result)
            (cpu-update-nz cpu result)
            (set! cycles 7))]
 
       ;; --- ROL accumulator ---
       [(== op 42)
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
-           (let val (cast :int (get (deref cpu) a)))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
+           (let val cpu.a)
            (let old-carry (cpu-flag-set cpu FLAG_C))
-           (if (!= (bit-and val 128) 0)
+           (if (!= (& val 128) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (bit-or (shl val 1) old-carry) 255))
-           (set! (get (deref cpu) a) (cast :u8 result))
+           (let result (& (| (<< val 1) old-carry) 255))
+           (set! cpu.a result)
            (cpu-update-nz cpu result)
            (set! cycles 2))]
       ;; --- ROL zp ---
@@ -971,10 +971,10 @@
        (do (let addr (addr-zp cpu mem))
            (let val (mem-read mem addr))
            (let old-carry (cpu-flag-set cpu FLAG_C))
-           (if (!= (bit-and val 128) 0)
+           (if (!= (& val 128) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (bit-or (shl val 1) old-carry) 255))
+           (let result (& (| (<< val 1) old-carry) 255))
            (mem-write mem addr result)
            (cpu-update-nz cpu result)
            (set! cycles 5))]
@@ -983,10 +983,10 @@
        (do (let addr (addr-zpx cpu mem))
            (let val (mem-read mem addr))
            (let old-carry (cpu-flag-set cpu FLAG_C))
-           (if (!= (bit-and val 128) 0)
+           (if (!= (& val 128) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (bit-or (shl val 1) old-carry) 255))
+           (let result (& (| (<< val 1) old-carry) 255))
            (mem-write mem addr result)
            (cpu-update-nz cpu result)
            (set! cycles 6))]
@@ -995,10 +995,10 @@
        (do (let addr (addr-abs cpu mem))
            (let val (mem-read mem addr))
            (let old-carry (cpu-flag-set cpu FLAG_C))
-           (if (!= (bit-and val 128) 0)
+           (if (!= (& val 128) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (bit-or (shl val 1) old-carry) 255))
+           (let result (& (| (<< val 1) old-carry) 255))
            (mem-write mem addr result)
            (cpu-update-nz cpu result)
            (set! cycles 6))]
@@ -1007,24 +1007,24 @@
        (do (let addr (addr-abx cpu mem))
            (let val (mem-read mem addr))
            (let old-carry (cpu-flag-set cpu FLAG_C))
-           (if (!= (bit-and val 128) 0)
+           (if (!= (& val 128) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (bit-or (shl val 1) old-carry) 255))
+           (let result (& (| (<< val 1) old-carry) 255))
            (mem-write mem addr result)
            (cpu-update-nz cpu result)
            (set! cycles 7))]
 
       ;; --- ROR accumulator ---
       [(== op 106)
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
-           (let val (cast :int (get (deref cpu) a)))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
+           (let val cpu.a)
            (let old-carry (cpu-flag-set cpu FLAG_C))
-           (if (!= (bit-and val 1) 0)
+           (if (!= (& val 1) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (bit-or (shr val 1) (shl old-carry 7)) 255))
-           (set! (get (deref cpu) a) (cast :u8 result))
+           (let result (& (| (>> val 1) (<< old-carry 7)) 255))
+           (set! cpu.a result)
            (cpu-update-nz cpu result)
            (set! cycles 2))]
       ;; --- ROR zp ---
@@ -1032,10 +1032,10 @@
        (do (let addr (addr-zp cpu mem))
            (let val (mem-read mem addr))
            (let old-carry (cpu-flag-set cpu FLAG_C))
-           (if (!= (bit-and val 1) 0)
+           (if (!= (& val 1) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (bit-or (shr val 1) (shl old-carry 7)) 255))
+           (let result (& (| (>> val 1) (<< old-carry 7)) 255))
            (mem-write mem addr result)
            (cpu-update-nz cpu result)
            (set! cycles 5))]
@@ -1044,10 +1044,10 @@
        (do (let addr (addr-zpx cpu mem))
            (let val (mem-read mem addr))
            (let old-carry (cpu-flag-set cpu FLAG_C))
-           (if (!= (bit-and val 1) 0)
+           (if (!= (& val 1) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (bit-or (shr val 1) (shl old-carry 7)) 255))
+           (let result (& (| (>> val 1) (<< old-carry 7)) 255))
            (mem-write mem addr result)
            (cpu-update-nz cpu result)
            (set! cycles 6))]
@@ -1056,10 +1056,10 @@
        (do (let addr (addr-abs cpu mem))
            (let val (mem-read mem addr))
            (let old-carry (cpu-flag-set cpu FLAG_C))
-           (if (!= (bit-and val 1) 0)
+           (if (!= (& val 1) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (bit-or (shr val 1) (shl old-carry 7)) 255))
+           (let result (& (| (>> val 1) (<< old-carry 7)) 255))
            (mem-write mem addr result)
            (cpu-update-nz cpu result)
            (set! cycles 6))]
@@ -1068,10 +1068,10 @@
        (do (let addr (addr-abx cpu mem))
            (let val (mem-read mem addr))
            (let old-carry (cpu-flag-set cpu FLAG_C))
-           (if (!= (bit-and val 1) 0)
+           (if (!= (& val 1) 0)
                (cpu-set-flag cpu FLAG_C)
                (cpu-clear-flag cpu FLAG_C))
-           (let result (bit-and (bit-or (shr val 1) (shl old-carry 7)) 255))
+           (let result (& (| (>> val 1) (<< old-carry 7)) 255))
            (mem-write mem addr result)
            (cpu-update-nz cpu result)
            (set! cycles 7))]
@@ -1085,14 +1085,14 @@
 
 (defn cpu-do-branch [cpu :ptr-CPU, mem :ptr-u8, take-branch :int] :int
   (do
-    (let offset (mem-read mem (bit-and (+ (get (deref cpu) pc) 1) 65535)))
-    (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 2) 65535))
+    (let offset (mem-read mem (& (+ cpu.pc 1) 65535)))
+    (set! cpu.pc (& (+ cpu.pc 2) 65535))
     (if (== take-branch 1)
         (do
           ;; Signed offset: if > 127, subtract 256
           (let signed-off (if (> offset 127) (- offset 256) offset))
-          (set! (get (deref cpu) pc)
-                (bit-and (+ (get (deref cpu) pc) signed-off) 65535))
+          (set! cpu.pc
+                (& (+ cpu.pc signed-off) 65535))
           3)  ;; branch taken = 3 cycles (simplified, no page cross check)
         2))) ;; branch not taken = 2 cycles
 
@@ -1128,30 +1128,30 @@
     (let-mut cycles -1)
     (cond
       [(== op 72) ;; PHA
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
-           (cpu-push cpu mem (cast :int (get (deref cpu) a)))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
+           (cpu-push cpu mem cpu.a)
            (set! cycles 3))]
       [(== op 104) ;; PLA
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
            (let val (cpu-pull cpu mem))
-           (set! (get (deref cpu) a) (cast :u8 val))
+           (set! cpu.a val)
            (cpu-update-nz cpu val)
            (set! cycles 4))]
       [(== op 8) ;; PHP — push status with B and U set
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
-           (let status-val (bit-or (cast :int (get (deref cpu) status)) (bit-or FLAG_B FLAG_U)))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
+           (let status-val (| cpu.status (| FLAG_B FLAG_U)))
            (cpu-push cpu mem status-val)
            (set! cycles 3))]
       [(== op 40) ;; PLP — pull status, ignore B and U bits from stack
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
            (let val (cpu-pull cpu mem))
            ;; Preserve B and U from current status, take rest from pulled value
-           (set! (get (deref cpu) status)
-                 (cast :u8 (bit-or (bit-and val (bit-not (bit-or FLAG_B FLAG_U)))
-                                   (bit-and (cast :int (get (deref cpu) status)) (bit-or FLAG_B FLAG_U)))))
+           (set! cpu.status
+                 (| (& val (~ (| FLAG_B FLAG_U)))
+                    (& cpu.status (| FLAG_B FLAG_U))))
            ;; Actually, PLP sets all except B (bit 4 is cleared, bit 5 always 1)
-           (set! (get (deref cpu) status)
-                 (cast :u8 (bit-or (bit-and val (bit-not FLAG_B)) FLAG_U)))
+           (set! cpu.status
+                 (| (& val (~ FLAG_B)) FLAG_U))
            (set! cycles 4))]
       [else (set! cycles -1)])
     cycles))
@@ -1168,116 +1168,116 @@
     (cond
       ;; --- JMP absolute ---
       [(== op 76)
-       (do (let addr (mem-read16 mem (bit-and (+ (get (deref cpu) pc) 1) 65535)))
-           (set! (get (deref cpu) pc) addr)
+       (do (let addr (mem-read16 mem (& (+ cpu.pc 1) 65535)))
+           (set! cpu.pc addr)
            (set! cycles 3))]
       ;; --- JMP indirect ---
       [(== op 108)
-       (do (let ptr-addr (mem-read16 mem (bit-and (+ (get (deref cpu) pc) 1) 65535)))
+       (do (let ptr-addr (mem-read16 mem (& (+ cpu.pc 1) 65535)))
            ;; 6502 bug: if ptr is at page boundary ($xxFF), high byte wraps within page
            (let lo (mem-read mem ptr-addr))
-           (let hi-addr (if (== (bit-and ptr-addr 255) 255)
-                            (bit-and ptr-addr 65280)  ;; wrap to start of same page
+           (let hi-addr (if (== (& ptr-addr 255) 255)
+                            (& ptr-addr 65280)  ;; wrap to start of same page
                             (+ ptr-addr 1)))
            (let hi (mem-read mem hi-addr))
-           (set! (get (deref cpu) pc) (bit-or lo (shl hi 8)))
+           (set! cpu.pc (| lo (<< hi 8)))
            (set! cycles 5))]
       ;; --- JSR ---
       [(== op 32)
-       (do (let addr (mem-read16 mem (bit-and (+ (get (deref cpu) pc) 1) 65535)))
+       (do (let addr (mem-read16 mem (& (+ cpu.pc 1) 65535)))
            ;; Push return address - 1 (address of last byte of JSR instruction)
-           (cpu-push16 cpu mem (bit-and (+ (get (deref cpu) pc) 2) 65535))
-           (set! (get (deref cpu) pc) addr)
+           (cpu-push16 cpu mem (& (+ cpu.pc 2) 65535))
+           (set! cpu.pc addr)
            (set! cycles 6))]
       ;; --- RTS ---
       [(== op 96)
        (do (let addr (cpu-pull16 cpu mem))
-           (set! (get (deref cpu) pc) (bit-and (+ addr 1) 65535))
+           (set! cpu.pc (& (+ addr 1) 65535))
            (set! cycles 6))]
       ;; --- RTI ---
       [(== op 64)
        (do ;; Pull status (same as PLP: ignore B, set U)
            (let status-val (cpu-pull cpu mem))
-           (set! (get (deref cpu) status)
-                 (cast :u8 (bit-or (bit-and status-val (bit-not FLAG_B)) FLAG_U)))
+           (set! cpu.status
+                 (| (& status-val (~ FLAG_B)) FLAG_U))
            ;; Pull PC
            (let addr (cpu-pull16 cpu mem))
-           (set! (get (deref cpu) pc) addr)
+           (set! cpu.pc addr)
            (set! cycles 6))]
       ;; --- BRK ---
       [(== op 0)
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 2) 65535))
-           (cpu-push16 cpu mem (get (deref cpu) pc))
+       (do (set! cpu.pc (& (+ cpu.pc 2) 65535))
+           (cpu-push16 cpu mem cpu.pc)
            (cpu-set-flag cpu FLAG_B)
-           (cpu-push cpu mem (bit-or (cast :int (get (deref cpu) status)) FLAG_U))
+           (cpu-push cpu mem (| cpu.status FLAG_U))
            (cpu-set-flag cpu FLAG_I)
            ;; Load IRQ vector from $FFFE
-           (set! (get (deref cpu) pc) (mem-read16 mem 65534))
+           (set! cpu.pc (mem-read16 mem 65534))
            (set! cycles 7))]
       ;; --- NOP ---
       [(== op 234)
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
            (set! cycles 2))]
 
       ;; --- Register transfers ---
       [(== op 170) ;; TAX
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
-           (set! (get (deref cpu) x) (get (deref cpu) a))
-           (cpu-update-nz cpu (cast :int (get (deref cpu) x)))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
+           (set! cpu.x cpu.a)
+           (cpu-update-nz cpu cpu.x)
            (set! cycles 2))]
       [(== op 168) ;; TAY
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
-           (set! (get (deref cpu) y) (get (deref cpu) a))
-           (cpu-update-nz cpu (cast :int (get (deref cpu) y)))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
+           (set! cpu.y cpu.a)
+           (cpu-update-nz cpu cpu.y)
            (set! cycles 2))]
       [(== op 138) ;; TXA
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
-           (set! (get (deref cpu) a) (get (deref cpu) x))
-           (cpu-update-nz cpu (cast :int (get (deref cpu) a)))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
+           (set! cpu.a cpu.x)
+           (cpu-update-nz cpu cpu.a)
            (set! cycles 2))]
       [(== op 152) ;; TYA
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
-           (set! (get (deref cpu) a) (get (deref cpu) y))
-           (cpu-update-nz cpu (cast :int (get (deref cpu) a)))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
+           (set! cpu.a cpu.y)
+           (cpu-update-nz cpu cpu.a)
            (set! cycles 2))]
       [(== op 186) ;; TSX
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
-           (set! (get (deref cpu) x) (get (deref cpu) sp))
-           (cpu-update-nz cpu (cast :int (get (deref cpu) x)))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
+           (set! cpu.x cpu.sp)
+           (cpu-update-nz cpu cpu.x)
            (set! cycles 2))]
       [(== op 154) ;; TXS
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
-           (set! (get (deref cpu) sp) (get (deref cpu) x))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
+           (set! cpu.sp cpu.x)
            ;; TXS does NOT affect flags
            (set! cycles 2))]
 
       ;; --- Flag operations ---
       [(== op 24) ;; CLC
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
            (cpu-clear-flag cpu FLAG_C)
            (set! cycles 2))]
       [(== op 56) ;; SEC
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
            (cpu-set-flag cpu FLAG_C)
            (set! cycles 2))]
       [(== op 88) ;; CLI
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
            (cpu-clear-flag cpu FLAG_I)
            (set! cycles 2))]
       [(== op 120) ;; SEI
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
            (cpu-set-flag cpu FLAG_I)
            (set! cycles 2))]
       [(== op 216) ;; CLD
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
            (cpu-clear-flag cpu FLAG_D)
            (set! cycles 2))]
       [(== op 248) ;; SED
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
            (cpu-set-flag cpu FLAG_D)
            (set! cycles 2))]
       [(== op 184) ;; CLV
-       (do (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
+       (do (set! cpu.pc (& (+ cpu.pc 1) 65535))
            (cpu-clear-flag cpu FLAG_V)
            (set! cycles 2))]
 
@@ -1290,7 +1290,7 @@
 
 (defn cpu-step [cpu :ptr-CPU, mem :ptr-u8] :int
   (do
-    (let op (mem-read mem (get (deref cpu) pc)))
+    (let op (mem-read mem cpu.pc))
     (let-mut cycles (cpu-exec-load-store cpu mem op))
     (when (== cycles -1)
       (set! cycles (cpu-exec-arithmetic cpu mem op)))
@@ -1306,8 +1306,8 @@
       (set! cycles (cpu-exec-misc cpu mem op)))
     (when (== cycles -1)
       ;; Unknown opcode: treat as 1-byte NOP, advance PC
-      (do (printf "Unknown opcode: %d at PC=%d\\n" op (get (deref cpu) pc))
-          (set! (get (deref cpu) pc) (bit-and (+ (get (deref cpu) pc) 1) 65535))
+      (do (printf "Unknown opcode: %d at PC=%d\\n" op cpu.pc)
+          (set! cpu.pc (& (+ cpu.pc 1) 65535))
           (set! cycles 2)))
     cycles))
 
@@ -1317,9 +1317,9 @@
 
 (defn cpu-reset [cpu :ptr-CPU, mem :ptr-u8] :void
   (do
-    (set! (get (deref cpu) a) (cast :u8 0))
-    (set! (get (deref cpu) x) (cast :u8 0))
-    (set! (get (deref cpu) y) (cast :u8 0))
-    (set! (get (deref cpu) sp) (cast :u8 253))
-    (set! (get (deref cpu) status) (cast :u8 36))
-    (set! (get (deref cpu) pc) (mem-read16 mem 65532))))
+    (set! cpu.a 0)
+    (set! cpu.x 0)
+    (set! cpu.y 0)
+    (set! cpu.sp 253)
+    (set! cpu.status 36)
+    (set! cpu.pc (mem-read16 mem 65532))))

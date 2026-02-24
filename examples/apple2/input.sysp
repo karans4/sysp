@@ -18,9 +18,9 @@
       (do
         ;; Read event type (first 4 bytes, little-endian u32)
         (let etype (+ (cast :int (ptr-deref event-buf 0))
-                      (shl (cast :int (ptr-deref event-buf 1)) 8)
-                      (shl (cast :int (ptr-deref event-buf 2)) 16)
-                      (shl (cast :int (ptr-deref event-buf 3)) 24)))
+                      (<< (cast :int (ptr-deref event-buf 1)) 8)
+                      (<< (cast :int (ptr-deref event-buf 2)) 16)
+                      (<< (cast :int (ptr-deref event-buf 3)) 24)))
         (cond
           [(== etype EVT_QUIT)
            (set! quit 1)]
@@ -29,17 +29,17 @@
              ;; SDL_KeyboardEvent: keysym.sym is at offset 20 (4 bytes)
              ;; For basic ASCII keys, the sym value IS the ASCII code
              (let sym (+ (cast :int (ptr-deref event-buf 20))
-                         (shl (cast :int (ptr-deref event-buf 21)) 8)
-                         (shl (cast :int (ptr-deref event-buf 22)) 16)
-                         (shl (cast :int (ptr-deref event-buf 23)) 24)))
+                         (<< (cast :int (ptr-deref event-buf 21)) 8)
+                         (<< (cast :int (ptr-deref event-buf 22)) 16)
+                         (<< (cast :int (ptr-deref event-buf 23)) 24)))
              ;; Only handle printable ASCII range
              (when (and (>= sym 32) (<= sym 126))
                ;; Apple II: uppercase only, set bit 7 to indicate key available
                (let key (if (and (>= sym 97) (<= sym 122))
                             (- sym 32)   ;; lowercase -> uppercase
                             sym))
-               (mem-write mem 49152 (bit-or key 128)))  ;; $C000 = 49152
+               (mem-write mem 49152 (| key 128)))  ;; $C000 = 49152
              ;; Handle Return key (sym 13)
              (when (== sym 13)
-               (mem-write mem 49152 (bit-or 13 128))))])))
+               (mem-write mem 49152 (| 13 128))))])))
     quit))

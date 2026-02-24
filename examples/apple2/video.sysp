@@ -357,7 +357,7 @@
   (do
     ;; Map Apple II char to font index
     ;; Apple II "normal" mode: char & 0x7F, displayed if bit 7 set (inverse if clear)
-    (let idx (bit-and ch 127))
+    (let idx (& ch 127))
     (when (and (>= idx 32) (< idx 128))
       (let font-off (* (- idx 32) 8))
       (for [row 0 CHAR_H]
@@ -366,7 +366,7 @@
           (let pixel-x (+ px col))
           (let pixel-y (+ py row))
           (when (and (< pixel-x SCREEN_W) (< pixel-y SCREEN_H))
-            (let bit (bit-and (shr bits (- 6 col)) 1))
+            (let bit (& (>> bits (- 6 col)) 1))
             (let color (if (== bit 1) COLOR_FG COLOR_BG))
             (ptr-set! pixels (+ (* pixel-y SCREEN_W) pixel-x) color)))))))
 

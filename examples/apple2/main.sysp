@@ -105,7 +105,7 @@
       (return 1))
 
     (let renderer (SDL_CreateRenderer window -1
-                    (bit-or SYSP_RENDERER_ACCEL SYSP_RENDERER_VSYNC)))
+                    (| SYSP_RENDERER_ACCEL SYSP_RENDERER_VSYNC)))
     (when (null? renderer)
       (printf "Renderer creation failed\\n")
       (return 1))
@@ -130,11 +130,11 @@
 
     ;; Load test program and init CPU
     (load-test-program mem)
-    (let-mut cpu (CPU (cast :u8 0) (cast :u8 0) (cast :u8 0) (cast :u8 253)
-                      0 (cast :u8 36)))
+    (let-mut cpu (CPU 0 0 0 253
+                      0 36))
     (cpu-reset (addr-of cpu) mem)
 
-    (printf "Apple II emulator started. Reset vector -> PC=$%04X\\n" (get cpu pc))
+    (printf "Apple II emulator started. Reset vector -> PC=$%04X\\n" cpu.pc)
 
     ;; Main loop
     (let-mut running 1)
@@ -153,7 +153,7 @@
           else
             (do
               ;; Bad opcode — stop
-              (printf "Unknown opcode at PC=$%04X\\n" (get cpu pc))
+              (printf "Unknown opcode at PC=$%04X\\n" cpu.pc)
               (set! running 0)
               (set! cycles CYCLES_PER_FRAME))))
 

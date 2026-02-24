@@ -31,7 +31,7 @@
     (when (null? window) (printf "Window failed\\n") (return 1))
 
     (let renderer (SDL_CreateRenderer window -1
-                    (bit-or SYSP_RENDERER_ACCEL SYSP_RENDERER_VSYNC)))
+                    (| SYSP_RENDERER_ACCEL SYSP_RENDERER_VSYNC)))
     (when (null? renderer) (printf "Renderer failed\\n") (return 1))
 
     (let texture (SDL_CreateTexture renderer SYSP_PIXFMT_ARGB
@@ -67,9 +67,9 @@
     (let event-buf (cast :ptr-u8 (malloc (cast :size 64))))
 
     ;; CPU: start at $0800
-    (let-mut cpu (CPU (cast :u8 0) (cast :u8 0) (cast :u8 0) (cast :u8 253)
-                      0 (cast :u8 36)))
-    (set! (get (deref (addr-of cpu)) pc) 2048)
+    (let-mut cpu (CPU 0 0 0 253
+                      0 36))
+    (set! cpu.pc 2048)
 
     ;; Main loop
     (let-mut running 1)
@@ -86,7 +86,7 @@
             (set! cycles (+ cycles c))
           else
             (do
-              (printf "Bad opcode at PC=$%04X\\n" (get cpu pc))
+              (printf "Bad opcode at PC=$%04X\\n" cpu.pc)
               (set! running 0)
               (set! cycles CYCLES_PER_FRAME))))
 
