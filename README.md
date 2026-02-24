@@ -12,16 +12,27 @@ Most numerical computing is either written in C/CUDA (fast but verbose) or Pytho
 
 ## Features
 
-- **S-expression syntax** with `[]` array literals
-- **Compile-time macros** - `defmacro` over s-expressions, quasiquote with `~` and `~@`
-- **Compile-time evaluation** - `defn-ct` for real homoiconic metaprogramming with `gensym`
-- **Tail-call optimization** - `recur` compiles to `goto`
+- **S-expression syntax** with `[]` array literals and custom parser (not CL's reader)
+- **Compile-time macros** — `defmacro` over s-expressions, quasiquote with `~` and `~@`
+- **Compile-time evaluation** — `defn-ct` for real homoiconic metaprogramming with `gensym`
+- **Tail-call optimization** — `recur` compiles to `goto`
 - **Cons cells** with automatic refcounting (`val_retain`/`val_release`)
 - **Symbols** as interned integers with compile-time symbol table
-- **Structs, enums, tuples, vectors** with generated C type definitions
-- **Foreign function interface** - `extern` declarations, pointer types, casts
-- **Type inference** - Hindley-Milner unification with constraint generation
-- **Tagged unions** - `deftype`, `(:union ...)`, `runtype`/`as` for runtime dispatch
+- **Structs, enums, tuples, vectors, hash maps** with generated C type definitions
+- **Foreign function interface** — `extern` declarations, pointer types, casts
+- **Type inference** — Hindley-Milner unification with constraint generation
+- **Tagged unions** — `deftype`, `(:union ...)`, pattern matching with `match`
+- **Closures** — fat pointers (`Fn = {fn, env}`), free variable analysis, direct call optimization
+- **Monomorphization** — polymorphic functions (`:?` type vars) stamped per concrete call site
+- **Threads** — `spawn`/`await` via pthreads, TLS-safe refcounting
+- **Condition system** — CL-style `restart-case`, `handler-bind`, `signal`, `invoke-restart`
+- **ARC memory** — `(new T args)` for RC-managed heap objects, escape analysis for stack promotion
+- **Multiple return values** — `(values a b)` + `(let-values [(q r) (f)] ...)`
+- **Inline assembly** — `(asm! ...)` for GCC extended asm, simple and extended forms
+- **Module system** — `(use mod)` with qualified imports, `:only`, `:as` aliases, `--emit-header`
+- **String interpolation** — `(fmt "x is {x}, sum is {(+ a b)}")`
+- **HOFs as real functions** — `map`, `filter`, `reduce` are polymorphic functions, not macros
+- **Collection toolkit** — `first`, `last`, `count`, `some`, `every?`, `take`, `drop`, `reverse`, `concat`, `distinct`, `frequencies`, etc.
 
 ## Examples
 
@@ -45,39 +56,43 @@ int clamp(int x, int lo, int hi) {
 }
 ```
 
-The more Lisp features you use (recursion, lambdas, closures, polymorphism, cons cells), the less the output resembles "normal" C. But it's always the same algorithm you'd write by hand; the compiler just does the mechanical work for you.
+Higher-order functions work as real values — `defn` functions are automatically wrapped into `Fn` structs when passed to polymorphic HOFs:
 
 ```lisp
-(defn factorial [n :int, acc :int] :int
-  (if (== n 0)
-    acc
-  else
-    (recur (- n 1) (* acc n))))
+(use core)
+
+(defn double [x :int] :int (* x 2))
+(defn add [a :int, b :int] :int (+ a b))
 
 (defn main [] :int
-  (println (factorial 12 1))
+  (let v (vector 1 2 3 4 5))
+  (let doubled (map double v))        ;; (2 4 6 8 10)
+  (let evens (filter even? v))        ;; (2 4)
+  (let sum (reduce add 0 v))          ;; 15
+  (println sum)
   0)
 ```
 
-Compiles to:
-```c
-int factorial(int n, int acc) {
-  _recur_top: ;
-  if ((n == 0)) {
-    return acc;
-  } else {
-    int __recur_0 = (n - 1);
-    int __recur_1 = (acc * n);
-    n = __recur_0;
-    acc = __recur_1;
-    goto _recur_top;
-  }
-}
+Closures capture their environment:
 
-int main(void) {
-  printf("%d\n", factorial(12, 1));
-  return 0;
-}
+```lisp
+(defn make-adder [n :int] :fn (:int) :int
+  (lambda [x :int] :int (+ x n)))
+
+(defn main [] :int
+  (let add5 (make-adder 5))
+  (println (add5 10))  ;; 15
+  0)
+```
+
+Macros operate on s-expressions at compile time:
+
+```lisp
+(defmacro swap! [a b]
+  (let tmp (gensym))
+  `(do (let ~tmp ~a)
+       (set! ~a ~b)
+       (set! ~b ~tmp)))
 ```
 
 ## Building
@@ -89,24 +104,34 @@ Requires SBCL (Steel Bank Common Lisp) and a C compiler.
 sbcl --script sysp.lisp input.sysp output.c
 
 # Then compile the C
-cc output.c -o program
-```
+cc -std=c99 output.c -o program
 
-For the raylib demo (tic-tac-toe):
-```sh
-sbcl --script sysp.lisp tictactoe.sysp tictactoe.c
-cc tictactoe.c -lraylib -lm -o tictactoe
+# Run tests
+bash run-tests.sh
 ```
 
 ## Architecture
 
-The compiler is a single Common Lisp file (`sysp.lisp`, ~3600 lines):
+The compiler is a single Common Lisp file (`sysp.lisp`, ~7200 lines):
 
-1. **Read** - custom readtable for `[]` arrays and backquote syntax
-2. **Macro-expand** - recursive expansion of `defmacro` + built-in macros (`->`, `->>`, `when-let`, `dotimes`, etc.)
-3. **Infer** - Hindley-Milner type inference with unification, generalize/instantiate for let-polymorphism
-4. **Compile** - AST → C code generation with type tracking
-5. **Emit** - headers, type declarations, forward decls, function bodies
+1. **Parse** — hand-written tokenizer + recursive descent (not CL's reader)
+2. **Macro-expand** — recursive expansion of `defmacro` + built-in macros
+3. **Infer** — Hindley-Milner type inference with unification
+4. **Compile** — AST → C code generation with type tracking, monomorphization
+5. **Emit** — headers, type declarations, forward decls, function bodies
+
+Standard library in `lib/`:
+
+| Module | Contents |
+|--------|----------|
+| `core` | Predicates (`zero?`, `even?`, `odd?`), arithmetic (`inc`, `dec`, `abs`, `min`, `max`, `clamp`), HOFs (`map`, `filter`, `reduce`) |
+| `string` | String operations |
+| `io` | File I/O |
+| `mem` | Memory utilities |
+| `math` | Math functions |
+| `fmt` | String interpolation |
+| `cuda` | CUDA kernel support |
+| `raylib` | Raylib game library bindings |
 
 ## Type System
 
@@ -114,11 +139,10 @@ Gradual typing with Hindley-Milner inference and tagged unions:
 
 - Unresolved types box into `Value` (tagged union: int, float, string, symbol, cons)
 - Resolved types generate specialized C: `Vector_int`, `Fn_int_int`, `Cons_int_symbol`
-- The inference engine supports type variables, structural unification, occurs check, and let-polymorphism
-- `Value` acts as the "any" type, unifies with everything, zero annotation burden
+- Polymorphic functions use `:?` type variables, monomorphized at call site
 - `deftype` for named type aliases and union types: `(deftype NumVal (:union :int :float))`
 - if/cond branches with different types automatically produce union types
-- `runtype` for runtime tag query, `as` for variant extraction
+- `match` for pattern matching on unions and structs
 
 ## Roadmap
 
@@ -127,21 +151,24 @@ Gradual typing with Hindley-Milner inference and tagged unions:
 - [x] Cons cells with refcounting
 - [x] Symbols, quasiquote, splice
 - [x] Type inference (HM unification, constraint generation)
-- [x] Tagged unions (sum types, deftype, runtype/as)
-- [ ] Monomorphization (specialized C output per concrete type)
-- [ ] Pattern matching / destructuring
+- [x] Tagged unions (sum types, deftype, match)
+- [x] Monomorphization (specialized C output per concrete type)
+- [x] Closures (fat pointers, free variable analysis)
+- [x] Threads (spawn/await, TLS-safe RC)
+- [x] Condition system (restart-case, handler-bind)
+- [x] ARC memory (new, escape analysis)
+- [x] Module system (use, emit-header, namespacing)
+- [x] Multiple return values
+- [x] Inline assembly
+- [x] HOFs as real polymorphic functions
 - [ ] Borrow checker (linear types)
 - [ ] CUDA backend (GPU kernels from Lisp)
-- [ ] HPC primitives (SIMD, parallel loops)
 - [ ] Self-hosting
+
+## Status
+
+Alpha. 35 tests, valgrind clean. Expect breaking changes.
 
 ## License
 
 MIT
-
-## Status
-
-Alpha software. Expect breaking changes. All tests pass on master.
-
-Threading is planned but not yet implemented. C99 does not have standard threads, so when threads land they will require C11 or compiler-specific extensions (pthreads, Windows threads, etc.).
-
