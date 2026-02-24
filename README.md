@@ -161,13 +161,16 @@ Gradual typing with Hindley-Milner inference and tagged unions:
 - [x] Multiple return values
 - [x] Inline assembly
 - [x] HOFs as real polymorphic functions
-- [ ] Borrow checker (linear types)
-- [ ] CUDA backend (GPU kernels from Lisp)
-- [ ] Self-hosting
+- [x] CUDA backend (lib/cuda.sysp — untested, needs GPU hardware)
+- [ ] Self-hosting (bootstrap compiler ships as generated C)
 
 ## Status
 
 Alpha. 35 tests, valgrind clean. Expect breaking changes.
+
+## Self-Hosting
+
+The end goal is for sysp to compile itself. The bootstrap compiler (`sysp.lisp`, Common Lisp) would be replaced by `sysp.sysp`, which compiles to `bootstrap.c` — a checked-in generated C file that can build the compiler with just `cc bootstrap.c -o sysp`. New contributors need only a C compiler, not SBCL.
 
 ## License
 
