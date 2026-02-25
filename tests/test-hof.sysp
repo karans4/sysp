@@ -43,7 +43,7 @@
   (println (area r))  ;; 12
 
   ;; for-each
-  (let v (vector 10 20 30))
+  (let v (Vector 10 20 30))
   (for-each [x v]
     (println x))  ;; 10 20 30
 
@@ -53,7 +53,7 @@
     (println x))  ;; 20 40 60
 
   ;; filter
-  (let nums (vector 1 2 3 4 5 6))
+  (let nums (Vector 1 2 3 4 5 6))
   (let evens (filter is-even nums))
   (for-each [x evens]
     (println x))  ;; 2 4 6

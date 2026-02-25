@@ -80,7 +80,7 @@
   0)
 
 (defn test-join [] :int
-  (let v (vector "a" "b" "c"))
+  (let v (Vector "a" "b" "c"))
   (let s (str-join v ","))
   (if (str-eq? s "a,b,c") (println "PASS join") (println "FAIL join"))
   0)

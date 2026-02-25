@@ -44,7 +44,7 @@
   (println (!= 1 2 3))         ; true (1!=2 && 2!=3)
 
   ;; set! on hash-get
-  (let-mut m (hash-map "a" 1 "b" 2))
+  (let-mut m (HashMap "a" 1 "b" 2))
   (set! (hash-get m "a") 99)
   (println (hash-get m "a"))   ; 99
 
@@ -62,7 +62,7 @@
   (println (str-replace "foo bar foo" "foo" "baz")) ; baz bar baz
 
   ;; str-join
-  (let-mut words (vector "a" "b" "c"))
+  (let-mut words (Vector "a" "b" "c"))
   (println (str-join words ", "))                   ; a, b, c
   (println (str-join words "-"))                    ; a-b-c
 

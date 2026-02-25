@@ -1,0 +1,32 @@
+;;; Test: Traits — compile-time method dispatch
+
+(struct Circle [radius :int])
+(struct Rect [w :int, h :int])
+
+(deftrait Shape [:T]
+  (area [self] :int)
+  (name [self] :str))
+
+(impl Shape Circle
+  (defn area [c :Circle] :int
+    (* (get c radius) (get c radius) 3))
+  (defn name [c :Circle] :str
+    "circle"))
+
+(impl Shape Rect
+  (defn area [r :Rect] :int
+    (* (get r w) (get r h)))
+  (defn name [r :Rect] :str
+    "rect"))
+
+(defn main [] :int
+  (let c (Circle 5))
+  (let r (Rect 3 4))
+
+  ;; Dispatch based on concrete type
+  (println (area c))     ; 75  (5*5*3)
+  (println (area r))     ; 12  (3*4)
+  (println (name c))     ; circle
+  (println (name r))     ; rect
+
+  0)

@@ -22,7 +22,7 @@ Most numerical computing is either written in C/CUDA (fast but verbose) or Pytho
 - **Foreign function interface** — `extern` declarations, pointer types, casts
 - **Type inference** — Hindley-Milner with struct field reverse lookup, pointer element tracking, numeric promotion, void detection
 - **Tagged unions** — `deftype`, `(:union ...)`, pattern matching with `match`
-- **Closures** — fat pointers (`Fn = {fn, env}`), free variable analysis, direct call optimization
+- **Closures** — fat pointers (`Fn = {fn, env}`), free variable analysis, C-compatible non-capturing lambdas
 - **Monomorphization** — auto-polymorphic functions stamped per concrete call site (`:?` explicit or inferred)
 - **Threads** — `spawn`/`await` via pthreads, TLS-safe refcounting
 - **Condition system** — CL-style `restart-case`, `handler-bind`, `signal`, `invoke-restart`
@@ -69,7 +69,7 @@ Struct field access infers struct types via reverse lookup:
   (+ p.x p.y))
 ```
 
-Closures capture their environment as fat pointers:
+Closures capture their environment as fat pointers. Non-capturing lambdas compile to plain C functions — directly passable to C APIs like `qsort`:
 
 ```lisp
 (defn make-adder [n :int] :fn (:int) :int
@@ -81,7 +81,27 @@ Closures capture their environment as fat pointers:
   0)
 ```
 
-Compiles to a struct `{fn_ptr, env*}` — non-capturing lambdas get `NULL` env, no allocation. `recur` inside lambdas compiles to `goto`.
+```c
+typedef struct { int y; } _env_1;
+
+// Capturing lambda — env struct, void* ctx
+static int _lambda_1(void* _ctx, int x) {
+    _env_1* _env = (_env_1*)_ctx;
+    return (x + _env->y);
+}
+
+// Non-capturing — plain C function, no void*
+static int _lambda_2(int x) {
+    return (x * 2);
+}
+
+// Thin wrapper lets it work with sysp's Fn fat pointers too
+static int _lambda_2_wrap(void* _ctx, int x) {
+    return _lambda_2(x);
+}
+```
+
+Any `defn` passed to a HOF gets the same treatment — auto-wrapped into a `Fn` struct. `recur` inside lambdas compiles to `goto`.
 
 Polymorphic functions auto-generalize and monomorphize:
 

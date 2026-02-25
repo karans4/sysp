@@ -1,0 +1,34 @@
+;;; Test: Generic structs — type-parameterized structs that monomorphize
+
+;; Generic pair struct
+(struct (Pair :T :U) [fst :T, snd :U])
+
+;; Generic wrapper (single type param)
+(struct (Box :T) [val :T])
+
+(defn main [] :int
+  ;; Pair of int, int
+  (let p1 (Pair 10 20))
+  (println (get p1 fst))    ; 10
+  (println (get p1 snd))    ; 20
+
+  ;; Pair of str, int
+  (let p2 (Pair "hello" 42))
+  (println (get p2 fst))    ; hello
+  (println (get p2 snd))    ; 42
+
+  ;; Box of int
+  (let b1 (Box 99))
+  (println (get b1 val))    ; 99
+
+  ;; Box of str
+  (let b2 (Box "world"))
+  (println (get b2 val))    ; world
+
+  ;; Nested: Pair of int, Pair of int, int
+  (let inner (Pair 3 4))
+  (let outer (Pair 1 2))
+  (println (get outer fst))  ; 1
+  (println (get inner snd))  ; 4
+
+  0)

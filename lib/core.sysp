@@ -17,14 +17,14 @@
 
 (defn map [f :? v :?] :?
   (do
-    (let-mut result (vector))
+    (let-mut result (Vector))
     (for [i 0 (vector-len v)]
       (vector-push! result (f (vector-ref v i))))
     result))
 
 (defn filter [pred :? v :?] :?
   (do
-    (let-mut result (vector))
+    (let-mut result (Vector))
     (for [i 0 (vector-len v)]
       (do
         (let elem (vector-ref v i))

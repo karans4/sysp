@@ -1,0 +1,13 @@
+;;; Test: Collections library — Vector/HashMap with get for field access
+
+(defn main [] :int
+  ;; get on vector (direct field access through struct)
+  (let v (Vector 10 20 30))
+  (println (get v len))        ; 3
+  (println (get v cap))        ; 0 (stack-allocated)
+
+  ;; array-ref through data pointer
+  (println (array-ref (get v data) 0))  ; 10
+  (println (array-ref (get v data) 2))  ; 30
+
+  0)

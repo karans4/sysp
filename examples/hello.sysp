@@ -6,7 +6,7 @@
   (print (get p x)) ;; Should print 10
 
   ;; 2. Generic Vector (Infers :int)
-  (let v (vector 1 2 3 4 5))
+  (let v (Vector 1 2 3 4 5))
   (print (vector-ref v 2)) ;; Should print 3
 
   ;; 3. Immutable Tuple (Infers Tuple_int_float)
@@ -18,6 +18,6 @@
   (print (adder 5)) ;; Should print 15
 
   ;; 5. Vector of Lambdas (Higher Order Vector)
-  (let v_funcs (vector adder adder))
+  (let v_funcs (Vector adder adder))
 
   0)

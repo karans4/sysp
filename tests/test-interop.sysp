@@ -13,7 +13,7 @@
 
 (defn main [] :int
   ;; Pass vector's .data to C function expecting int*
-  (let v (vector 10 20 30 40 50))
+  (let v (Vector 10 20 30 40 50))
   (let sum (_sum_array (get v data) (get v len)))
   (println sum)  ;; 150
 
@@ -22,7 +22,7 @@
   (println (get v cap))  ;; 0 (stack-allocated)
 
   ;; Pass string vector's .data to C function
-  (let names (vector "alice" "bob" "charlie"))
+  (let names (Vector "alice" "bob" "charlie"))
   (let count (_count_strs (get names data) (get names len)))
   (println count)  ;; 3
 

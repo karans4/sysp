@@ -4,7 +4,7 @@
 
 (defn main [] :int
   ;; Vector nth
-  (let v (vector 10 20 30))
+  (let v (Vector 10 20 30))
   (println (nth v 0))   ;; 10
   (println (nth v 2))   ;; 30
 
