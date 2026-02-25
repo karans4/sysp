@@ -1,45 +1,36 @@
 ;; input.sysp — Apple II keyboard input via SDL2
 
-;; SDL2 event type offsets (for reading raw event buffer)
-;; SDL_Event is a union, first u32 is the type field
-;; For EVT_KEYDOWN (type=0x300): key scancode at offset 16, keysym at offset 20
-;; SDL_QUIT = 0x100
-
 ;; SDL event type constants (prefixed to avoid header collision)
-(let EVT_QUIT :int 256)
-(let EVT_KEYDOWN :int 768)
+(let EVT_QUIT 256)
+(let EVT_KEYDOWN 768)
 
 ;; Poll SDL events and update keyboard state in memory
 ;; Returns 1 if quit requested, 0 otherwise
-(defn input-poll [mem :ptr-u8, event-buf :ptr-u8] :int
-  (do
-    (let-mut quit 0)
-    (while (SDL_PollEvent (cast :ptr-void event-buf))
-      (do
-        ;; Read event type (first 4 bytes, little-endian u32)
-        (let etype (+ (cast :int (ptr-deref event-buf 0))
-                      (<< (cast :int (ptr-deref event-buf 1)) 8)
-                      (<< (cast :int (ptr-deref event-buf 2)) 16)
-                      (<< (cast :int (ptr-deref event-buf 3)) 24)))
-        (cond
-          [(== etype EVT_QUIT)
-           (set! quit 1)]
-          [(== etype EVT_KEYDOWN)
-           (do
-             ;; SDL_KeyboardEvent: keysym.sym is at offset 20 (4 bytes)
-             ;; For basic ASCII keys, the sym value IS the ASCII code
-             (let sym (+ (cast :int (ptr-deref event-buf 20))
-                         (<< (cast :int (ptr-deref event-buf 21)) 8)
-                         (<< (cast :int (ptr-deref event-buf 22)) 16)
-                         (<< (cast :int (ptr-deref event-buf 23)) 24)))
-             ;; Only handle printable ASCII range
-             (when (and (>= sym 32) (<= sym 126))
-               ;; Apple II: uppercase only, set bit 7 to indicate key available
-               (let key (if (and (>= sym 97) (<= sym 122))
-                            (- sym 32)   ;; lowercase -> uppercase
-                            sym))
-               (mem-write mem 49152 (| key 128)))  ;; $C000 = 49152
-             ;; Handle Return key (sym 13)
-             (when (== sym 13)
-               (mem-write mem 49152 (| 13 128))))])))
-    quit))
+(defn input-poll [mem, event-buf]
+  (let-mut quit 0)
+  (while (SDL_PollEvent (cast :ptr-void event-buf))
+    ;; Read event type (first 4 bytes, little-endian u32)
+    (let etype (+ (ptr-deref event-buf 0)
+                  (<< (ptr-deref event-buf 1) 8)
+                  (<< (ptr-deref event-buf 2) 16)
+                  (<< (ptr-deref event-buf 3) 24)))
+    (cond
+      [(== etype EVT_QUIT)
+       (set! quit 1)]
+      [(== etype EVT_KEYDOWN)
+       ;; SDL_KeyboardEvent: keysym.sym is at offset 20 (4 bytes)
+       (let sym (+ (ptr-deref event-buf 20)
+                   (<< (ptr-deref event-buf 21) 8)
+                   (<< (ptr-deref event-buf 22) 16)
+                   (<< (ptr-deref event-buf 23) 24)))
+       ;; Only handle printable ASCII range
+       (when (and (>= sym 32) (<= sym 126))
+         ;; Apple II: uppercase only, set bit 7 to indicate key available
+         (let key (if (and (>= sym 97) (<= sym 122))
+                      (- sym 32)   ;; lowercase -> uppercase
+                      sym))
+         (mem-write mem 49152 (| key 128)))  ;; $C000 = 49152
+       ;; Handle Return key (sym 13)
+       (when (== sym 13)
+         (mem-write mem 49152 (| 13 128)))]))
+  quit)

@@ -150,12 +150,12 @@
                                :size :ptrdiff :intptr :uintptr)))
 
 (defun maybe-coerce (code from-type to-type)
-  "Wrap code in a C cast if from-type and to-type are different integer types.
-   Returns code unchanged if types match or aren't both integers."
+  "Wrap code in a C cast if from-type and to-type are different numeric types.
+   Handles int→float, float→int, and int→int promotions."
   (if (and to-type
            (not (eq (resolve-type from-type) (resolve-type to-type)))
-           (integer-type-p from-type)
-           (integer-type-p to-type))
+           (numeric-type-p from-type)
+           (numeric-type-p to-type))
       (format nil "((~a)~a)" (type-to-c to-type) code)
       code))
 
@@ -267,6 +267,7 @@
 
 ;; Type environment for inference: alist of (name . type-or-scheme)
 (defvar *infer-env* nil)
+(defvar *infer-structs* (make-hash-table :test #'equal))
 
 (defun infer-env-lookup (name)
   (let* ((resolved (resolve-name name))
@@ -327,17 +328,29 @@
     (unless (symbolp head)
       (return-from infer-list (make-tvar)))
     (cond
-      ;; Arithmetic: operands must unify, result = operand type
+      ;; Arithmetic: promote result type (don't unify operands with different concrete types)
       ;; Variadic: (+ a b c d) folds left to (+ (+ (+ a b) c) d)
       ((member (string head) '("+" "-" "*" "/" "%" "mod") :test #'string-equal)
        (if (and (= (length form) 2) (string-equal (string head) "-"))
            ;; Unary minus
            (infer-expr (second form))
-           ;; Fold left over all args
+           ;; Fold left over all args, promoting numeric types
            (let ((result-type (infer-expr (second form))))
              (dolist (arg (cddr form))
-               (let ((rt (infer-expr arg)))
-                 (unify result-type rt)))
+               (let* ((rt (infer-expr arg))
+                      (r (resolve-type result-type))
+                      (a (resolve-type rt)))
+                 (cond
+                   ;; Both concrete numerics: promote without unifying
+                   ((and (not (tvar-p r)) (not (tvar-p a))
+                         (numeric-type-p r) (numeric-type-p a))
+                    (unless (equal r a)
+                      (setf result-type (sysp-arithmetic-type r a))))
+                   ;; One is tvar: unify (needed for type propagation)
+                   ((tvar-p r) (unify result-type rt))
+                   ((tvar-p a) (unify rt result-type))
+                   ;; Both concrete non-numeric: just unify
+                   (t (unify result-type rt)))))
              result-type)))
 
       ;; Comparison: operands unify, result is bool. Chained: (< a b c) all unify.
@@ -352,10 +365,12 @@
        (dolist (arg (cdr form)) (infer-expr arg))
        :bool)
 
-      ;; Bitwise: operands are int, result is int
+      ;; Bitwise: walk operands, return :int (C semantics: bitwise ops produce int)
       ((member (string head) '("bit-and" "bit-or" "bit-xor" "bit-not" "shl" "shr"
                                 "&" "|" "^" "~" "<<" ">>")
-               :test #'string-equal) :int)
+               :test #'string-equal)
+       (dolist (arg (cdr form)) (infer-expr arg))
+       :int)
 
       ;; if expression: unify both branches
       ((sym= head "if")
@@ -574,12 +589,38 @@
       ((sym= head "str-replace") (dolist (e (cdr form)) (infer-expr e)) :str)
       ((sym= head "fmt") :str)  ; format string interpolation always returns :str
 
-      ;; get: struct field access — need struct info
+      ;; get: struct field access — resolve from struct definition
       ((sym= head "get")
-       (make-tvar))  ; can't resolve without struct definition context
+       (let* ((obj-type (resolve-type (infer-expr (second form))))
+              (field-name (string (third form)))
+              ;; Find struct name: (:struct "CPU"), (:ptr (:struct "CPU")), or direct
+              (struct-name (cond
+                             ((and (consp obj-type) (eq (car obj-type) :struct))
+                              (second obj-type))
+                             ((and (consp obj-type) (eq (car obj-type) :ptr)
+                                   (consp (second obj-type)) (eq (car (second obj-type)) :struct))
+                              (second (second obj-type)))
+                             (t nil)))
+              ;; If obj is a tvar, try to find a struct with this field (reverse lookup)
+              (struct-name (or struct-name
+                               (when (tvar-p obj-type)
+                                 (block found
+                                   (maphash (lambda (sname fields)
+                                              (when (and (listp fields)
+                                                         (assoc field-name fields :test #'equal))
+                                                (return-from found sname)))
+                                            *infer-structs*)
+                                   nil))))
+              (fields (when struct-name (gethash struct-name *infer-structs*)))
+              (field-type (when (and fields (listp fields))
+                            (cdr (assoc field-name fields :test #'equal)))))
+         ;; Don't unify object type — it might be struct or ptr-to-struct
+         ;; Let call-site types determine the concrete param type
+         (or field-type (make-tvar))))
 
-      ;; set!: returns the assigned type
+      ;; set!: infer target and value, return the assigned type
       ((sym= head "set!")
+       (infer-expr (second form))  ;; target (may trigger struct lookup via dot syntax)
        (infer-expr (third form)))
 
       ;; addr-of, deref, cast, sizeof
@@ -650,6 +691,20 @@
          (unify arr-type (make-ptr-type elem))
          (when (fourth form) (unify elem (infer-expr (fourth form))))
          :void))
+      ;; ptr-set!: (ptr-set! p val) or (ptr-set! p idx val)
+      ((sym= head "ptr-set!")
+       (let ((ptr-type (infer-expr (second form))))
+         (if (fourth form)
+             ;; (ptr-set! p idx val) — indexed
+             (progn
+               (infer-expr (third form))
+               (infer-expr (fourth form)))
+             ;; (ptr-set! p val)
+             (infer-expr (third form)))
+         ;; Unify pointer elem type with value
+         (let ((elem (make-tvar)))
+           (unify ptr-type (make-ptr-type elem))
+           elem)))
       ((sym= head "make-array") (make-tvar))
 
       ;; match: infer scrutinee, collect body types from all clauses, unify
@@ -674,7 +729,18 @@
        (make-ptr-type (parse-type-annotation (second form))))
 
       ;; ptr-deref: dereference → element type
-      ((sym= head "ptr-deref") (make-tvar))
+      ((sym= head "ptr-deref")
+       ;; (ptr-deref p) or (ptr-deref p idx) — infer pointer, return element type
+       (let ((ptr-type (infer-expr (second form)))
+             (elem-tvar (make-tvar)))
+         (when (third form) (infer-expr (third form)))  ;; index
+         (unify ptr-type (make-ptr-type elem-tvar))
+         elem-tvar))
+
+      ;; Statement-only forms in expression position: infer bodies, return :void
+      ((or (sym= head "when") (sym= head "unless") (sym= head "while") (sym= head "for"))
+       (infer-stmt form)
+       :void)
 
       ;; Function call: look up function type, unify args, return ret type
       (t (let* ((fn-name (string head))
@@ -724,15 +790,24 @@
         ((or (sym= head "when") (sym= head "unless"))
          (infer-expr (second form))
          (dolist (f (cddr form))
-           (infer-stmt f)))
+           (infer-stmt f))
+         :void)
         ((sym= head "while")
          (infer-expr (second form))
          (dolist (f (cddr form))
-           (infer-stmt f)))
+           (infer-stmt f))
+         :void)
         ((sym= head "for")
-         ;; (for [var start end] body...) — body starts at position 2
-         (dolist (f (cddr form))
-           (infer-stmt f)))
+         ;; (for [var start end] body...) — bind loop var to int, infer body
+         (let ((binding (second form)))
+           (when (and (listp binding) (>= (length binding) 3))
+             (let ((var-name (string (first binding))))
+               (infer-expr (second binding))  ;; start
+               (infer-expr (third binding))   ;; end
+               (infer-env-bind var-name :int)))
+           (dolist (f (cddr form))
+             (infer-stmt f)))
+         :void)
         ((sym= head "cond")
          (dolist (clause (cdr form))
            (when (listp clause)
@@ -865,6 +940,7 @@
 (defun infer-toplevel (forms)
   "Run type inference on all top-level forms. Populates *infer-env*."
   (setf *infer-env* nil)
+  (clrhash *infer-structs*)
   (reset-inference)
   (dolist (form forms)
     (when (listp form)
@@ -881,17 +957,20 @@
                 (fields-raw (cond (has-attr (fourth form))
                                   (is-struct (third form))
                                   (t (third form))))
-                (field-types nil))
+                (field-types nil)
+                (field-alist nil))
            (let ((lst (if (listp fields-raw) (copy-list fields-raw) nil)))
              (loop while lst do
-               (pop lst)  ; field name
-               (when (and lst (keywordp (first lst)))
-                 (let ((result (parse-type-from-list lst)))
-                   (push (car result) field-types)
-                   (setf lst (cdr result))))))
+               (let ((fname (string (pop lst))))  ; field name
+                 (when (and lst (keywordp (first lst)))
+                   (let ((result (parse-type-from-list lst)))
+                     (push (car result) field-types)
+                     (push (cons fname (car result)) field-alist)
+                     (setf lst (cdr result)))))))
            (setf field-types (nreverse field-types))
-           ;; Register in *structs* temporarily for parse-type-annotation resolution
-           ;; (will be overwritten by compile phase)
+           (setf field-alist (nreverse field-alist))
+           ;; Register struct fields for inference (get/set! resolution)
+           (setf (gethash name *infer-structs*) field-alist)
            (unless (gethash name *structs*)
              (setf (gethash name *structs*) :infer-placeholder))
            (when is-struct
@@ -2753,6 +2832,7 @@
     ("new" . compile-new-expr)
     ("ptr-alloc" . compile-ptr-alloc)
     ("ptr-deref" . compile-ptr-deref)
+    ("ptr-set!" . compile-ptr-set-expr)
     ("null?" . compile-null-check)
     ("spawn" . compile-spawn)
     ("await" . compile-await)
@@ -3005,9 +3085,12 @@
                    (compile-if-expr (list* 'if rest) env))
                   ;; Single form -> positional else
                   (t (compile-expr (first rest) env)))
-              (let ((result-type (if (type-equal-p then-type else-type)
-                                     then-type
-                                     (make-union-type (list then-type else-type)))))
+              (let ((result-type (cond
+                                     ((type-equal-p then-type else-type) then-type)
+                                     ;; Numeric types: promote instead of union
+                                     ((and (numeric-type-p then-type) (numeric-type-p else-type))
+                                      (sysp-arithmetic-type then-type else-type))
+                                     (t (make-union-type (list then-type else-type))))))
                 (if (union-type-p result-type)
                     (values (format nil "(~a ? ~a : ~a)" cond-code
                                     (wrap-as-union then-code then-type result-type)
@@ -3081,6 +3164,27 @@
             (values (format nil "~a[~a]" p-code i-code) elem-type))
           (values (format nil "(*~a)" p-code) elem-type)))))
 
+(defun compile-ptr-set-expr (form env)
+  "(ptr-set! p val) or (ptr-set! p i val) as expression — returns the assigned value."
+  (let ((args (rest form)))
+    (if (= (length args) 3)
+        ;; (ptr-set! p i val) → (p[i] = val)
+        (multiple-value-bind (p-code pt) (compile-expr (first args) env)
+          (multiple-value-bind (i-code it) (compile-expr (second args) env)
+            (declare (ignore it))
+            (multiple-value-bind (v-code vt) (compile-expr (third args) env)
+              (let* ((elem-type (when (and (consp pt) (eq (car pt) :ptr)) (second pt)))
+                     (coerced (if elem-type (maybe-coerce v-code vt elem-type) v-code)))
+                (values (format nil "(~a[~a] = ~a)" p-code i-code coerced)
+                        (or elem-type vt))))))
+        ;; (ptr-set! p val) → (*p = val)
+        (multiple-value-bind (p-code pt) (compile-expr (first args) env)
+          (multiple-value-bind (v-code vt) (compile-expr (second args) env)
+            (let* ((elem-type (when (and (consp pt) (eq (car pt) :ptr)) (second pt)))
+                   (coerced (if elem-type (maybe-coerce v-code vt elem-type) v-code)))
+              (values (format nil "(*~a = ~a)" p-code coerced)
+                      (or elem-type vt))))))))
+
 (defun compile-ptr-set-stmt (form env)
   "(ptr-set! p val) → *p = val; or (ptr-set! p i val) → p[i] = val;"
   (let ((*pending-stmts* nil)
@@ -3134,9 +3238,10 @@
               (multiple-value-bind (then-code then-type) (compile-expr (second clause) env)
                 (multiple-value-bind (rest-code rest-type) (compile-cond-clauses (rest clauses) env)
                   ;; Unify this clause type with rest type
-                  (let ((result-type (if (type-equal-p then-type rest-type)
-                                         then-type
-                                         (make-union-type (list then-type rest-type)))))
+                  (let ((result-type (cond ((type-equal-p then-type rest-type) then-type)
+                                           ((and (numeric-type-p then-type) (numeric-type-p rest-type))
+                                            (sysp-arithmetic-type then-type rest-type))
+                                           (t (make-union-type (list then-type rest-type))))))
                     (if (union-type-p result-type)
                         (values (format nil "(~a ? ~a : ~a)" test-code
                                         (wrap-as-union then-code then-type result-type)
@@ -3189,6 +3294,8 @@
                                      (cond ((eq a :void) b)
                                            ((eq b :void) a)
                                            ((type-equal-p a b) a)
+                                           ((and (numeric-type-p a) (numeric-type-p b))
+                                            (sysp-arithmetic-type a b))
                                            (t (make-union-type (list a b)))))
                                    (nreverse all-types))))
           (values result-type result))))))
@@ -3261,6 +3368,8 @@
                          ((null clause-types) :int)
                          ((every (lambda (t2) (type-equal-p (first clause-types) t2)) (rest clause-types))
                           (first clause-types))
+                         ((every #'numeric-type-p clause-types)
+                          (reduce #'sysp-arithmetic-type clause-types))
                          (t (make-union-type clause-types)))))
       (values result-type result))))
 
@@ -5631,6 +5740,8 @@
                                          (cond ((eq a :void) b)
                                                ((eq b :void) a)
                                                ((type-equal-p a b) a)
+                                               ((and (numeric-type-p a) (numeric-type-p b))
+                                                (sysp-arithmetic-type a b))
                                                (t (make-union-type (list a b)))))
                                        clause-types)
                                :void)))
@@ -6136,6 +6247,17 @@
                             (string-equal name "sysp-main"))
                        "main"
                        (sanitize-name name))))
+      ;; If no return annotation and last form is inherently void (when/for/while/unless),
+      ;; force void return type
+      (when (and no-ret-annotation-p
+                 (listp last-form)
+                 (symbolp (first last-form))
+                 (member (string (first last-form)) '("when" "unless" "while" "for") :test #'string-equal))
+        (setf ret-type :void)
+        ;; Update global env
+        (let* ((arg-types (mapcar #'second params))
+               (fn-type (make-fn-type arg-types :void)))
+          (env-bind *global-env* name fn-type)))
       ;; Handle void return or expression return
       (let (return-stmt)
         (if (eq (type-kind ret-type) :void)

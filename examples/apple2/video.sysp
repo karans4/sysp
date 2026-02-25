@@ -1,384 +1,232 @@
 ;; video.sysp — Apple II text mode renderer (40x24, green phosphor)
 
 ;; Screen dimensions
-(let SCREEN_W :int 280)
-(let SCREEN_H :int 192)
-(let CHAR_W :int 7)
-(let CHAR_H :int 8)
-(let COLS :int 40)
-(let ROWS :int 24)
+(let SCREEN_W 280)
+(let SCREEN_H 192)
+(let CHAR_W 7)
+(let CHAR_H 8)
+(let COLS 40)
+(let ROWS 24)
 
 ;; Colors (ARGB8888)
-;; ARGB: 0xFF000000 = 4278190080, 0xFF33FF33 = 4281532211
 (let COLOR_BG :u32 4278190080)
 (let COLOR_FG :u32 4281532211)
 
 ;; Apple II text screen base addresses for each row (interleaved layout)
-;; Row = group*8 + line: base = $0400 + line*$80 + group*$28
-(defn screen-addr [row :int] :int
+(defn screen-addr [row]
   (let group (/ row 8))
   (let line (% row 8))
-  (+ 1024 (+ (* line 128) (* group 40))))
+  (+ 1024 (* line 128) (* group 40)))
 
 ;; Font data: 7x8 pixel bitmaps for ASCII 32-127 (96 chars)
-;; Each char is 8 bytes (one per row), 7 bits used per byte (MSB first)
-;; This is a minimal approximation of the Apple II character ROM
-(defn font-init [font :ptr-u8] :void
-  (do
-    ;; Zero everything first
-    (for [i 0 768]
-      (ptr-set! font i (cast :u8 0)))
+(defn font-init [font]
+  ;; Zero everything first
+  (for [i 0 768]
+    (ptr-set! font i 0))
 
-    ;; Space (32) - all zeros, already done
+  ;; ! (33)
+  (ptr-set! font 8 16) (ptr-set! font 9 16) (ptr-set! font 10 16)
+  (ptr-set! font 11 16) (ptr-set! font 12 16) (ptr-set! font 14 16)
 
-    ;; ! (33)
-    (ptr-set! font 8 (cast :u8 16))
-    (ptr-set! font 9 (cast :u8 16))
-    (ptr-set! font 10 (cast :u8 16))
-    (ptr-set! font 11 (cast :u8 16))
-    (ptr-set! font 12 (cast :u8 16))
-    (ptr-set! font 13 (cast :u8 0))
-    (ptr-set! font 14 (cast :u8 16))
+  ;; 0 (48) - offset 128
+  (ptr-set! font 128 56) (ptr-set! font 129 68) (ptr-set! font 130 68)
+  (ptr-set! font 131 68) (ptr-set! font 132 68) (ptr-set! font 133 68)
+  (ptr-set! font 134 56)
 
-    ;; 0 (48) - offset 128
-    (ptr-set! font 128 (cast :u8 56))
-    (ptr-set! font 129 (cast :u8 68))
-    (ptr-set! font 130 (cast :u8 68))
-    (ptr-set! font 131 (cast :u8 68))
-    (ptr-set! font 132 (cast :u8 68))
-    (ptr-set! font 133 (cast :u8 68))
-    (ptr-set! font 134 (cast :u8 56))
+  ;; 1 (49) - offset 136
+  (ptr-set! font 136 16) (ptr-set! font 137 48) (ptr-set! font 138 16)
+  (ptr-set! font 139 16) (ptr-set! font 140 16) (ptr-set! font 141 16)
+  (ptr-set! font 142 56)
 
-    ;; 1 (49) - offset 136
-    (ptr-set! font 136 (cast :u8 16))
-    (ptr-set! font 137 (cast :u8 48))
-    (ptr-set! font 138 (cast :u8 16))
-    (ptr-set! font 139 (cast :u8 16))
-    (ptr-set! font 140 (cast :u8 16))
-    (ptr-set! font 141 (cast :u8 16))
-    (ptr-set! font 142 (cast :u8 56))
+  ;; 2 (50) - offset 144
+  (ptr-set! font 144 56) (ptr-set! font 145 68) (ptr-set! font 146 4)
+  (ptr-set! font 147 8) (ptr-set! font 148 16) (ptr-set! font 149 32)
+  (ptr-set! font 150 124)
 
-    ;; 2 (50) - offset 144
-    (ptr-set! font 144 (cast :u8 56))
-    (ptr-set! font 145 (cast :u8 68))
-    (ptr-set! font 146 (cast :u8 4))
-    (ptr-set! font 147 (cast :u8 8))
-    (ptr-set! font 148 (cast :u8 16))
-    (ptr-set! font 149 (cast :u8 32))
-    (ptr-set! font 150 (cast :u8 124))
+  ;; A (65) - offset 264
+  (ptr-set! font 264 16) (ptr-set! font 265 40) (ptr-set! font 266 68)
+  (ptr-set! font 267 68) (ptr-set! font 268 124) (ptr-set! font 269 68)
+  (ptr-set! font 270 68)
 
-    ;; A (65) - offset 264
-    (ptr-set! font 264 (cast :u8 16))
-    (ptr-set! font 265 (cast :u8 40))
-    (ptr-set! font 266 (cast :u8 68))
-    (ptr-set! font 267 (cast :u8 68))
-    (ptr-set! font 268 (cast :u8 124))
-    (ptr-set! font 269 (cast :u8 68))
-    (ptr-set! font 270 (cast :u8 68))
+  ;; B (66) - offset 272
+  (ptr-set! font 272 120) (ptr-set! font 273 68) (ptr-set! font 274 68)
+  (ptr-set! font 275 120) (ptr-set! font 276 68) (ptr-set! font 277 68)
+  (ptr-set! font 278 120)
 
-    ;; B (66) - offset 272
-    (ptr-set! font 272 (cast :u8 120))
-    (ptr-set! font 273 (cast :u8 68))
-    (ptr-set! font 274 (cast :u8 68))
-    (ptr-set! font 275 (cast :u8 120))
-    (ptr-set! font 276 (cast :u8 68))
-    (ptr-set! font 277 (cast :u8 68))
-    (ptr-set! font 278 (cast :u8 120))
+  ;; C (67) - offset 280
+  (ptr-set! font 280 56) (ptr-set! font 281 68) (ptr-set! font 282 64)
+  (ptr-set! font 283 64) (ptr-set! font 284 64) (ptr-set! font 285 68)
+  (ptr-set! font 286 56)
 
-    ;; C (67) - offset 280
-    (ptr-set! font 280 (cast :u8 56))
-    (ptr-set! font 281 (cast :u8 68))
-    (ptr-set! font 282 (cast :u8 64))
-    (ptr-set! font 283 (cast :u8 64))
-    (ptr-set! font 284 (cast :u8 64))
-    (ptr-set! font 285 (cast :u8 68))
-    (ptr-set! font 286 (cast :u8 56))
+  ;; D (68) - offset 288
+  (ptr-set! font 288 120) (ptr-set! font 289 68) (ptr-set! font 290 68)
+  (ptr-set! font 291 68) (ptr-set! font 292 68) (ptr-set! font 293 68)
+  (ptr-set! font 294 120)
 
-    ;; D (68) - offset 288
-    (ptr-set! font 288 (cast :u8 120))
-    (ptr-set! font 289 (cast :u8 68))
-    (ptr-set! font 290 (cast :u8 68))
-    (ptr-set! font 291 (cast :u8 68))
-    (ptr-set! font 292 (cast :u8 68))
-    (ptr-set! font 293 (cast :u8 68))
-    (ptr-set! font 294 (cast :u8 120))
+  ;; E (69) - offset 296
+  (ptr-set! font 296 124) (ptr-set! font 297 64) (ptr-set! font 298 64)
+  (ptr-set! font 299 120) (ptr-set! font 300 64) (ptr-set! font 301 64)
+  (ptr-set! font 302 124)
 
-    ;; E (69) - offset 296
-    (ptr-set! font 296 (cast :u8 124))
-    (ptr-set! font 297 (cast :u8 64))
-    (ptr-set! font 298 (cast :u8 64))
-    (ptr-set! font 299 (cast :u8 120))
-    (ptr-set! font 300 (cast :u8 64))
-    (ptr-set! font 301 (cast :u8 64))
-    (ptr-set! font 302 (cast :u8 124))
+  ;; F (70) - offset 304
+  (ptr-set! font 304 124) (ptr-set! font 305 64) (ptr-set! font 306 64)
+  (ptr-set! font 307 120) (ptr-set! font 308 64) (ptr-set! font 309 64)
+  (ptr-set! font 310 64)
 
-    ;; H (72) - offset 320
-    (ptr-set! font 320 (cast :u8 68))
-    (ptr-set! font 321 (cast :u8 68))
-    (ptr-set! font 322 (cast :u8 68))
-    (ptr-set! font 323 (cast :u8 124))
-    (ptr-set! font 324 (cast :u8 68))
-    (ptr-set! font 325 (cast :u8 68))
-    (ptr-set! font 326 (cast :u8 68))
+  ;; G (71) - offset 312
+  (ptr-set! font 312 56) (ptr-set! font 313 68) (ptr-set! font 314 64)
+  (ptr-set! font 315 76) (ptr-set! font 316 68) (ptr-set! font 317 68)
+  (ptr-set! font 318 56)
 
-    ;; I (73) - offset 328
-    (ptr-set! font 328 (cast :u8 56))
-    (ptr-set! font 329 (cast :u8 16))
-    (ptr-set! font 330 (cast :u8 16))
-    (ptr-set! font 331 (cast :u8 16))
-    (ptr-set! font 332 (cast :u8 16))
-    (ptr-set! font 333 (cast :u8 16))
-    (ptr-set! font 334 (cast :u8 56))
+  ;; H (72) - offset 320
+  (ptr-set! font 320 68) (ptr-set! font 321 68) (ptr-set! font 322 68)
+  (ptr-set! font 323 124) (ptr-set! font 324 68) (ptr-set! font 325 68)
+  (ptr-set! font 326 68)
 
-    ;; L (76) - offset 352
-    (ptr-set! font 352 (cast :u8 64))
-    (ptr-set! font 353 (cast :u8 64))
-    (ptr-set! font 354 (cast :u8 64))
-    (ptr-set! font 355 (cast :u8 64))
-    (ptr-set! font 356 (cast :u8 64))
-    (ptr-set! font 357 (cast :u8 64))
-    (ptr-set! font 358 (cast :u8 124))
+  ;; I (73) - offset 328
+  (ptr-set! font 328 56) (ptr-set! font 329 16) (ptr-set! font 330 16)
+  (ptr-set! font 331 16) (ptr-set! font 332 16) (ptr-set! font 333 16)
+  (ptr-set! font 334 56)
 
-    ;; M (77) - offset 360
-    (ptr-set! font 360 (cast :u8 68))
-    (ptr-set! font 361 (cast :u8 108))
-    (ptr-set! font 362 (cast :u8 84))
-    (ptr-set! font 363 (cast :u8 68))
-    (ptr-set! font 364 (cast :u8 68))
-    (ptr-set! font 365 (cast :u8 68))
-    (ptr-set! font 366 (cast :u8 68))
+  ;; K (75) - offset 344
+  (ptr-set! font 344 68) (ptr-set! font 345 72) (ptr-set! font 346 80)
+  (ptr-set! font 347 96) (ptr-set! font 348 80) (ptr-set! font 349 72)
+  (ptr-set! font 350 68)
 
-    ;; N (78) - offset 368
-    (ptr-set! font 368 (cast :u8 68))
-    (ptr-set! font 369 (cast :u8 100))
-    (ptr-set! font 370 (cast :u8 84))
-    (ptr-set! font 371 (cast :u8 76))
-    (ptr-set! font 372 (cast :u8 68))
-    (ptr-set! font 373 (cast :u8 68))
-    (ptr-set! font 374 (cast :u8 68))
+  ;; L (76) - offset 352
+  (ptr-set! font 352 64) (ptr-set! font 353 64) (ptr-set! font 354 64)
+  (ptr-set! font 355 64) (ptr-set! font 356 64) (ptr-set! font 357 64)
+  (ptr-set! font 358 124)
 
-    ;; O (79) - offset 376
-    (ptr-set! font 376 (cast :u8 56))
-    (ptr-set! font 377 (cast :u8 68))
-    (ptr-set! font 378 (cast :u8 68))
-    (ptr-set! font 379 (cast :u8 68))
-    (ptr-set! font 380 (cast :u8 68))
-    (ptr-set! font 381 (cast :u8 68))
-    (ptr-set! font 382 (cast :u8 56))
+  ;; M (77) - offset 360
+  (ptr-set! font 360 68) (ptr-set! font 361 108) (ptr-set! font 362 84)
+  (ptr-set! font 363 68) (ptr-set! font 364 68) (ptr-set! font 365 68)
+  (ptr-set! font 366 68)
 
-    ;; P (80) - offset 384
-    (ptr-set! font 384 (cast :u8 120))
-    (ptr-set! font 385 (cast :u8 68))
-    (ptr-set! font 386 (cast :u8 68))
-    (ptr-set! font 387 (cast :u8 120))
-    (ptr-set! font 388 (cast :u8 64))
-    (ptr-set! font 389 (cast :u8 64))
-    (ptr-set! font 390 (cast :u8 64))
+  ;; N (78) - offset 368
+  (ptr-set! font 368 68) (ptr-set! font 369 100) (ptr-set! font 370 84)
+  (ptr-set! font 371 76) (ptr-set! font 372 68) (ptr-set! font 373 68)
+  (ptr-set! font 374 68)
 
-    ;; R (82) - offset 400
-    (ptr-set! font 400 (cast :u8 120))
-    (ptr-set! font 401 (cast :u8 68))
-    (ptr-set! font 402 (cast :u8 68))
-    (ptr-set! font 403 (cast :u8 120))
-    (ptr-set! font 404 (cast :u8 80))
-    (ptr-set! font 405 (cast :u8 72))
-    (ptr-set! font 406 (cast :u8 68))
+  ;; O (79) - offset 376
+  (ptr-set! font 376 56) (ptr-set! font 377 68) (ptr-set! font 378 68)
+  (ptr-set! font 379 68) (ptr-set! font 380 68) (ptr-set! font 381 68)
+  (ptr-set! font 382 56)
 
-    ;; S (83) - offset 408
-    (ptr-set! font 408 (cast :u8 56))
-    (ptr-set! font 409 (cast :u8 68))
-    (ptr-set! font 410 (cast :u8 64))
-    (ptr-set! font 411 (cast :u8 56))
-    (ptr-set! font 412 (cast :u8 4))
-    (ptr-set! font 413 (cast :u8 68))
-    (ptr-set! font 414 (cast :u8 56))
+  ;; P (80) - offset 384
+  (ptr-set! font 384 120) (ptr-set! font 385 68) (ptr-set! font 386 68)
+  (ptr-set! font 387 120) (ptr-set! font 388 64) (ptr-set! font 389 64)
+  (ptr-set! font 390 64)
 
-    ;; T (84) - offset 416
-    (ptr-set! font 416 (cast :u8 124))
-    (ptr-set! font 417 (cast :u8 16))
-    (ptr-set! font 418 (cast :u8 16))
-    (ptr-set! font 419 (cast :u8 16))
-    (ptr-set! font 420 (cast :u8 16))
-    (ptr-set! font 421 (cast :u8 16))
-    (ptr-set! font 422 (cast :u8 16))
+  ;; R (82) - offset 400
+  (ptr-set! font 400 120) (ptr-set! font 401 68) (ptr-set! font 402 68)
+  (ptr-set! font 403 120) (ptr-set! font 404 80) (ptr-set! font 405 72)
+  (ptr-set! font 406 68)
 
-    ;; U (85) - offset 424
-    (ptr-set! font 424 (cast :u8 68))
-    (ptr-set! font 425 (cast :u8 68))
-    (ptr-set! font 426 (cast :u8 68))
-    (ptr-set! font 427 (cast :u8 68))
-    (ptr-set! font 428 (cast :u8 68))
-    (ptr-set! font 429 (cast :u8 68))
-    (ptr-set! font 430 (cast :u8 56))
+  ;; S (83) - offset 408
+  (ptr-set! font 408 56) (ptr-set! font 409 68) (ptr-set! font 410 64)
+  (ptr-set! font 411 56) (ptr-set! font 412 4) (ptr-set! font 413 68)
+  (ptr-set! font 414 56)
 
-    ;; W (87) - offset 440
-    (ptr-set! font 440 (cast :u8 68))
-    (ptr-set! font 441 (cast :u8 68))
-    (ptr-set! font 442 (cast :u8 68))
-    (ptr-set! font 443 (cast :u8 68))
-    (ptr-set! font 444 (cast :u8 84))
-    (ptr-set! font 445 (cast :u8 108))
-    (ptr-set! font 446 (cast :u8 68))
+  ;; T (84) - offset 416
+  (ptr-set! font 416 124) (ptr-set! font 417 16) (ptr-set! font 418 16)
+  (ptr-set! font 419 16) (ptr-set! font 420 16) (ptr-set! font 421 16)
+  (ptr-set! font 422 16)
 
-    ;; Y (89) - offset 456
-    (ptr-set! font 456 (cast :u8 68))
-    (ptr-set! font 457 (cast :u8 68))
-    (ptr-set! font 458 (cast :u8 40))
-    (ptr-set! font 459 (cast :u8 16))
-    (ptr-set! font 460 (cast :u8 16))
-    (ptr-set! font 461 (cast :u8 16))
-    (ptr-set! font 462 (cast :u8 16))
+  ;; U (85) - offset 424
+  (ptr-set! font 424 68) (ptr-set! font 425 68) (ptr-set! font 426 68)
+  (ptr-set! font 427 68) (ptr-set! font 428 68) (ptr-set! font 429 68)
+  (ptr-set! font 430 56)
 
-    ;; X (88) - offset 448
-    (ptr-set! font 448 (cast :u8 68))
-    (ptr-set! font 449 (cast :u8 68))
-    (ptr-set! font 450 (cast :u8 40))
-    (ptr-set! font 451 (cast :u8 16))
-    (ptr-set! font 452 (cast :u8 40))
-    (ptr-set! font 453 (cast :u8 68))
-    (ptr-set! font 454 (cast :u8 68))
+  ;; W (87) - offset 440
+  (ptr-set! font 440 68) (ptr-set! font 441 68) (ptr-set! font 442 68)
+  (ptr-set! font 443 68) (ptr-set! font 444 84) (ptr-set! font 445 108)
+  (ptr-set! font 446 68)
 
-    ;; 3 (51) - offset 152
-    (ptr-set! font 152 (cast :u8 56))
-    (ptr-set! font 153 (cast :u8 68))
-    (ptr-set! font 154 (cast :u8 4))
-    (ptr-set! font 155 (cast :u8 24))
-    (ptr-set! font 156 (cast :u8 4))
-    (ptr-set! font 157 (cast :u8 68))
-    (ptr-set! font 158 (cast :u8 56))
+  ;; X (88) - offset 448
+  (ptr-set! font 448 68) (ptr-set! font 449 68) (ptr-set! font 450 40)
+  (ptr-set! font 451 16) (ptr-set! font 452 40) (ptr-set! font 453 68)
+  (ptr-set! font 454 68)
 
-    ;; 4 (52) - offset 160
-    (ptr-set! font 160 (cast :u8 12))
-    (ptr-set! font 161 (cast :u8 20))
-    (ptr-set! font 162 (cast :u8 36))
-    (ptr-set! font 163 (cast :u8 68))
-    (ptr-set! font 164 (cast :u8 124))
-    (ptr-set! font 165 (cast :u8 4))
-    (ptr-set! font 166 (cast :u8 4))
+  ;; Y (89) - offset 456
+  (ptr-set! font 456 68) (ptr-set! font 457 68) (ptr-set! font 458 40)
+  (ptr-set! font 459 16) (ptr-set! font 460 16) (ptr-set! font 461 16)
+  (ptr-set! font 462 16)
 
-    ;; 5 (53) - offset 168
-    (ptr-set! font 168 (cast :u8 124))
-    (ptr-set! font 169 (cast :u8 64))
-    (ptr-set! font 170 (cast :u8 120))
-    (ptr-set! font 171 (cast :u8 4))
-    (ptr-set! font 172 (cast :u8 4))
-    (ptr-set! font 173 (cast :u8 68))
-    (ptr-set! font 174 (cast :u8 56))
+  ;; 3 (51) - offset 152
+  (ptr-set! font 152 56) (ptr-set! font 153 68) (ptr-set! font 154 4)
+  (ptr-set! font 155 24) (ptr-set! font 156 4) (ptr-set! font 157 68)
+  (ptr-set! font 158 56)
 
-    ;; 6 (54) - offset 176
-    (ptr-set! font 176 (cast :u8 56))
-    (ptr-set! font 177 (cast :u8 64))
-    (ptr-set! font 178 (cast :u8 64))
-    (ptr-set! font 179 (cast :u8 120))
-    (ptr-set! font 180 (cast :u8 68))
-    (ptr-set! font 181 (cast :u8 68))
-    (ptr-set! font 182 (cast :u8 56))
+  ;; 4 (52) - offset 160
+  (ptr-set! font 160 12) (ptr-set! font 161 20) (ptr-set! font 162 36)
+  (ptr-set! font 163 68) (ptr-set! font 164 124) (ptr-set! font 165 4)
+  (ptr-set! font 166 4)
 
-    ;; 7 (55) - offset 184
-    (ptr-set! font 184 (cast :u8 124))
-    (ptr-set! font 185 (cast :u8 4))
-    (ptr-set! font 186 (cast :u8 8))
-    (ptr-set! font 187 (cast :u8 16))
-    (ptr-set! font 188 (cast :u8 32))
-    (ptr-set! font 189 (cast :u8 32))
-    (ptr-set! font 190 (cast :u8 32))
+  ;; 5 (53) - offset 168
+  (ptr-set! font 168 124) (ptr-set! font 169 64) (ptr-set! font 170 120)
+  (ptr-set! font 171 4) (ptr-set! font 172 4) (ptr-set! font 173 68)
+  (ptr-set! font 174 56)
 
-    ;; 8 (56) - offset 192
-    (ptr-set! font 192 (cast :u8 56))
-    (ptr-set! font 193 (cast :u8 68))
-    (ptr-set! font 194 (cast :u8 68))
-    (ptr-set! font 195 (cast :u8 56))
-    (ptr-set! font 196 (cast :u8 68))
-    (ptr-set! font 197 (cast :u8 68))
-    (ptr-set! font 198 (cast :u8 56))
+  ;; 6 (54) - offset 176
+  (ptr-set! font 176 56) (ptr-set! font 177 64) (ptr-set! font 178 64)
+  (ptr-set! font 179 120) (ptr-set! font 180 68) (ptr-set! font 181 68)
+  (ptr-set! font 182 56)
 
-    ;; 9 (57) - offset 200
-    (ptr-set! font 200 (cast :u8 56))
-    (ptr-set! font 201 (cast :u8 68))
-    (ptr-set! font 202 (cast :u8 68))
-    (ptr-set! font 203 (cast :u8 60))
-    (ptr-set! font 204 (cast :u8 4))
-    (ptr-set! font 205 (cast :u8 8))
-    (ptr-set! font 206 (cast :u8 48))
+  ;; 7 (55) - offset 184
+  (ptr-set! font 184 124) (ptr-set! font 185 4) (ptr-set! font 186 8)
+  (ptr-set! font 187 16) (ptr-set! font 188 32) (ptr-set! font 189 32)
+  (ptr-set! font 190 32)
 
-    ;; - (45) - offset 104
-    (ptr-set! font 107 (cast :u8 124))
+  ;; 8 (56) - offset 192
+  (ptr-set! font 192 56) (ptr-set! font 193 68) (ptr-set! font 194 68)
+  (ptr-set! font 195 56) (ptr-set! font 196 68) (ptr-set! font 197 68)
+  (ptr-set! font 198 56)
 
-    ;; + (43) - offset 88
-    (ptr-set! font 89 (cast :u8 16))
-    (ptr-set! font 90 (cast :u8 16))
-    (ptr-set! font 91 (cast :u8 124))
-    (ptr-set! font 92 (cast :u8 16))
-    (ptr-set! font 93 (cast :u8 16))
+  ;; 9 (57) - offset 200
+  (ptr-set! font 200 56) (ptr-set! font 201 68) (ptr-set! font 202 68)
+  (ptr-set! font 203 60) (ptr-set! font 204 4) (ptr-set! font 205 8)
+  (ptr-set! font 206 48)
 
-    ;; | (124) - offset 736
-    (ptr-set! font 736 (cast :u8 16))
-    (ptr-set! font 737 (cast :u8 16))
-    (ptr-set! font 738 (cast :u8 16))
-    (ptr-set! font 739 (cast :u8 16))
-    (ptr-set! font 740 (cast :u8 16))
-    (ptr-set! font 741 (cast :u8 16))
-    (ptr-set! font 742 (cast :u8 16))
+  ;; - (45) - offset 104
+  (ptr-set! font 107 124)
 
-    ;; ' (39) - offset 56
-    (ptr-set! font 56 (cast :u8 16))
-    (ptr-set! font 57 (cast :u8 16))
-    (ptr-set! font 58 (cast :u8 32))
+  ;; + (43) - offset 88
+  (ptr-set! font 89 16) (ptr-set! font 90 16) (ptr-set! font 91 124)
+  (ptr-set! font 92 16) (ptr-set! font 93 16)
 
-    ;; K (75) - offset 344
-    (ptr-set! font 344 (cast :u8 68))
-    (ptr-set! font 345 (cast :u8 72))
-    (ptr-set! font 346 (cast :u8 80))
-    (ptr-set! font 347 (cast :u8 96))
-    (ptr-set! font 348 (cast :u8 80))
-    (ptr-set! font 349 (cast :u8 72))
-    (ptr-set! font 350 (cast :u8 68))
+  ;; | (124) - offset 736
+  (ptr-set! font 736 16) (ptr-set! font 737 16) (ptr-set! font 738 16)
+  (ptr-set! font 739 16) (ptr-set! font 740 16) (ptr-set! font 741 16)
+  (ptr-set! font 742 16)
 
-    ;; G (71) - offset 312
-    (ptr-set! font 312 (cast :u8 56))
-    (ptr-set! font 313 (cast :u8 68))
-    (ptr-set! font 314 (cast :u8 64))
-    (ptr-set! font 315 (cast :u8 76))
-    (ptr-set! font 316 (cast :u8 68))
-    (ptr-set! font 317 (cast :u8 68))
-    (ptr-set! font 318 (cast :u8 56))
-
-    ;; F (70) - offset 304
-    (ptr-set! font 304 (cast :u8 124))
-    (ptr-set! font 305 (cast :u8 64))
-    (ptr-set! font 306 (cast :u8 64))
-    (ptr-set! font 307 (cast :u8 120))
-    (ptr-set! font 308 (cast :u8 64))
-    (ptr-set! font 309 (cast :u8 64))
-    (ptr-set! font 310 (cast :u8 64))))
+  ;; ' (39) - offset 56
+  (ptr-set! font 56 16) (ptr-set! font 57 16) (ptr-set! font 58 32))
 
 ;; Render a single character to the pixel buffer
-(defn render-char [font :ptr-u8, pixels :ptr-u32, ch :int, px :int, py :int] :void
-  (do
-    ;; Map Apple II char to font index
-    ;; Apple II "normal" mode: char & 0x7F, displayed if bit 7 set (inverse if clear)
-    (let idx (& ch 127))
-    (when (and (>= idx 32) (< idx 128))
-      (let font-off (* (- idx 32) 8))
-      (for [row 0 CHAR_H]
-        (let bits (cast :int (ptr-deref font (+ font-off row))))
-        (for [col 0 CHAR_W]
-          (let pixel-x (+ px col))
-          (let pixel-y (+ py row))
-          (when (and (< pixel-x SCREEN_W) (< pixel-y SCREEN_H))
-            (let bit (& (>> bits (- 6 col)) 1))
-            (let color (if (== bit 1) COLOR_FG COLOR_BG))
-            (ptr-set! pixels (+ (* pixel-y SCREEN_W) pixel-x) color)))))))
+(defn render-char [font, pixels, ch, px, py]
+  ;; Map Apple II char to font index
+  (let idx (& ch 127))
+  (when (and (>= idx 32) (< idx 128))
+    (let font-off (* (- idx 32) 8))
+    (for [row 0 CHAR_H]
+      (let bits (ptr-deref font (+ font-off row)))
+      (for [col 0 CHAR_W]
+        (let pixel-x (+ px col))
+        (let pixel-y (+ py row))
+        (when (and (< pixel-x SCREEN_W) (< pixel-y SCREEN_H))
+          (let bit (& (>> bits (- 6 col)) 1))
+          (let color (if (== bit 1) COLOR_FG COLOR_BG))
+          (ptr-set! pixels (+ (* pixel-y SCREEN_W) pixel-x) color))))))
 
 ;; Render the full 40x24 text screen
-(defn video-update [mem :ptr-u8, font :ptr-u8, pixels :ptr-u32] :void
-  (do
-    ;; Clear to black
-    (for [i 0 (* SCREEN_W SCREEN_H)]
-      (ptr-set! pixels i COLOR_BG))
-    ;; Render each character
-    (for [row 0 ROWS]
-      (let base (screen-addr row))
-      (for [col 0 COLS]
-        (let ch (mem-read mem (+ base col)))
-        (render-char font pixels ch (* col CHAR_W) (* row CHAR_H))))))
+(defn video-update [mem, font, pixels]
+  ;; Clear to black
+  (for [i 0 (* SCREEN_W SCREEN_H)]
+    (ptr-set! pixels i COLOR_BG))
+  ;; Render each character
+  (for [row 0 ROWS]
+    (let base (screen-addr row))
+    (for [col 0 COLS]
+      (let ch (mem-read mem (+ base col)))
+      (render-char font pixels ch (* col CHAR_W) (* row CHAR_H)))))

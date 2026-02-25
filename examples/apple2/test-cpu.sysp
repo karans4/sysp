@@ -1,5 +1,4 @@
 ;; test-cpu.sysp — Run Klaus Dormann's 6502 functional test (headless)
-;; Loads a 64KB binary, executes until PC loops, reports pass/fail
 
 (use "lib/sdl2.sysp")
 (use "mem.sysp")
@@ -7,77 +6,65 @@
 
 (include "stdio.h")
 
-;; The test succeeds when PC reaches the success trap (a JMP to itself)
-;; In Klaus' test, success is at the end — PC will loop on the same address
-
 (defn main [] :int
-  (do
-    ;; Allocate 64KB memory
-    (let mem (cast :ptr-u8 (malloc (cast :size 65536))))
-    (memset (cast :ptr-void mem) 0 (cast :size 65536))
+  ;; Allocate 64KB memory
+  (let mem (cast :ptr-u8 (malloc 65536)))
+  (memset (cast :ptr-void mem) 0 65536)
 
-    ;; Load the binary
-    (let fp (fopen "apple2/6502_functional_test.bin" "rb"))
-    (when (null? fp)
-      (printf "Failed to open 6502_functional_test.bin\\n")
-      (return 1))
-    (let bytes-read (fread (cast :ptr-void mem) (cast :size 1) (cast :size 65536) fp))
-    (fclose fp)
-    (printf "Loaded %d bytes\\n" (cast :int bytes-read))
+  ;; Load the binary
+  (let fp (fopen "apple2/6502_functional_test.bin" "rb"))
+  (when (null? fp)
+    (printf "Failed to open 6502_functional_test.bin\\n")
+    (return 1))
+  (let bytes-read (fread (cast :ptr-void mem) 1 65536 fp))
+  (fclose fp)
+  (printf "Loaded %d bytes\\n" (cast :int bytes-read))
 
-    ;; Init CPU — reset vector is embedded in the binary at $FFFC
-    (let-mut cpu (CPU 0 0 0 253
-                      0 36))
-    ;; Klaus' test starts at $0400, not from the reset vector
-    (set! cpu.pc 1024)
-    (printf "Starting test at PC=$%04X\\n" cpu.pc)
+  ;; Init CPU — Klaus' test starts at $0400
+  (let-mut cpu (CPU 0 0 0 253 0 36))
+  (set! cpu.pc 1024)
+  (printf "Starting test at PC=$%04X\\n" cpu.pc)
 
-    ;; Execute until PC loops (same address twice in a row)
-    (let-mut prev-pc -1)
-    (let-mut steps 0)
-    (let-mut stuck-count 0)
-    (let-mut done 0)
+  ;; Execute until PC loops (same address twice in a row)
+  (let-mut prev-pc -1)
+  (let-mut steps 0)
+  (let-mut stuck-count 0)
+  (let-mut done 0)
 
-    (while (== done 0)
-      (do
-        (let old-pc cpu.pc)
-        ;; Debug trace first 20 steps
-        (when (< steps 20)
-          (printf "  step %d: PC=$%04X op=%d A=%d X=%d Y=%d SP=%d P=%d\\n"
-                  steps cpu.pc
-                  (mem-read mem cpu.pc)
-                  cpu.a
-                  cpu.x
-                  cpu.y
-                  cpu.sp
-                  cpu.status))
-        (cpu-step (addr-of cpu) mem)
-        (set! steps (+ steps 1))
+  (while (== done 0)
+    (let old-pc cpu.pc)
+    ;; Debug trace first 20 steps
+    (when (< steps 20)
+      (printf "  step %d: PC=$%04X op=%d A=%d X=%d Y=%d SP=%d P=%d\\n"
+              steps cpu.pc
+              (mem-read mem cpu.pc)
+              cpu.a cpu.x cpu.y cpu.sp cpu.status))
+    (cpu-step (addr-of cpu) mem)
+    (set! steps (+ steps 1))
 
-        ;; Check if PC is stuck (looping on same instruction)
-        (if (== cpu.pc old-pc)
-          (do
-            (set! stuck-count (+ stuck-count 1))
-            (when (> stuck-count 2)
-              (printf "PC stuck at $%04X after %d steps\\n" cpu.pc steps)
-              (set! done 1)))
-          (set! stuck-count 0))
-
-        ;; Progress report every 10M steps
-        (when (== (% steps 10000000) 0)
-          (printf "  ... %dM steps, PC=$%04X\\n" (/ steps 1000000) cpu.pc))
-
-        ;; Safety limit
-        (when (> steps 500000000)
-          (printf "Timeout after %d steps, PC=$%04X\\n" steps cpu.pc)
-          (set! done 1))))
-
-    ;; The test succeeds if it reaches $3469 (the success trap in Klaus' test)
-    ;; Success trap is: JMP $3469 at address $3469
-    (if (== cpu.pc 13417)
-      (printf "PASSED! All 6502 tests passed (%d steps)\\n" steps)
+    ;; Check if PC is stuck
+    (if (== cpu.pc old-pc)
+      (set! stuck-count (+ stuck-count 1))
+      (when (> stuck-count 2)
+        (printf "PC stuck at $%04X after %d steps\\n" cpu.pc steps)
+        (set! done 1))
     else
-      (printf "FAILED at PC=$%04X after %d steps\\n" cpu.pc steps))
+      (set! stuck-count 0))
 
-    (free (cast :ptr-void mem))
-    0))
+    ;; Progress report every 10M steps
+    (when (== (% steps 10000000) 0)
+      (printf "  ... %dM steps, PC=$%04X\\n" (/ steps 1000000) cpu.pc))
+
+    ;; Safety limit
+    (when (> steps 500000000)
+      (printf "Timeout after %d steps, PC=$%04X\\n" steps cpu.pc)
+      (set! done 1)))
+
+  ;; Success = PC reaches $3469
+  (if (== cpu.pc 13417)
+    (printf "PASSED! All 6502 tests passed (%d steps)\\n" steps)
+  else
+    (printf "FAILED at PC=$%04X after %d steps\\n" cpu.pc steps))
+
+  (free (cast :ptr-void mem))
+  0)

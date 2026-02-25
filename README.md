@@ -1,6 +1,6 @@
 # sysp
 
-A systems Lisp that compiles to readable C. Designed for numerical computing and GPU work, where you want to generate specialized kernels at compile time using homoiconic macros. Manual memory management, Hindley-Milner type inference with monomorphization, and direct C generation with no runtime.
+A systems Lisp that compiles to readable C. Hindley-Milner type inference with monomorphization, homoiconic macros for compile-time code generation, and direct C output with no runtime. The inference engine resolves pointer types, struct fields, and numeric promotions — a 1600-line Apple II emulator compiles with zero type annotations.
 
 ## Prior Art
 
@@ -20,10 +20,10 @@ Most numerical computing is either written in C/CUDA (fast but verbose) or Pytho
 - **Symbols** as interned integers with compile-time symbol table
 - **Structs, enums, tuples, vectors, hash maps** with generated C type definitions
 - **Foreign function interface** — `extern` declarations, pointer types, casts
-- **Type inference** — Hindley-Milner unification with constraint generation
+- **Type inference** — Hindley-Milner with struct field reverse lookup, pointer element tracking, numeric promotion, void detection
 - **Tagged unions** — `deftype`, `(:union ...)`, pattern matching with `match`
 - **Closures** — fat pointers (`Fn = {fn, env}`), free variable analysis, direct call optimization
-- **Monomorphization** — polymorphic functions (`:?` type vars) stamped per concrete call site
+- **Monomorphization** — auto-polymorphic functions stamped per concrete call site (`:?` explicit or inferred)
 - **Threads** — `spawn`/`await` via pthreads, TLS-safe refcounting
 - **Condition system** — CL-style `restart-case`, `handler-bind`, `signal`, `invoke-restart`
 - **ARC memory** — `(new T args)` for RC-managed heap objects, escape analysis for stack promotion
@@ -36,44 +36,40 @@ Most numerical computing is either written in C/CUDA (fast but verbose) or Pytho
 
 ## Examples
 
+Types are inferred — annotations are optional. These are equivalent:
+
 ```lisp
+;; Fully annotated
 (defn clamp [x :int, lo :int, hi :int] :int
+  (if (< x lo) lo
+  elif (> x hi) hi
+  else x))
+
+;; No annotations — same generated C
+(defn clamp [x, lo, hi]
   (if (< x lo) lo
   elif (> x hi) hi
   else x))
 ```
 
-Compiles to:
 ```c
 int clamp(int x, int lo, int hi) {
-  if ((x < lo)) {
-    return lo;
-  } else if ((x > hi)) {
-    return hi;
-  } else {
-    return x;
-  }
+  if ((x < lo)) { return lo; }
+  else if ((x > hi)) { return hi; }
+  else { return x; }
 }
 ```
 
-Higher-order functions work as real values — `defn` functions are automatically wrapped into `Fn` structs when passed to polymorphic HOFs:
+Struct field access infers struct types via reverse lookup:
 
 ```lisp
-(use core)
+(struct Point [x :int, y :int])
 
-(defn double [x :int] :int (* x 2))
-(defn add [a :int, b :int] :int (+ a b))
-
-(defn main [] :int
-  (let v (vector 1 2 3 4 5))
-  (let doubled (map double v))        ;; (2 4 6 8 10)
-  (let evens (filter even? v))        ;; (2 4)
-  (let sum (reduce add 0 v))          ;; 15
-  (println sum)
-  0)
+(defn manhattan [p]        ;; p inferred as Point from field access
+  (+ p.x p.y))
 ```
 
-Closures capture their environment:
+Closures capture their environment as fat pointers:
 
 ```lisp
 (defn make-adder [n :int] :fn (:int) :int
@@ -83,6 +79,16 @@ Closures capture their environment:
   (let add5 (make-adder 5))
   (println (add5 10))  ;; 15
   0)
+```
+
+Compiles to a struct `{fn_ptr, env*}` — non-capturing lambdas get `NULL` env, no allocation. `recur` inside lambdas compiles to `goto`.
+
+Polymorphic functions auto-generalize and monomorphize:
+
+```lisp
+(defn identity [x] x)     ;; unconstrained → auto-poly
+(identity 42)              ;; instantiates identity_int
+(identity 3.14)            ;; instantiates identity_float
 ```
 
 Macros operate on s-expressions at compile time:
@@ -135,14 +141,14 @@ Standard library in `lib/`:
 
 ## Type System
 
-Gradual typing with Hindley-Milner inference and tagged unions:
+Hindley-Milner inference with monomorphization — annotations are optional:
 
+- **Inference**: pointer element types from `ptr-deref`/`ptr-set!`, struct types from field access (reverse lookup), numeric promotion across arithmetic/bitwise/branches, void detection for statement-ending functions
+- **Auto-polymorphism**: functions with unconstrained type variables auto-generalize; each call site instantiates a concrete monomorphized version
+- **Implicit coercion**: widening numeric conversions (int→float, u8→int) inserted automatically; narrowing (float→int) requires explicit `(cast :int ...)`
 - Unresolved types box into `Value` (tagged union: int, float, string, symbol, cons)
 - Resolved types generate specialized C: `Vector_int`, `Fn_int_int`, `Cons_int_symbol`
-- Polymorphic functions use `:?` type variables, monomorphized at call site
-- `deftype` for named type aliases and union types: `(deftype NumVal (:union :int :float))`
-- if/cond branches with different types automatically produce union types
-- `match` for pattern matching on unions and structs
+- `deftype` for named type aliases and union types, `match` for pattern matching
 
 ## Roadmap
 
@@ -166,7 +172,7 @@ Gradual typing with Hindley-Milner inference and tagged unions:
 
 ## Status
 
-Alpha. 35 tests, valgrind clean. Expect breaking changes.
+Alpha. 37 tests, valgrind clean. Expect breaking changes.
 
 ## Self-Hosting
 

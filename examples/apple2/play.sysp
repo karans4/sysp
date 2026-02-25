@@ -14,97 +14,92 @@
 (let SYSP_RENDERER_ACCEL :u32 2)
 (let SYSP_RENDERER_VSYNC :u32 4)
 (let SYSP_PIXFMT_ARGB :u32 372645892)
-(let SYSP_TEXACCESS_STREAM :int 1)
+(let SYSP_TEXACCESS_STREAM 1)
 
-(let SCALE :int 3)
-(let WIN_W :int 840)
-(let WIN_H :int 576)
-(let CYCLES_PER_FRAME :int 20000)
+(let SCALE 3)
+(let WIN_W 840)
+(let WIN_H 576)
+(let CYCLES_PER_FRAME 20000)
 
 (defn main [] :int
-  (do
-    (when (!= (SDL_Init SYSP_INIT_VIDEO) 0)
-      (printf "SDL_Init failed\\n")
-      (return 1))
+  (when (!= (SDL_Init SYSP_INIT_VIDEO) 0)
+    (printf "SDL_Init failed\\n")
+    (return 1))
 
-    (let window (SDL_CreateWindow "Apple II - Tic Tac Toe" 100 100 WIN_W WIN_H SYSP_WINDOW_SHOWN))
-    (when (null? window) (printf "Window failed\\n") (return 1))
+  (let window (SDL_CreateWindow "Apple II - Tic Tac Toe" 100 100 WIN_W WIN_H SYSP_WINDOW_SHOWN))
+  (when (null? window) (printf "Window failed\\n") (return 1))
 
-    (let renderer (SDL_CreateRenderer window -1
-                    (| SYSP_RENDERER_ACCEL SYSP_RENDERER_VSYNC)))
-    (when (null? renderer) (printf "Renderer failed\\n") (return 1))
+  (let renderer (SDL_CreateRenderer window -1
+                  (| SYSP_RENDERER_ACCEL SYSP_RENDERER_VSYNC)))
+  (when (null? renderer) (printf "Renderer failed\\n") (return 1))
 
-    (let texture (SDL_CreateTexture renderer SYSP_PIXFMT_ARGB
-                    SYSP_TEXACCESS_STREAM SCREEN_W SCREEN_H))
+  (let texture (SDL_CreateTexture renderer SYSP_PIXFMT_ARGB
+                  SYSP_TEXACCESS_STREAM SCREEN_W SCREEN_H))
 
-    ;; 64KB memory
-    (let mem (cast :ptr-u8 (malloc (cast :size 65536))))
-    (memset (cast :ptr-void mem) 0 (cast :size 65536))
+  ;; 64KB memory
+  (let mem (cast :ptr-u8 (malloc 65536)))
+  (memset (cast :ptr-void mem) 0 65536)
 
-    ;; Load binary at $0800
-    (let fp (fopen "apple2/tictactoe.bin" "rb"))
-    (when (null? fp)
-      (printf "Failed to open apple2/tictactoe.bin\\n")
-      (return 1))
-    ;; Read into temp buffer, copy to mem at offset $0800
-    (let tmpbuf (cast :ptr-u8 (malloc (cast :size 8192))))
-    (let nbytes (fread (cast :ptr-void tmpbuf) (cast :size 1) (cast :size 8192) fp))
-    (fclose fp)
-    (printf "Loaded %d bytes at $0800\\n" (cast :int nbytes))
-    (for [i 0 (cast :int nbytes)]
-      (ptr-set! mem (+ 2048 i) (ptr-deref tmpbuf i)))
-    (free (cast :ptr-void tmpbuf))
+  ;; Load binary at $0800
+  (let fp (fopen "apple2/tictactoe.bin" "rb"))
+  (when (null? fp)
+    (printf "Failed to open apple2/tictactoe.bin\\n")
+    (return 1))
+  (let tmpbuf (cast :ptr-u8 (malloc 8192)))
+  (let nbytes (fread (cast :ptr-void tmpbuf) 1 8192 fp))
+  (fclose fp)
+  (printf "Loaded %d bytes at $0800\\n" (cast :int nbytes))
+  (for [i 0 (cast :int nbytes)]
+    (ptr-set! mem (+ 2048 i) (ptr-deref tmpbuf i)))
+  (free (cast :ptr-void tmpbuf))
 
-    ;; Pixel buffer
-    (let pixels (cast :ptr-u32 (malloc (cast :size (* (* SCREEN_W SCREEN_H) 4)))))
+  ;; Pixel buffer
+  (let pixels (cast :ptr-u32 (malloc (* SCREEN_W SCREEN_H 4))))
 
-    ;; Font
-    (let font (cast :ptr-u8 (malloc (cast :size 768))))
-    (memset (cast :ptr-void font) 0 (cast :size 768))
-    (font-init font)
+  ;; Font
+  (let font (cast :ptr-u8 (malloc 768)))
+  (memset (cast :ptr-void font) 0 768)
+  (font-init font)
 
-    ;; Event buffer
-    (let event-buf (cast :ptr-u8 (malloc (cast :size 64))))
+  ;; Event buffer
+  (let event-buf (cast :ptr-u8 (malloc 64)))
 
-    ;; CPU: start at $0800
-    (let-mut cpu (CPU 0 0 0 253
-                      0 36))
-    (set! cpu.pc 2048)
+  ;; CPU: start at $0800
+  (let-mut cpu (CPU 0 0 0 253 0 36))
+  (set! cpu.pc 2048)
 
-    ;; Main loop
-    (let-mut running 1)
-    (while running
-      (do
-        (when (input-poll mem event-buf)
-          (set! running 0))
+  ;; Main loop
+  (let-mut running 1)
+  (while running
+    (when (input-poll mem event-buf)
+      (set! running 0))
 
-        ;; Execute CPU cycles
-        (let-mut cycles 0)
-        (while (< cycles CYCLES_PER_FRAME)
-          (let c (cpu-step (addr-of cpu) mem))
-          (if (> c 0)
-            (set! cycles (+ cycles c))
-          else
-            (do
-              (printf "Bad opcode at PC=$%04X\\n" cpu.pc)
-              (set! running 0)
-              (set! cycles CYCLES_PER_FRAME))))
+    ;; Execute CPU cycles
+    (let-mut cycles 0)
+    (while (< cycles CYCLES_PER_FRAME)
+      (let c (cpu-step (addr-of cpu) mem))
+      (if (> c 0)
+        (set! cycles (+ cycles c))
+      else
+        (printf "Bad opcode at PC=$%04X\\n" cpu.pc)
+        (set! running 0)
+        (set! cycles CYCLES_PER_FRAME)))
 
-        ;; Render
-        (video-update mem font pixels)
-        (SDL_UpdateTexture texture (cast :ptr-void 0) (cast :ptr-void pixels)
-                           (* SCREEN_W 4))
-        (SDL_RenderClear renderer)
-        (SDL_RenderCopy renderer texture (cast :ptr-void 0) (cast :ptr-void 0))
-        (SDL_RenderPresent renderer)))
+    ;; Render
+    (video-update mem font pixels)
+    (SDL_UpdateTexture texture (cast :ptr-void 0) (cast :ptr-void pixels)
+                       (* SCREEN_W 4))
+    (SDL_RenderClear renderer)
+    (SDL_RenderCopy renderer texture (cast :ptr-void 0) (cast :ptr-void 0))
+    (SDL_RenderPresent renderer))
 
-    ;; Cleanup
-    (free (cast :ptr-void event-buf))
-    (free (cast :ptr-void font))
-    (free (cast :ptr-void pixels))
-    (free (cast :ptr-void mem))
-    (SDL_DestroyTexture texture)
-    (SDL_DestroyRenderer renderer)
-    (SDL_DestroyWindow window)
-    (SDL_Quit)
-    0))
+  ;; Cleanup
+  (free (cast :ptr-void event-buf))
+  (free (cast :ptr-void font))
+  (free (cast :ptr-void pixels))
+  (free (cast :ptr-void mem))
+  (SDL_DestroyTexture texture)
+  (SDL_DestroyRenderer renderer)
+  (SDL_DestroyWindow window)
+  (SDL_Quit)
+  0)

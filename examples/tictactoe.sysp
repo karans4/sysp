@@ -1,5 +1,5 @@
-;;; Tic Tac Toe in sysp — proof of concept
-;;; Compiles to C, uses raylib for graphics
+;;; Tic Tac Toe in sysp
+;;; No type annotations needed — HM inference handles everything
 
 (use raylib)
 
@@ -9,74 +9,70 @@
 (enum GameState [PLAYING 0] [WON 1] [DRAW 2])
 
 ;; Constants
-(let WINDOW_SIZE :int 600)
-(let CELL_SIZE :int 200)
-(let LINE_THICK :int 4)
-(let LEFT_CLICK :int 0)
-(let FLAG_MSAA :int 32)
+(let WINDOW_SIZE 600)
+(let CELL_SIZE 200)
+(let LINE_THICK 4)
+(let LEFT_CLICK 0)
+(let FLAG_MSAA 32)
 
 ;; Check if a player has won. Returns the winning Square or EMPTY.
-(defn check-winner [board :ptr-int] :int
+(defn check-winner [board]
   ;; Rows
   (for [i 0 3]
     (let idx (* i 3))
-    (when (and (!= (array-ref board idx) EMPTY)
-              (== (array-ref board idx) (array-ref board (+ idx 1)))
-              (== (array-ref board idx) (array-ref board (+ idx 2))))
-      (return (array-ref board idx))))
+    (when (and (!= (nth board idx) EMPTY)
+              (== (nth board idx) (nth board (+ idx 1)))
+              (== (nth board idx) (nth board (+ idx 2))))
+      (return (nth board idx))))
   ;; Columns
   (for [j 0 3]
-    (when (and (!= (array-ref board j) EMPTY)
-              (== (array-ref board j) (array-ref board (+ j 3)))
-              (== (array-ref board j) (array-ref board (+ j 6))))
-      (return (array-ref board j))))
+    (when (and (!= (nth board j) EMPTY)
+              (== (nth board j) (nth board (+ j 3)))
+              (== (nth board j) (nth board (+ j 6))))
+      (return (nth board j))))
   ;; Diagonals
-  (when (and (!= (array-ref board 0) EMPTY)
-            (== (array-ref board 0) (array-ref board 4))
-            (== (array-ref board 0) (array-ref board 8)))
-    (return (array-ref board 0)))
-  (when (and (!= (array-ref board 2) EMPTY)
-            (== (array-ref board 2) (array-ref board 4))
-            (== (array-ref board 2) (array-ref board 6)))
-    (return (array-ref board 2)))
+  (when (and (!= (nth board 0) EMPTY)
+            (== (nth board 0) (nth board 4))
+            (== (nth board 0) (nth board 8)))
+    (return (nth board 0)))
+  (when (and (!= (nth board 2) EMPTY)
+            (== (nth board 2) (nth board 4))
+            (== (nth board 2) (nth board 6)))
+    (return (nth board 2)))
   EMPTY)
 
 ;; Check if board is full
-(defn board-full [board :ptr-int] :int
+(defn board-full [board]
   (for [i 0 9]
-    (when (== (array-ref board i) EMPTY)
+    (when (== (nth board i) EMPTY)
       (return 0)))
   1)
 
 ;; Draw an X in a cell
-(defn draw-x [col :int, row :int, color :Color] :void
+(defn draw-x [col, row, color]
   (let pad 30)
   (let x1 (+ (* col CELL_SIZE) pad))
   (let y1 (+ (* row CELL_SIZE) pad))
   (let x2 (- (* (+ col 1) CELL_SIZE) pad))
   (let y2 (- (* (+ row 1) CELL_SIZE) pad))
-  (DrawLineEx (Vector2 (cast :f32 x1) (cast :f32 y1))
-              (Vector2 (cast :f32 x2) (cast :f32 y2))
-              (cast :f32 LINE_THICK) color)
-  (DrawLineEx (Vector2 (cast :f32 x2) (cast :f32 y1))
-              (Vector2 (cast :f32 x1) (cast :f32 y2))
-              (cast :f32 LINE_THICK) color))
+  (DrawLineEx (Vector2 x1 y1) (Vector2 x2 y2) LINE_THICK color)
+  (DrawLineEx (Vector2 x2 y1) (Vector2 x1 y2) LINE_THICK color))
 
 ;; Draw an O in a cell
-(defn draw-o [col :int, row :int, color :Color] :void
-  (let cx (cast :f32 (+ (* col CELL_SIZE) (/ CELL_SIZE 2))))
-  (let cy (cast :f32 (+ (* row CELL_SIZE) (/ CELL_SIZE 2))))
-  (let radius (cast :f32 (- (/ CELL_SIZE 2) 30)))
-  (let half-thick (cast :f32 (/ LINE_THICK 2)))
+(defn draw-o [col, row, color]
+  (let cx (+ (* col CELL_SIZE) (/ CELL_SIZE 2)))
+  (let cy (+ (* row CELL_SIZE) (/ CELL_SIZE 2)))
+  (let radius (- (/ CELL_SIZE 2) 30))
+  (let half-thick (/ LINE_THICK 2))
   (DrawRing (Vector2 cx cy) (- radius half-thick) (+ radius half-thick)
             0.0 360.0 36 color))
 
 ;; Draw the grid lines
-(defn draw-grid [color :Color] :void
-  (let thick (cast :f32 LINE_THICK))
-  (let size (cast :f32 WINDOW_SIZE))
-  (let c1 (cast :f32 CELL_SIZE))
-  (let c2 (cast :f32 (* CELL_SIZE 2)))
+(defn draw-grid [color]
+  (let thick LINE_THICK)
+  (let size WINDOW_SIZE)
+  (let c1 CELL_SIZE)
+  (let c2 (* CELL_SIZE 2))
   ;; Vertical
   (DrawLineEx (Vector2 c1 0.0) (Vector2 c1 size) thick color)
   (DrawLineEx (Vector2 c2 0.0) (Vector2 c2 size) thick color)
@@ -91,9 +87,9 @@
   (SetTargetFPS 60)
 
   (let board (make-array :int 9))
-  (let-mut turn :int PLAYER_X)
-  (let-mut state :int PLAYING)
-  (let-mut winner :int EMPTY)
+  (let-mut turn PLAYER_X)
+  (let-mut state PLAYING)
+  (let-mut winner EMPTY)
 
   (let white (Color 245 245 245 255))
   (let dark-bg (Color 0 0 0 255))
@@ -106,11 +102,11 @@
     (if (== state PLAYING)
       (when (IsMouseButtonPressed LEFT_CLICK)
         (let mouse (GetMousePosition))
-        (let col (cast :int (/ mouse.x (cast :f32 CELL_SIZE))))
-        (let row (cast :int (/ mouse.y (cast :f32 CELL_SIZE))))
+        (let col (cast :int (/ mouse.x CELL_SIZE)))
+        (let row (cast :int (/ mouse.y CELL_SIZE)))
         (when (and (>= col 0) (< col 3) (>= row 0) (< row 3))
           (let idx (+ (* row 3) col))
-          (when (== (array-ref board idx) EMPTY)
+          (when (== (nth board idx) EMPTY)
             (array-set! board idx (if (== turn PLAYER_X) X_PIECE O_PIECE))
             (set! winner (check-winner board))
             (if (!= winner EMPTY)
@@ -138,8 +134,8 @@
       (let col (mod i 3))
       (let row (/ i 3))
       (cond
-        [(== (array-ref board i) X_PIECE) (draw-x col row red)]
-        [(== (array-ref board i) O_PIECE) (draw-o col row blue)]))
+        [(== (nth board i) X_PIECE) (draw-x col row red)]
+        [(== (nth board i) O_PIECE) (draw-o col row blue)]))
 
     (when (== state PLAYING)
       (if (== turn PLAYER_X)
