@@ -1,5 +1,7 @@
 ;; test-variadic.sysp — variadic arithmetic, chained comparisons, bare enums, new string ops
 
+(use strings)
+
 (enum Dir North, South, East, West)
 
 (defn main () :int

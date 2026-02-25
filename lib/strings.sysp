@@ -1,0 +1,35 @@
+;; strings.sysp — string query operations as library functions
+;; Allocating ops (str-concat, str-slice, etc.) remain as compiler builtins.
+
+(include "string.h")
+
+(extern strlen [s :str] :int)
+(extern strcmp [a :str, b :str] :int)
+(extern strncmp [a :str, b :str, n :int] :int)
+(extern strstr [s :str, sub :str] :str)
+
+(defn str-len [s :str] :int
+  (strlen s))
+
+(defn str-ref [s :str, i :int] :char
+  (array-ref (cast (:ptr :char) s) i))
+
+(defn str-eq? [a :str, b :str] :bool
+  (== (strcmp a b) 0))
+
+(defn str-contains? [s :str, sub :str] :bool
+  (!= (cast :intptr (strstr s sub)) 0))
+
+(defn str-starts? [s :str, pre :str] :bool
+  (== (strncmp s pre (strlen pre)) 0))
+
+(defn str-ends? [s :str, sfx :str] :bool
+  (let slen (strlen s))
+  (let flen (strlen sfx))
+  (and (>= slen flen) (== (strcmp (ptr+ s (- slen flen)) sfx) 0)))
+
+(defn str-find [s :str, sub :str] :int
+  (let p (strstr s sub))
+  (if (!= (cast :intptr p) 0)
+    (cast :int (- (cast :intptr p) (cast :intptr s)))
+    -1))

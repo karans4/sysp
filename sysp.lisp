@@ -548,10 +548,6 @@
       ((sym= head "hash-del!")
        (dolist (e (cdr form)) (infer-expr e)) :void)
 
-      ;; hash-len: int
-      ((sym= head "hash-len")
-       (infer-expr (second form)) :int)
-
       ;; hash-keys: (:vector K)
       ((sym= head "hash-keys")
        (let ((mt (infer-expr (second form))))
@@ -663,12 +659,7 @@
       ((sym= head "sym-eq?") :bool)
       ((sym= head "gensym") :value)
 
-      ;; String builtins
-      ((sym= head "str-len") (infer-expr (second form)) :int)
-      ((sym= head "str-ref") (infer-expr (second form)) (infer-expr (third form)) :char)
-      ((sym= head "str-eq?") (infer-expr (second form)) (infer-expr (third form)) :bool)
-      ((sym= head "str-contains?") (infer-expr (second form)) (infer-expr (third form)) :bool)
-      ((sym= head "str-find") (infer-expr (second form)) (infer-expr (third form)) :int)
+      ;; String builtins (allocating ops that remain in compiler)
       ((sym= head "str-concat") (infer-expr (second form)) (infer-expr (third form)) :str)
       ((sym= head "str-slice") (dolist (e (cdr form)) (infer-expr e)) :str)
       ((sym= head "str-upper") (infer-expr (second form)) :str)
@@ -677,8 +668,6 @@
       ((sym= head "str-from-int") (infer-expr (second form)) :str)
       ((sym= head "str-from-float") (infer-expr (second form)) :str)
       ((sym= head "str-join") (infer-expr (second form)) (infer-expr (third form)) :str)
-      ((sym= head "str-starts?") (infer-expr (second form)) (infer-expr (third form)) :bool)
-      ((sym= head "str-ends?") (infer-expr (second form)) (infer-expr (third form)) :bool)
       ((sym= head "str-trim") (infer-expr (second form)) :str)
       ((sym= head "str-replace") (dolist (e (cdr form)) (infer-expr e)) :str)
       ((sym= head "fmt") :str)  ; format string interpolation always returns :str
@@ -2104,7 +2093,7 @@
                   (list 'do
                         (list 'let fm m)
                         (list 'let fk (list 'hash-keys fm))
-                        (list* 'for (list fi 0 (list 'vector-len fk))
+                        (list* 'for (list fi 0 (list 'len fk))
                                (list 'let k (list 'vector-ref fk fi))
                                (list 'let v (list 'hash-get fm k))
                                body)))
@@ -2113,7 +2102,7 @@
                       (collection (second spec))
                       (idx (intern (format nil "_fe~d" (incf *sysp-gensym-counter*)))))
                   (list 'do
-                        (list* 'for (list idx 0 (list 'vector-len collection))
+                        (list* 'for (list idx 0 (list 'len collection))
                                (cons (list 'let var (list 'vector-ref collection idx))
                                      body))))))))
   ;; map, filter, reduce: now real poly defn functions in lib/core.sysp
@@ -2140,7 +2129,7 @@
                 (idx (intern (format nil "_mi~d" (incf *sysp-gensym-counter*)))))
             (list 'do
                   (list 'let kv (list 'hash-keys (third form)))
-                  (list 'for (list idx 0 (list 'vector-len kv))
+                  (list 'for (list idx 0 (list 'len kv))
                         (list 'let k (list 'vector-ref kv idx))
                         (list 'hash-set! (second form) k (list 'hash-get (third form) k)))))))
 
@@ -2156,7 +2145,7 @@
             (list 'do
                   (list 'let sv vec)
                   (list 'let-mut r 0)
-                  (list 'for (list idx 0 (list 'vector-len sv))
+                  (list 'for (list idx 0 (list 'len sv))
                         (list 'when (list pred (list 'vector-ref sv idx))
                               (list 'set! r 1)
                               '(break)))
@@ -2172,7 +2161,7 @@
             (list 'do
                   (list 'let ev vec)
                   (list 'let-mut r 1)
-                  (list 'for (list idx 0 (list 'vector-len ev))
+                  (list 'for (list idx 0 (list 'len ev))
                         (list 'when (list 'not (list pred (list 'vector-ref ev idx)))
                               (list 'set! r 0)
                               '(break)))
@@ -2199,7 +2188,7 @@
             (list 'do
                   (list 'let rv vec)
                   (list 'let-mut result (list '|Vector|))
-                  (list 'for (list idx 0 (list 'vector-len rv))
+                  (list 'for (list idx 0 (list 'len rv))
                         (list 'let elem (list 'vector-ref rv idx))
                         (list 'when (list 'not (list pred elem))
                               (list 'vector-push! result elem)))
@@ -2216,7 +2205,7 @@
             (list 'do
                   (list 'let tv vec)
                   (list 'let-mut result (list '|Vector|))
-                  (list 'let lim (list 'if (list '< n (list 'vector-len tv)) n (list 'vector-len tv)))
+                  (list 'let lim (list 'if (list '< n (list 'len tv)) n (list 'len tv)))
                   (list 'for (list idx 0 lim)
                         (list 'vector-push! result (list 'vector-ref tv idx)))
                   result))))
@@ -2231,7 +2220,7 @@
             (list 'do
                   (list 'let dv vec)
                   (list 'let-mut result (list '|Vector|))
-                  (list 'for (list idx n (list 'vector-len dv))
+                  (list 'for (list idx n (list 'len dv))
                         (list 'vector-push! result (list 'vector-ref dv idx)))
                   result))))
   ;; take-while: (take-while pred vec)
@@ -2246,7 +2235,7 @@
             (list 'do
                   (list 'let twv vec)
                   (list 'let-mut result (list '|Vector|))
-                  (list 'for (list idx 0 (list 'vector-len twv))
+                  (list 'for (list idx 0 (list 'len twv))
                         (list 'let elem (list 'vector-ref twv idx))
                         (list 'when (list 'not (list pred elem))
                               '(break))
@@ -2265,7 +2254,7 @@
                   (list 'let dwv vec)
                   (list 'let-mut result (list '|Vector|))
                   (list 'let-mut dropping 1)
-                  (list 'for (list idx 0 (list 'vector-len dwv))
+                  (list 'for (list idx 0 (list 'len dwv))
                         (list 'when (list 'and dropping (list 'not (list pred (list 'vector-ref dwv idx))))
                               (list 'set! dropping 0))
                         (list 'when (list 'not dropping)
@@ -2314,7 +2303,7 @@
             (list 'do
                   (list 'let rvv vec)
                   (list 'let-mut result (list '|Vector|))
-                  (list 'let ln (list 'vector-len rvv))
+                  (list 'let ln (list 'len rvv))
                   (list 'for (list idx 0 ln)
                         (list 'vector-push! result (list 'vector-ref rvv (list '- (list '- ln 1) idx))))
                   result))))
@@ -2331,9 +2320,9 @@
                   (list 'let cv1 v1)
                   (list 'let cv2 v2)
                   (list 'let-mut result (list '|Vector|))
-                  (list 'for (list idx 0 (list 'vector-len cv1))
+                  (list 'for (list idx 0 (list 'len cv1))
                         (list 'vector-push! result (list 'vector-ref cv1 idx)))
-                  (list 'for (list idx 0 (list 'vector-len cv2))
+                  (list 'for (list idx 0 (list 'len cv2))
                         (list 'vector-push! result (list 'vector-ref cv2 idx)))
                   result))))
 
@@ -2343,15 +2332,15 @@
         (lambda (form) (list 'vector-ref (second form) 0)))
   ;; last: (last vec) => (vector-ref vec (- (vector-len vec) 1))
   (setf (gethash "last" *macros*)
-        (lambda (form) (list 'vector-ref (second form) (list '- (list 'vector-len (second form)) 1))))
+        (lambda (form) (list 'vector-ref (second form) (list '- (list 'len (second form)) 1))))
   ;; nth is now a builtin in *expr-dispatch* — dispatches by type
   ;; (kept as comment for history)
   ;; count: (count vec) => (vector-len vec)
   (setf (gethash "count" *macros*)
-        (lambda (form) (list 'vector-len (second form))))
+        (lambda (form) (list 'len (second form))))
   ;; empty?: (empty? vec) => (== (vector-len vec) 0)
   (setf (gethash "empty?" *macros*)
-        (lambda (form) (list '== (list 'vector-len (second form)) 0)))
+        (lambda (form) (list '== (list 'len (second form)) 0)))
 
   ;; === Hash-map dependent collection macros ===
   ;; distinct: (distinct vec) => use hash-map as seen set
@@ -2369,7 +2358,7 @@
                   (list 'let vref vec)
                   (list 'let-mut result (list '|Vector| (list 'vector-ref vref 0)))
                   (list 'let-mut seen (list '|HashMap| (list 'vector-ref vref 0) 1))
-                  (list 'for (list idx 1 (list 'vector-len vref))
+                  (list 'for (list idx 1 (list 'len vref))
                         (list 'let elem (list 'vector-ref vref idx))
                         (list 'when (list 'not (list 'hash-has? seen elem))
                               (list 'hash-set! seen elem 1)
@@ -2387,7 +2376,7 @@
             (list 'do
                   (list 'let vref vec)
                   (list 'let-mut m (list '|HashMap| (list 'vector-ref vref 0) 1))
-                  (list 'for (list idx 1 (list 'vector-len vref))
+                  (list 'for (list idx 1 (list 'len vref))
                         (list 'let elem (list 'vector-ref vref idx))
                         (list 'if (list 'hash-has? m elem)
                               (list 'hash-set! m elem (list '+ (list 'hash-get m elem) 1))
@@ -3136,7 +3125,6 @@
     ("HashMap" . compile-hash-map)
     ("hash-get" . compile-hash-get) ("hash-set!" . compile-hash-set)
     ("hash-has?" . compile-hash-has) ("hash-del!" . compile-hash-del)
-    ("hash-len" . compile-hash-len)
     ("hash-keys" . compile-hash-keys) ("hash-vals" . compile-hash-vals)
     ("tuple" . compile-tuple) ("tuple-ref" . compile-tuple-ref)
     ("lambda" . compile-lambda)
@@ -3168,15 +3156,12 @@
     ("c-tmpl" . compile-c-tmpl-expr)
     ("ptr+" . compile-ptr-add)
     ("ptr-to" . compile-ptr-to)
-    ("str-len" . compile-str-len) ("str-ref" . compile-str-ref)
-    ("str-eq?" . compile-str-eq) ("str-contains?" . compile-str-contains)
-    ("str-find" . compile-str-find) ("str-concat" . compile-str-concat)
+    ("str-concat" . compile-str-concat)
     ("str-slice" . compile-str-slice) ("str-upper" . compile-str-upper)
     ("str-lower" . compile-str-lower) ("str-split" . compile-str-split)
     ("str-from-int" . compile-str-from-int) ("str-from-float" . compile-str-from-float)
-    ("str-join" . compile-str-join) ("str-starts?" . compile-str-starts)
-    ("str-ends?" . compile-str-ends) ("str-trim" . compile-str-trim)
-    ("str-replace" . compile-str-replace)
+    ("str-join" . compile-str-join)
+    ("str-trim" . compile-str-trim) ("str-replace" . compile-str-replace)
     ("fmt" . compile-fmt)
     ("nth" . compile-nth)
     ("asm!" . compile-asm-expr)
@@ -8268,34 +8253,9 @@
   (register-builtin-poly-fns))
 
 (defun register-builtin-poly-fns ()
-  "Register poly-fn versions of vector/hashmap operations that replace builtins.
-   These use get/array-ref/array-set! which work on any struct with the right fields."
-  ;; vector-ref: (defn vector-ref [v :? i :int] :? (array-ref (get v data) i))
-  ;; Note: use UPPERCASE keywords to match CL's default readtable (parse-type-annotation expects :INT not :|int|)
-  (setf (gethash "vector-ref" *poly-fns*)
-        (list (list (intern "v" :sysp) (intern "?" :keyword)
-                    (intern "i" :sysp) (intern "INT" :keyword))
-              :poly
-              (list (list (intern "array-ref" :sysp)
-                          (list (intern "get" :sysp) (intern "v" :sysp) (intern "data" :sysp))
-                          (intern "i" :sysp)))))
-  (setf (gethash "vector-ref" *auto-poly-fns*) t)
-  ;; vector-len: (defn vector-len [v :?] :int (get v len))
-  (setf (gethash "vector-len" *poly-fns*)
-        (list (list (intern "v" :sysp) (intern "?" :keyword))
-              (intern "INT" :keyword)
-              (list (list (intern "get" :sysp) (intern "v" :sysp) (intern "len" :sysp)))))
-  (setf (gethash "vector-len" *auto-poly-fns*) t)
-  ;; vector-set!: (defn vector-set! [v :? i :int val :?] :? (array-set! (get v data) i val))
-  (setf (gethash "vector-set!" *poly-fns*)
-        (list (list (intern "v" :sysp) (intern "?" :keyword)
-                    (intern "i" :sysp) (intern "INT" :keyword)
-                    (intern "val" :sysp) (intern "?" :keyword))
-              :poly
-              (list (list (intern "array-set!" :sysp)
-                          (list (intern "get" :sysp) (intern "v" :sysp) (intern "data" :sysp))
-                          (intern "i" :sysp) (intern "val" :sysp)))))
-  (setf (gethash "vector-set!" *auto-poly-fns*) t))
+  "No-op: all poly-fns now live in library files (collections.sysp, strings.sysp).
+   Kept as hook point for future compiler-level poly-fns if needed."
+  nil)
 
 ;;; === Escape Analysis ===
 
@@ -8358,16 +8318,15 @@
                                          "cond" "match" "+" "-" "*" "/" "%" "=" "!=" "<" ">" "<=" ">="
                                          "and" "or" "not" "cast" "addr-of" "sizeof" "deref"
                                          "array-ref" "array-set!" "vector-ref" "vector-set!"
-                                         "vector-len" "vector-push!" "vector-free"
+                                         "vector-push!" "vector-free" "len"
                                          "hash-get" "hash-set!" "hash-has?" "hash-del!"
-                                         "hash-len" "hash-keys" "hash-vals" "hash-free"
+                                         "hash-keys" "hash-vals" "hash-free"
                                          "inc" "dec" "bit-and" "bit-or" "bit-xor" "bit-not"
                                          "bit-shl" "bit-shr" "&" "|" "^" "~" "<<" ">>" "new" "recur" "break" "continue"
                                          "block" "runtype" "as" "Vector" "HashMap"
-                                         "str-len" "str-ref" "str-eq?" "str-contains?" "str-find"
                                          "str-concat" "str-slice" "str-upper" "str-lower"
                                          "str-split" "str-from-int" "str-from-float"
-                                         "str-join" "str-starts?" "str-ends?" "str-trim" "str-replace"
+                                         "str-join" "str-trim" "str-replace"
                                          "nth" "asm!" "values" "let-values")
                                        :test #'equal))
                                  ;; Also safe: any known macro (expands inline)
@@ -8409,15 +8368,14 @@
     ((not (listp arg)) nil)
     (t (let* ((head (first arg))
               (h (and (symbolp head) (string-downcase (string head)))))
-         (if (and h (member h '("vector-ref" "vector-len" "vector-set!"
-                                 "vector-push!" "vector-free"
+         (if (and h (member h '("vector-ref" "vector-set!"
+                                 "vector-push!" "vector-free" "len"
                                  "hash-get" "hash-has?" "hash-del!"
-                                 "hash-len" "hash-keys" "hash-vals" "hash-free"
+                                 "hash-keys" "hash-vals" "hash-free"
                                  "hash-set!" "array-ref" "array-set!" "get"
-                                 "str-len" "str-ref" "str-eq?" "str-contains?" "str-find"
                                  "str-concat" "str-slice" "str-upper" "str-lower"
                                  "str-split" "str-from-int" "str-from-float"
-                                 "str-join" "str-starts?" "str-ends?" "str-trim" "str-replace")
+                                 "str-join" "str-trim" "str-replace")
                             :test #'equal))
              nil  ; extraction: var is accessed, not leaked
              (some (lambda (f) (var-escapes-through-arg-p f var-name))

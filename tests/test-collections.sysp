@@ -1,5 +1,7 @@
 ;; test-collections.sysp — Clojure-style collection toolkit
 
+(use collections)
+
 (defn pos? (x :int) :bool (> x 0))
 (defn even? (x :int) :bool (== (% x 2) 0))
 (defn odd? (x :int) :bool (!= (% x 2) 0))

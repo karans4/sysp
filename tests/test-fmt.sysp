@@ -1,5 +1,7 @@
 ;; test-fmt.sysp — string interpolation
 
+(use strings)
+
 (defn test-basic [] :int
   (let name "world")
   (let s (fmt "hello {name}"))

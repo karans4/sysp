@@ -1,12 +1,14 @@
 ;; test-hashmap.sysp — hash map CRUD, merge, keys/vals, contains
 
+(use collections)
+
 (defn main () :int
   ;; Basic creation and set/get
   (let-mut m (HashMap "x" 10 "y" 20 "z" 30))
   (println (hash-get m "x"))   ; 10
   (println (hash-get m "y"))   ; 20
   (println (hash-get m "z"))   ; 30
-  (println (hash-len m))       ; 3
+  (println (len m))       ; 3
 
   ;; Update existing key
   (hash-set! m "x" 99)
@@ -19,7 +21,7 @@
 
   ;; Delete
   (hash-del! m "y")
-  (println (hash-len m))       ; 2
+  (println (len m))       ; 2
   (println (hash-has? m "y"))  ; false
 
   ;; Clojure aliases
@@ -33,20 +35,20 @@
   (println (hash-get m2 1))   ; 100
   (println (hash-get m2 3))   ; 300
   (hash-set! m2 4 400)
-  (println (hash-len m2))     ; 4
+  (println (len m2))     ; 4
 
   ;; keys and vals
   (let-mut m3 (HashMap "a" 1 "b" 2))
   (let ks (hash-keys m3))
   (let vs (hash-vals m3))
-  (println (vector-len ks))   ; 2
-  (println (vector-len vs))   ; 2
+  (println (len ks))   ; 2
+  (println (len vs))   ; 2
 
   ;; merge
   (let-mut m4 (HashMap "x" 1))
   (let-mut m5 (HashMap "y" 2 "z" 3))
   (merge! m4 m5)
-  (println (hash-len m4))     ; 3
+  (println (len m4))     ; 3
   (println (hash-get m4 "y")) ; 2
   (println (hash-get m4 "z")) ; 3
 

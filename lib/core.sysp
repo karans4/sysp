@@ -1,5 +1,7 @@
 ;; core.sysp — standard predicates and utilities
 
+(use collections)
+
 (defn identity [x :?] :? x)
 (defn zero? [x :int] :bool (== x 0))
 (defn pos? [x :int] :bool (> x 0))
@@ -18,14 +20,14 @@
 (defn map [f :? v :?] :?
   (do
     (let-mut result (Vector))
-    (for [i 0 (vector-len v)]
+    (for [i 0 (len v)]
       (vector-push! result (f (vector-ref v i))))
     result))
 
 (defn filter [pred :? v :?] :?
   (do
     (let-mut result (Vector))
-    (for [i 0 (vector-len v)]
+    (for [i 0 (len v)]
       (do
         (let elem (vector-ref v i))
         (when (pred elem)
@@ -35,6 +37,6 @@
 (defn reduce [f :? init :? v :?] :?
   (do
     (let-mut acc init)
-    (for [i 0 (vector-len v)]
+    (for [i 0 (len v)]
       (set! acc (f acc (vector-ref v i))))
     acc))

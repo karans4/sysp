@@ -1,20 +1,12 @@
-;; collections.sysp — Vector and HashMap as generic structs
-;; These definitions mirror the compiler-generated types.
-;; Operations defined here as poly-fns can replace builtins.
+;; collections.sysp — generic collection operations
+;; Vector/HashMap types are compiler builtins (need malloc/realloc).
+;; Access operations live here as library poly-fns.
 
-;; Generic Vector: growable array with data pointer, length, capacity
-(struct (Vector :T) [data (:ptr :T), len :int, cap :int])
-
-;; Generic HashMap: open addressing with linear probing
-(struct (HashMap :K :V) [keys (:ptr :K), vals (:ptr :V), occ (:ptr :char), len :int, cap :int])
-
-;; --- Vector operations as poly-fns ---
+(defn len [x :?] :int
+  (get x len))
 
 (defn vector-ref [v :? i :int] :?
   (array-ref (get v data) i))
-
-(defn vector-len [v :?] :int
-  (get v len))
 
 (defn vector-set! [v :? i :int val :?] :?
   (array-set! (get v data) i val))

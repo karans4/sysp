@@ -1,6 +1,8 @@
 ;; test-arc-strings.sysp — verify allocated strings are freed at scope exit
 ;; Run with valgrind to confirm zero leaks.
 
+(use strings)
+
 (defn test-concat [] :int
   (let s (str-concat "hello" " world"))
   (if (str-eq? s "hello world") (println "PASS concat") (println "FAIL concat"))

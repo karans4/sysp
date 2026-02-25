@@ -1,5 +1,8 @@
 ;; test-strings.sysp — string builtin operations
 
+(use strings)
+(use collections)
+
 (defn main () :int
   ;; str-len
   (println (str-len "hello"))        ; 5
@@ -37,7 +40,7 @@
 
   ;; str-split
   (let parts (str-split "a,b,c" ","))
-  (println (vector-len parts))       ; 3
+  (println (len parts))       ; 3
   (println (vector-ref parts 0))     ; a
   (println (vector-ref parts 1))     ; b
   (println (vector-ref parts 2))     ; c
