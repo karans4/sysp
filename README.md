@@ -138,7 +138,7 @@ bash run-tests.sh
 
 ## Architecture
 
-The compiler is a single Common Lisp file (`sysp.lisp`, ~7200 lines):
+The compiler is a single Common Lisp file (`sysp.lisp`, ~7400 lines, targeting ~4000). The design principle: keep the compiler dumb, push everything into libraries via traits. The compiler knows nothing about Vector, HashMap, or String — they're ordinary generic structs defined in library code. Three built-in traits (Drop, Gettable, Settable) plus a field-walking intrinsic provide the general mechanisms; everything else is library. See `TRAITS-VISION.md` for the full architectural vision.
 
 1. **Parse** — hand-written tokenizer + recursive descent (not CL's reader)
 2. **Macro-expand** — recursive expansion of `defmacro` + built-in macros
@@ -151,6 +151,7 @@ Standard library in `lib/`:
 | Module | Contents |
 |--------|----------|
 | `core` | Predicates (`zero?`, `even?`, `odd?`), arithmetic (`inc`, `dec`, `abs`, `min`, `max`, `clamp`), HOFs (`map`, `filter`, `reduce`) |
+| `collections` | Vector, HashMap — structs, traits (Indexed, Keyed, Hashable), mutation ops |
 | `string` | String operations |
 | `io` | File I/O |
 | `mem` | Memory utilities |
@@ -192,7 +193,7 @@ Hindley-Milner inference with monomorphization — annotations are optional:
 
 ## Status
 
-Alpha. 37 tests, valgrind clean. Expect breaking changes.
+Alpha. 39 tests, valgrind clean. Actively refactoring toward ~4000 line compiler via trait-based architecture. Expect breaking changes.
 
 ## Self-Hosting
 
