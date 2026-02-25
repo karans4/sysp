@@ -3999,6 +3999,240 @@
 "
           *functions*)))
 
+;;; === Printable / Show Auto-Derivation ===
+
+(defun type-to-show-format (tp)
+  "Return printf format specifier for a primitive type, or nil for complex types needing show_X()."
+  (case (type-kind tp)
+    (:char "%c")
+    (:short "%hd")
+    (:int "%d")
+    (:long "%ld")
+    (:long-long "%lld")
+    (:uchar "%u")
+    (:ushort "%hu")
+    (:uint "%u")
+    (:ulong "%lu")
+    (:ulong-long "%llu")
+    (:i8 "%\" PRId8 \"")
+    (:i16 "%\" PRId16 \"")
+    (:i32 "%\" PRId32 \"")
+    (:i64 "%\" PRId64 \"")
+    (:u8 "%\" PRIu8 \"")
+    (:u16 "%\" PRIu16 \"")
+    (:u32 "%\" PRIu32 \"")
+    (:u64 "%\" PRIu64 \"")
+    (:float "%g")
+    (:f32 "%g")
+    (:double "%g")
+    (:f64 "%g")
+    (:size "%zu")
+    (:bool "%s")
+    (:str "%s")
+    (otherwise nil)))
+
+(defun ensure-show-helper (tp)
+  "Ensure a show_TypeName C function exists for type TP. Auto-generates for primitives, structs, vectors, hashmaps."
+  (let* ((mangled (mangle-type-name tp))
+         (fn-name (format nil "show_~a" mangled))
+         (guard-key (format nil "_show_~a" mangled)))
+    (unless (gethash guard-key *generated-types*)
+      (setf (gethash guard-key *generated-types*) t)
+      (pushnew "stdio.h" *includes* :test #'string=)
+      (pushnew "string.h" *includes* :test #'string=)
+      (pushnew "stdlib.h" *includes* :test #'string=)
+      (let ((kind (type-kind tp)))
+        (cond
+          ;; --- Primitive show helpers ---
+          ((eq kind :int)
+           (push (format nil "static const char* show_int(int x) { int n = snprintf(NULL, 0, \"%d\", x); char* b = malloc(n+1); snprintf(b, n+1, \"%d\", x); return b; }~%") *functions*))
+          ((eq kind :long)
+           (push (format nil "static const char* show_long(long x) { int n = snprintf(NULL, 0, \"%ld\", x); char* b = malloc(n+1); snprintf(b, n+1, \"%ld\", x); return b; }~%") *functions*))
+          ((eq kind :long-long)
+           (push (format nil "static const char* show_longlong(long long x) { int n = snprintf(NULL, 0, \"%lld\", x); char* b = malloc(n+1); snprintf(b, n+1, \"%lld\", x); return b; }~%") *functions*))
+          ((eq kind :short)
+           (push (format nil "static const char* show_short(short x) { int n = snprintf(NULL, 0, \"%hd\", x); char* b = malloc(n+1); snprintf(b, n+1, \"%hd\", x); return b; }~%") *functions*))
+          ((eq kind :char)
+           (push (format nil "static const char* show_char(char x) { char* b = malloc(2); b[0] = x; b[1] = 0; return b; }~%") *functions*))
+          ((member kind '(:uchar :ushort :uint :ulong :ulong-long))
+           (let* ((c-type (type-to-c tp))
+                  (fmt (type-to-show-format tp)))
+             (push (format nil "static const char* ~a(~a x) { int n = snprintf(NULL, 0, \"~a\", x); char* b = malloc(n+1); snprintf(b, n+1, \"~a\", x); return b; }~%" fn-name c-type fmt fmt) *functions*)))
+          ((member kind '(:i8 :i16 :i32 :i64 :u8 :u16 :u32 :u64))
+           (let ((c-type (type-to-c tp)))
+             (pushnew "inttypes.h" *includes* :test #'string=)
+             (push (format nil "static const char* ~a(~a x) { char buf[64]; snprintf(buf, sizeof(buf), ~a, x); char* b = malloc(strlen(buf)+1); memcpy(b, buf, strlen(buf)+1); return b; }~%"
+                           fn-name c-type
+                           (case kind
+                             (:i8 "\"%\" PRId8") (:i16 "\"%\" PRId16") (:i32 "\"%\" PRId32") (:i64 "\"%\" PRId64")
+                             (:u8 "\"%\" PRIu8") (:u16 "\"%\" PRIu16") (:u32 "\"%\" PRIu32") (:u64 "\"%\" PRIu64")))
+                   *functions*)))
+          ((member kind '(:float :double :f32 :f64))
+           (let ((c-type (type-to-c tp)))
+             (push (format nil "static const char* ~a(~a x) { int n = snprintf(NULL, 0, \"%g\", (double)x); char* b = malloc(n+1); snprintf(b, n+1, \"%g\", (double)x); return b; }~%" fn-name c-type) *functions*)))
+          ((eq kind :str)
+           (push (format nil "static const char* show_str(const char* x) { int n = strlen(x); char* b = malloc(n+1); memcpy(b, x, n+1); return b; }~%") *functions*))
+          ((eq kind :bool)
+           (push (format nil "static const char* show_bool(int x) { return x ? strdup(\"true\") : strdup(\"false\"); }~%") *functions*))
+          ((eq kind :size)
+           (push (format nil "static const char* show_size(size_t x) { int n = snprintf(NULL, 0, \"%%zu\", x); char* b = malloc(n+1); snprintf(b, n+1, \"%%zu\", x); return b; }~%") *functions*))
+
+          ;; --- Struct show ---
+          ((eq kind :struct)
+           (let* ((struct-name (second tp))
+                  (fields (gethash struct-name *structs*))
+                  (c-struct (type-to-c tp)))
+             (unless fields
+               (error "ensure-show-helper: unknown struct ~a" struct-name))
+             ;; Ensure show helpers for all complex fields first
+             (dolist (f fields)
+               (let ((ft (cdr f)))
+                 (unless (type-to-show-format ft)
+                   (ensure-show-helper ft))))
+             ;; Build the function
+             (let ((has-complex (some (lambda (f) (null (type-to-show-format (cdr f)))) fields))
+                   (fmt-parts nil)
+                   (arg-parts nil)
+                   (complex-decls nil)
+                   (complex-frees nil)
+                   (field-idx 0))
+               (dolist (f fields)
+                 (let* ((fname (car f))
+                        (ftype (cdr f))
+                        (prim-fmt (type-to-show-format ftype))
+                        (accessor (format nil "self.~a" (sanitize-name fname))))
+                   (push (format nil "~a: " fname) fmt-parts)
+                   (if prim-fmt
+                       (progn
+                         (push prim-fmt fmt-parts)
+                         (if (eq (type-kind ftype) :bool)
+                             (push (format nil "(~a ? \"true\" : \"false\")" accessor) arg-parts)
+                             (push accessor arg-parts)))
+                       ;; Complex type: call show recursively
+                       (let ((tmp (format nil "_f~d" field-idx)))
+                         (push (format nil "  const char* ~a = show_~a(~a);~%"
+                                       tmp (mangle-type-name ftype) accessor)
+                               complex-decls)
+                         (push "%s" fmt-parts)
+                         (push tmp arg-parts)
+                         (push (format nil "  free((char*)~a);~%" tmp) complex-frees)))
+                   (incf field-idx)))
+               ;; Build format string: "StructName{f1: %d, f2: %s}"
+               (setf fmt-parts (nreverse fmt-parts))
+               (setf arg-parts (nreverse arg-parts))
+               (setf complex-decls (nreverse complex-decls))
+               (setf complex-frees (nreverse complex-frees))
+               ;; Interleave fields with ", "
+               (let* ((field-count (length fields))
+                      (fmt-str (with-output-to-string (s)
+                                 (write-string struct-name s)
+                                 (write-char #\{ s)
+                                 (let ((i 0))
+                                   (dolist (f fields)
+                                     (when (> i 0) (write-string ", " s))
+                                     ;; field-name: format
+                                     (write-string (car f) s)
+                                     (write-string ": " s)
+                                     (let* ((ftype (cdr f))
+                                            (prim-fmt (type-to-show-format ftype)))
+                                       (if prim-fmt
+                                           (write-string prim-fmt s)
+                                           (write-string "%s" s)))
+                                     (incf i)))
+                                 (write-char #\} s)))
+                      (args-str (format nil "~{~a~^, ~}" arg-parts)))
+                 (push (format nil "static const char* ~a(~a self) {~%~{~a~}  int _len = snprintf(NULL, 0, \"~a\", ~a);~%  char* _buf = malloc(_len + 1);~%  snprintf(_buf, _len + 1, \"~a\", ~a);~%~{~a~}  return _buf;~%}~%"
+                               fn-name c-struct
+                               complex-decls
+                               fmt-str args-str
+                               fmt-str args-str
+                               complex-frees)
+                       *functions*)))))
+
+          ;; --- Vector show ---
+          ((eq kind :vector)
+           (let* ((elem-type (second tp))
+                  (c-vec (type-to-c tp))
+                  (elem-mangled (mangle-type-name elem-type))
+                  (show-elem (format nil "show_~a" elem-mangled)))
+             ;; Ensure show helper for element type
+             (ensure-show-helper elem-type)
+             (push (format nil "static const char* ~a(~a self) {
+  if (self.len == 0) { char* r = malloc(3); memcpy(r, \"[]\", 3); return r; }
+  const char** parts = malloc(sizeof(const char*) * self.len);
+  int total = 2;
+  for (int i = 0; i < self.len; i++) {
+    parts[i] = ~a(self.data[i]);
+    total += strlen(parts[i]);
+    if (i > 0) total += 2;
+  }
+  char* buf = malloc(total + 1);
+  char* p = buf; *p++ = '[';
+  for (int i = 0; i < self.len; i++) {
+    if (i > 0) { *p++ = ','; *p++ = ' '; }
+    int n = strlen(parts[i]); memcpy(p, parts[i], n); p += n;
+    free((char*)parts[i]);
+  }
+  *p++ = ']'; *p = '\\0'; free(parts);
+  return buf;
+}~%" fn-name c-vec show-elem)
+                   *functions*)))
+
+          ;; --- Hashmap show ---
+          ((eq kind :hashmap)
+           (let* ((key-type (second tp))
+                  (val-type (third tp))
+                  (c-hm (type-to-c tp)))
+             (ensure-show-helper key-type)
+             (ensure-show-helper val-type)
+             (let ((show-k (format nil "show_~a" (mangle-type-name key-type)))
+                   (show-v (format nil "show_~a" (mangle-type-name val-type))))
+               (push (format nil "static const char* ~a(~a self) {
+  if (self.len == 0) { char* r = malloc(3); memcpy(r, \"{}\", 3); return r; }
+  const char** parts = malloc(sizeof(const char*) * self.len);
+  int total = 2, idx = 0;
+  for (int i = 0; i < self.cap; i++) {
+    if (!self.occ[i]) continue;
+    const char* ks = ~a(self.keys[i]);
+    const char* vs = ~a(self.vals[i]);
+    int kn = strlen(ks), vn = strlen(vs);
+    char* entry = malloc(kn + 2 + vn + 1);
+    memcpy(entry, ks, kn); entry[kn] = ':'; entry[kn+1] = ' ';
+    memcpy(entry + kn + 2, vs, vn + 1);
+    free((char*)ks); free((char*)vs);
+    parts[idx] = entry;
+    total += strlen(entry);
+    if (idx > 0) total += 2;
+    idx++;
+  }
+  char* buf = malloc(total + 1);
+  char* p = buf; *p++ = '{';
+  for (int i = 0; i < idx; i++) {
+    if (i > 0) { *p++ = ','; *p++ = ' '; }
+    int n = strlen(parts[i]); memcpy(p, parts[i], n); p += n;
+    free((char*)parts[i]);
+  }
+  *p++ = '}'; *p = '\\0'; free(parts);
+  return buf;
+}~%" fn-name c-hm show-k show-v)
+                     *functions*))))
+
+          ;; --- Generic struct (instantiated) ---
+          ((eq kind :generic)
+           (let* ((struct-name (second tp))
+                  (type-args (cddr tp))
+                  (mangled-struct (instantiate-generic-struct struct-name type-args))
+                  (concrete-tp (make-struct-type mangled-struct)))
+             ;; Delegate to the concrete struct show
+             (ensure-show-helper concrete-tp)
+             ;; Alias: show_Generic_A_B just calls show_MangedConcrete
+             (unless (string= fn-name (format nil "show_~a" mangled-struct))
+               (push (format nil "static const char* ~a(~a self) { return show_~a(self); }~%"
+                             fn-name (type-to-c tp) mangled-struct)
+                     *functions*))))
+
+          (t (warn "ensure-show-helper: unhandled type ~a" tp)))))))
+
 (defun ensure-str-split-helper ()
   "Emit C helper for str-split. Returns Vector_str."
   (unless (gethash "_sysp_str_split" *generated-types*)
@@ -5912,6 +6146,19 @@
     (:bool (values "%s" (format nil "(~a ? \"true\" : \"false\")" val-code)))
     ;; Value types
     ((:value :cons) (values :value-print val-code))
+    ;; Structs, vectors, hashmaps, generics — auto-derive show
+    (:struct
+     (ensure-show-helper val-type)
+     (values :show (format nil "show_~a(~a)" (mangle-type-name val-type) val-code)))
+    (:generic
+     (ensure-show-helper val-type)
+     (values :show (format nil "show_~a(~a)" (mangle-type-name val-type) val-code)))
+    (:vector
+     (ensure-show-helper val-type)
+     (values :show (format nil "show_~a(~a)" (mangle-type-name val-type) val-code)))
+    (:hashmap
+     (ensure-show-helper val-type)
+     (values :show (format nil "show_~a(~a)" (mangle-type-name val-type) val-code)))
     ;; Default to %d for unknown int-like types
     (otherwise (values "%d" val-code))))
 
@@ -5927,6 +6174,11 @@
                   (cond
                     ((eq fmt :value-print)
                      (list (format nil "  sysp_print_value(~a);" arg)))
+                    ((eq fmt :show)
+                     (let ((tmp (fresh-tmp)))
+                       (list (format nil "  const char* ~a = ~a;" tmp arg)
+                             (format nil "  printf(\"%s\", ~a);" tmp)
+                             (format nil "  free((char*)~a);" tmp))))
                     ((eq fmt :pri)
                      (list (format nil "  printf(\"%\" ~a, ~a);" arg val-code)))
                     (t
@@ -5947,6 +6199,11 @@
                       (cond
                         ((eq fmt :value-print)
                          (list (format nil "  sysp_print_value(~a); printf(\"\\n\");" arg)))
+                        ((eq fmt :show)
+                         (let ((tmp (fresh-tmp)))
+                           (list (format nil "  const char* ~a = ~a;" tmp arg)
+                                 (format nil "  printf(\"%s\\n\", ~a);" tmp)
+                                 (format nil "  free((char*)~a);" tmp))))
                         ((eq fmt :pri)
                          (list (format nil "  printf(\"%\" ~a \"\\n\", ~a);" arg val-code)))
                         (t

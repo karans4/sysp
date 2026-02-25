@@ -2,7 +2,7 @@
 # sysp test runner - compiles and runs all tests with memory checking
 # All phases run in parallel using background jobs + wait
 
-TESTS="test-cons test-refcount test-qq test-macros test-macros2 test-infer test-nesting test-numerics test-types test-recur test-union test-deftype test-branch-union test-inline test-match test-mono test-arc test-limitations test-modules test-closures test-threads test-conditions test-ffi test-c99 test-escape test-polish test-hof test-hashmap test-collections test-strings test-variadic test-nth test-asm test-values test-namespaces test-dot test-auto-poly test-generics test-traits"
+TESTS="test-cons test-refcount test-qq test-macros test-macros2 test-infer test-nesting test-numerics test-types test-recur test-union test-deftype test-branch-union test-inline test-match test-mono test-arc test-limitations test-modules test-closures test-threads test-conditions test-ffi test-c99 test-escape test-polish test-hof test-hashmap test-collections test-strings test-variadic test-nth test-asm test-values test-namespaces test-dot test-auto-poly test-generics test-traits test-printable"
 CFLAGS="-std=c99 -pedantic -Wall -Wextra -lpthread"
 SYSP="sbcl --script sysp.lisp"
 TEST_DIR="tests"

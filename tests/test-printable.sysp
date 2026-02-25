@@ -1,0 +1,27 @@
+;;; Test: Printable trait — auto-derived show for structs, vectors
+
+(struct Point [x :int, y :int])
+(struct Line [start :Point, end :Point])
+(struct Named [name :str, value :int])
+
+(defn main [] :int
+  ;; Struct printing
+  (let p (Point 3 4))
+  (println p)                    ; Point{x: 3, y: 4}
+  (let line (Line (Point 0 0) (Point 10 20)))
+  (println line)                 ; Line{start: Point{x: 0, y: 0}, end: Point{x: 10, y: 20}}
+  (let n (Named "hello" 42))
+  (println n)                    ; Named{name: hello, value: 42}
+
+  ;; Vector printing
+  (let v (Vector 1 2 3))
+  (println v)                    ; [1, 2, 3]
+  (println (Vector))             ; []
+  (let vs (Vector "a" "b" "c"))
+  (println vs)                   ; [a, b, c]
+
+  ;; Vector of structs
+  (let pts (Vector (Point 1 2) (Point 3 4)))
+  (println pts)                  ; [Point{x: 1, y: 2}, Point{x: 3, y: 4}]
+
+  0)
