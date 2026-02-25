@@ -22,11 +22,29 @@
 (defun make-struct-type (name) `(:struct ,name))
 (defun make-enum-type (name) `(:enum ,name))
 (defun make-fn-type (arg-types ret-type) `(:fn ,arg-types ,ret-type))
-(defun make-vector-type (elem-type) `(:vector ,elem-type))
+(defun make-vector-type (elem-type) `(:generic "Vector" ,elem-type))
 (defun make-tuple-type (elem-types) `(:tuple ,@elem-types))
 (defun make-array-type (elem-type size) `(:array ,elem-type ,size))
-(defun make-hashmap-type (key-type val-type) `(:hashmap ,key-type ,val-type))
+(defun make-hashmap-type (key-type val-type) `(:generic "HashMap" ,key-type ,val-type))
 (defun make-generic-type (name &rest type-args) `(:generic ,name ,@type-args))
+
+;; Vector/HashMap type predicates (these are now generic structs)
+(defun vector-type-p (tp)
+  "Check if TP is a Vector type: (:generic \"Vector\" elem-type)"
+  (and (consp tp) (eq (car tp) :generic) (equal (second tp) "Vector")))
+(defun vector-elem-type (tp)
+  "Extract element type from a Vector type"
+  (third tp))
+(defun hashmap-type-p (tp)
+  "Check if TP is a HashMap type: (:generic \"HashMap\" key-type val-type)"
+  (and (consp tp) (eq (car tp) :generic) (equal (second tp) "HashMap")))
+(defun hashmap-key-type (tp) (third tp))
+(defun hashmap-val-type (tp) (fourth tp))
+;; String type helper: :str is now (:ptr :char) everywhere
+(defun str-type-p (tp)
+  "Check if TP is a string type: (:ptr :char)"
+  (and (consp tp) (eq (car tp) :ptr) (eq (second tp) :char)))
+
 (defun make-rc-type (inner) `(:rc ,inner))
 (defun rc-type-p (tp) (and (consp tp) (eq (car tp) :rc)))
 (defun rc-inner-type (tp) (second tp))
@@ -157,7 +175,7 @@
         (to (resolve-type to-type)))
     (cond
       ;; Vector→ptr: extract .data field
-      ((and to (eq (type-kind from) :vector) (eq (type-kind to) :ptr))
+      ((and to (vector-type-p from) (eq (type-kind to) :ptr))
        (format nil "~a.data" code))
       ;; Numeric coercion
       ((and to (not (eq from to))
@@ -312,7 +330,7 @@
        ((<= form 9223372036854775807) :long-long)
        (t :ulong-long)))
     ((floatp form) :float)
-    ((stringp form) :str)
+    ((stringp form) '(:ptr :char))
     ((symbolp form)
      (let ((name (string form)))
        (cond
@@ -368,15 +386,33 @@
           (when (eq (type-kind concrete-type) :ptr)
             (infer-bind-type-params (second type-form) (second concrete-type) subst-table))))))))
 
+;; Tables for simple infer-list dispatch
+;; :infer-all = infer all args then return type; :infer-none = return type directly
+(defparameter *infer-all-return*
+  `(("str-concat" . (:ptr :char)) ("str-slice" . (:ptr :char)) ("str-upper" . (:ptr :char))
+    ("str-lower" . (:ptr :char)) ("str-from-int" . (:ptr :char)) ("str-from-float" . (:ptr :char))
+    ("str-join" . (:ptr :char)) ("str-trim" . (:ptr :char)) ("str-replace" . (:ptr :char))
+    ("sizeof-val" . :int)))
+
+(defparameter *infer-none-return*
+  '(("nil?" . :bool) ("null?" . :bool) ("sym" . :value) ("sym-eq?" . :bool)
+    ("gensym" . :value) ("sizeof" . :int) ("fmt" . (:ptr :char))
+    ("quote" . :value) ("quasiquote" . :value)))
+
 (defun infer-list (form)
   "Infer the type of a list expression."
   (let ((head (first form)))
-    ;; Handle non-symbol heads (e.g., numbers in quoted lists)
     (unless (symbolp head)
       (return-from infer-list (make-tvar)))
+    ;; Fast table lookups for simple cases
+    (let ((all-ret (cdr (assoc (string head) *infer-all-return* :test #'string-equal))))
+      (when all-ret
+        (dolist (e (cdr form)) (infer-expr e))
+        (return-from infer-list all-ret)))
+    (let ((none-ret (cdr (assoc (string head) *infer-none-return* :test #'string-equal))))
+      (when none-ret (return-from infer-list none-ret)))
     (cond
-      ;; Arithmetic: promote result type (don't unify operands with different concrete types)
-      ;; Variadic: (+ a b c d) folds left to (+ (+ (+ a b) c) d)
+      ;; Arithmetic: promote result type
       ((member (string head) '("+" "-" "*" "/" "%" "mod") :test #'string-equal)
        (if (and (= (length form) 2) (string-equal (string head) "-"))
            ;; Unary minus
@@ -470,58 +506,30 @@
            (unify elem-type (infer-expr e)))
          (make-vector-type elem-type)))
 
-      ;; vector-ref: result is element type
-      ((sym= head "vector-ref")
-       (let* ((vec-type (infer-expr (second form)))
-              (elem-tvar (make-tvar))
-              (expected-vec (make-vector-type elem-tvar)))
-         (infer-expr (third form))  ; index
-         (unify vec-type expected-vec)
-         elem-tvar))
-
-      ;; vector-len: result is int
-      ((sym= head "vector-len")
-       (infer-expr (second form))
-       :int)
-
-      ;; vector-set!: result is element type
-      ((sym= head "vector-set!")
-       (let* ((vec-type (infer-expr (second form)))
-              (elem-tvar (make-tvar)))
-         (infer-expr (third form))  ; index
-         (let ((val-type (infer-expr (fourth form))))
-           (unify elem-tvar val-type))
-         (unify vec-type (make-vector-type elem-tvar))
-         elem-tvar))
-
       ;; tuple: result is tuple of element types
       ((sym= head "tuple")
        (make-tuple-type (mapcar #'infer-expr (cdr form))))
 
-      ;; tuple-ref: we can't statically know which element without evaluating index
-      ((sym= head "tuple-ref")
-       (make-tvar))
+      ;; tuple-ref: can't statically resolve
+      ((sym= head "tuple-ref") (make-tvar))
 
       ;; nth: generic indexing — dispatch on collection type
       ((sym= head "nth")
        (let ((coll-type (infer-expr (second form))))
          (when (third form) (infer-expr (third form)))
-         (case (type-kind coll-type)
-           (:vector (second coll-type))
-           (:str :char)
-           (:tuple (make-tvar))  ; can't resolve without literal index
-           (:array (second coll-type))
-           (:ptr (second coll-type))
-           (otherwise
-            ;; Unresolved — assume pointer indexing
-            (let ((elem (make-tvar)))
-              (unify coll-type (make-ptr-type elem))
-              elem)))))
+         (cond
+           ((vector-type-p coll-type) (vector-elem-type coll-type))
+           ((eq (type-kind coll-type) :tuple) (make-tvar))
+           ((eq (type-kind coll-type) :array) (second coll-type))
+           ((eq (type-kind coll-type) :ptr) (second coll-type))
+           (t (let ((elem (make-tvar)))
+                (unify coll-type (make-ptr-type elem))
+                elem)))))
 
       ;; HashMap: result is (:hashmap K V)
       ((and (symbolp head) (string= (symbol-name head) "HashMap"))
        (if (null (cdr form))
-           (make-hashmap-type :str :int)  ; empty map defaults to str->int
+           (make-hashmap-type '(:ptr :char) :int)  ; empty map defaults to str->int
            (let ((key-type (infer-expr (second form)))
                  (val-type (infer-expr (third form))))
              ;; Infer remaining pairs too
@@ -529,34 +537,6 @@
                    when k do (unify key-type (infer-expr k))
                    when v do (unify val-type (infer-expr v)))
              (make-hashmap-type key-type val-type))))
-
-      ;; hash-get: returns val type
-      ((sym= head "hash-get")
-       (let ((mt (infer-expr (second form))))
-         (infer-expr (third form))
-         (if (eq (type-kind mt) :hashmap) (third mt) (make-tvar))))
-
-      ;; hash-set!: void
-      ((sym= head "hash-set!")
-       (dolist (e (cdr form)) (infer-expr e)) :void)
-
-      ;; hash-has?: bool
-      ((sym= head "hash-has?")
-       (dolist (e (cdr form)) (infer-expr e)) :bool)
-
-      ;; hash-del!: void
-      ((sym= head "hash-del!")
-       (dolist (e (cdr form)) (infer-expr e)) :void)
-
-      ;; hash-keys: (:vector K)
-      ((sym= head "hash-keys")
-       (let ((mt (infer-expr (second form))))
-         (if (eq (type-kind mt) :hashmap) (make-vector-type (second mt)) (make-vector-type (make-tvar)))))
-
-      ;; hash-vals: (:vector V)
-      ((sym= head "hash-vals")
-       (let ((mt (infer-expr (second form))))
-         (if (eq (type-kind mt) :hashmap) (make-vector-type (third mt)) (make-vector-type (make-tvar)))))
 
       ;; lambda: parse param types, infer body
       ((sym= head "lambda")
@@ -591,9 +571,6 @@
              ;; Restore env
              (setf *infer-env* old-env)
              (make-fn-type param-types ret-type)))))
-
-      ;; nil? : returns bool
-      ((sym= head "nil?") :bool)
 
       ;; cons: creates a cons cell
       ;; If cdr is a (:list T), result is (:list T) (homogeneous)
@@ -649,34 +626,14 @@
            (unify elem-type (infer-expr e)))
          (make-list-type elem-type)))
 
-      ;; quote/quasiquote: for now return Value (could be smarter)
-      ((member (string head) '("quote" "quasiquote") :test #'string-equal)
-       :value)
-
-      ;; Simple type returns
-      ((sym= head "null?") :bool)
-      ((sym= head "sym") :value)
-      ((sym= head "sym-eq?") :bool)
-      ((sym= head "gensym") :value)
-
-      ;; String builtins (allocating ops that remain in compiler)
-      ((sym= head "str-concat") (infer-expr (second form)) (infer-expr (third form)) :str)
-      ((sym= head "str-slice") (dolist (e (cdr form)) (infer-expr e)) :str)
-      ((sym= head "str-upper") (infer-expr (second form)) :str)
-      ((sym= head "str-lower") (infer-expr (second form)) :str)
-      ((sym= head "str-split") (infer-expr (second form)) (infer-expr (third form)) (make-vector-type :str))
-      ((sym= head "str-from-int") (infer-expr (second form)) :str)
-      ((sym= head "str-from-float") (infer-expr (second form)) :str)
-      ((sym= head "str-join") (infer-expr (second form)) (infer-expr (third form)) :str)
-      ((sym= head "str-trim") (infer-expr (second form)) :str)
-      ((sym= head "str-replace") (dolist (e (cdr form)) (infer-expr e)) :str)
-      ((sym= head "fmt") :str)  ; format string interpolation always returns :str
+      ;; str-split: returns Vector of str (not a simple constant type)
+      ((sym= head "str-split") (infer-expr (second form)) (infer-expr (third form)) (make-vector-type '(:ptr :char)))
 
       ;; get: struct field access — resolve from struct definition
       ((sym= head "get")
        (let* ((obj-type (resolve-type (infer-expr (second form))))
               (field-name (string (third form)))
-              ;; Find struct name: (:struct "CPU"), (:ptr (:struct "CPU")), (:generic ...), (:vector ...), or direct
+              ;; Find struct name: (:struct "CPU"), (:ptr (:struct "CPU")), (:generic ...), or direct
               (struct-name (cond
                              ((and (consp obj-type) (eq (car obj-type) :struct))
                               (second obj-type))
@@ -687,22 +644,7 @@
                               ;; Generic struct: look up field from template with substituted types
                               (second obj-type))
                              (t nil)))
-              ;; For vector/hashmap types, resolve field types directly
-              (builtin-field-type
-               (cond
-                 ((and (consp obj-type) (eq (car obj-type) :vector))
-                  (cond ((string-equal field-name "data") (make-ptr-type (second obj-type)))
-                        ((string-equal field-name "len") :int)
-                        ((string-equal field-name "cap") :int)
-                        (t nil)))
-                 ((and (consp obj-type) (eq (car obj-type) :hashmap))
-                  (cond ((string-equal field-name "keys") (make-ptr-type (second obj-type)))
-                        ((string-equal field-name "vals") (make-ptr-type (third obj-type)))
-                        ((string-equal field-name "occ") (make-ptr-type :char))
-                        ((string-equal field-name "len") :int)
-                        ((string-equal field-name "cap") :int)
-                        (t nil)))
-                 (t nil)))
+              ;; (Vector/HashMap field types now resolved via generic-field-type below)
               ;; For generic types, resolve field type with type param substitution
               (generic-field-type
                (when (and (consp obj-type) (eq (car obj-type) :generic))
@@ -741,7 +683,7 @@
                             (cdr (assoc field-name fields :test #'equal)))))
          ;; Don't unify object type — it might be struct or ptr-to-struct
          ;; Let call-site types determine the concrete param type
-         (or builtin-field-type generic-field-type field-type (make-tvar))))
+         (or generic-field-type field-type (make-tvar))))
 
       ;; set!: infer target and value, return the assigned type
       ((sym= head "set!")
@@ -761,8 +703,6 @@
        (if (listp (second form))
            (parse-type-expr (second form))
            (parse-type-annotation (second form))))
-      ((sym= head "sizeof")
-       :int)
 
       ;; values: multiple return values
       ((sym= head "values")
@@ -801,19 +741,6 @@
                         (parse-type-annotation v))))
          :void))
 
-      ;; Simple type returns for vector/array ops
-      ((sym= head "vector-len") :int)
-      ((sym= head "vector-set!")
-       (let ((vec-type (infer-expr (second form)))
-             (val-type (infer-expr (fourth form))))
-         (when (third form) (infer-expr (third form)))
-         (unify vec-type (make-vector-type val-type))
-         :void))
-      ((sym= head "vector-push!")
-       (let ((vec-type (infer-expr (second form)))
-             (val-type (infer-expr (third form))))
-         (unify vec-type (make-vector-type val-type))
-         :void))
       ((sym= head "array-ref")
        (let ((elem (make-tvar))
              (arr-type (infer-expr (second form))))
@@ -962,15 +889,9 @@
            (if (and (symbolp f) (string-equal (string f) "else"))
                nil
                (infer-stmt f))))
-        ((or (sym= head "when") (sym= head "unless"))
+        ((member (string head) '("when" "unless" "while") :test #'string-equal)
          (infer-expr (second form))
-         (dolist (f (cddr form))
-           (infer-stmt f))
-         :void)
-        ((sym= head "while")
-         (infer-expr (second form))
-         (dolist (f (cddr form))
-           (infer-stmt f))
+         (dolist (f (cddr form)) (infer-stmt f))
          :void)
         ((sym= head "for")
          ;; (for [var start end] body...) — bind loop var to int, infer body
@@ -1017,29 +938,15 @@
            (when target-type
              (unify target-type val-type))))
 
-        ;; return: infer the returned expression
-        ((sym= head "return")
-         (when (second form)
-           (infer-expr (second form))))
-
-        ;; print/println: just infer the expression
-        ((or (sym= head "print") (sym= head "println"))
-         (infer-expr (second form)))
-
-        ;; printf: infer all arg expressions
-        ((sym= head "printf")
-         (dolist (arg (cddr form))
-           (infer-expr arg)))
-
+        ;; return/print/println: infer the expression
+        ((member (string head) '("return" "print" "println") :test #'string-equal)
+         (when (second form) (infer-expr (second form))))
+        ;; printf: infer all arg expressions (skip format string)
+        ((sym= head "printf") (dolist (arg (cddr form)) (infer-expr arg)))
         ;; recur: infer arguments
-        ((sym= head "recur")
-         (dolist (arg (cdr form))
-           (infer-expr arg)))
-
+        ((sym= head "recur") (dolist (arg (cdr form)) (infer-expr arg)))
         ;; do block as statement
-        ((sym= head "do")
-         (dolist (f (cdr form))
-           (infer-stmt f)))
+        ((sym= head "do") (dolist (f (cdr form)) (infer-stmt f)))
 
         ;; Otherwise: treat as expression statement
         (t (infer-expr form))))))
@@ -1279,40 +1186,47 @@
 (defun type-needs-drop-p (tp)
   "Does this type own heap data that needs freeing on drop?"
   (let ((kind (type-kind tp)))
-    (or (eq tp :str)
-        (eq kind :vector)
-        (eq kind :hashmap)
+    (or (str-type-p tp)
         (eq kind :rc)
-        ;; Structs: check if any field needs drop
-        (and (eq kind :struct)
-             (let ((fields (gethash (second tp) *structs*)))
+        ;; Vector: has owned data pointer
+        (vector-type-p tp)
+        ;; HashMap: has owned keys/vals/occ pointers
+        (hashmap-type-p tp)
+        ;; Generic/plain structs: check if any field needs drop
+        (and (member kind '(:generic :struct))
+             (let* ((sname (if (eq kind :generic)
+                               (instantiate-generic-struct (second tp) (cddr tp))
+                               (second tp)))
+                    (fields (gethash sname *structs*)))
                (and (listp fields)
                     (some (lambda (f) (type-needs-drop-p (cdr f))) fields)))))))
 
 (defun emit-drop (c-expr tp &optional (indent "  "))
   "Generate C statements to recursively drop a value of type TP.
-   Walks the type structure like Swift's automatic deinit."
+   Walks the type structure: frees pointer fields, decrements RC, recurses into structs."
   (let ((kind (type-kind tp)))
     (cond
-      ;; String: free the char*
-      ((eq tp :str)
+      ;; String ((:ptr :char)): free the char*
+      ((str-type-p tp)
        (list (format nil "~afree((char*)~a);" indent c-expr)))
-      ;; Vector: free backing array (elements are borrowed, not owned)
-      ((eq kind :vector)
+      ;; Vector: free backing data array
+      ((vector-type-p tp)
        (list (format nil "~aif (~a.cap > 0) free(~a.data);" indent c-expr c-expr)))
-      ;; HashMap: free backing arrays (keys/vals are borrowed, not owned)
-      ((eq kind :hashmap)
+      ;; HashMap: free backing arrays
+      ((hashmap-type-p tp)
        (list (format nil "~aif (~a.cap > 0) { free(~a.keys); free(~a.vals); free(~a.occ); }"
                      indent c-expr c-expr c-expr c-expr)))
-      ;; Struct: drop each field that needs it
-      ((eq kind :struct)
-       (let ((fields (gethash (second tp) *structs*)))
+      ;; Generic/plain struct: drop each field that needs it
+      ((member kind '(:generic :struct))
+       (let* ((sname (if (eq kind :generic)
+                         (instantiate-generic-struct (second tp) (cddr tp))
+                         (second tp)))
+              (fields (gethash sname *structs*)))
          (when (listp fields)
            (mapcan (lambda (f)
-                     (let ((fname (car f)) (ftype (cdr f)))
-                       (when (type-needs-drop-p ftype)
-                         (emit-drop (format nil "~a.~a" c-expr (sanitize-name fname))
-                                     ftype indent))))
+                     (when (type-needs-drop-p (cdr f))
+                       (emit-drop (format nil "~a.~a" c-expr (sanitize-name (car f)))
+                                   (cdr f) indent)))
                    fields))))
       (t nil))))
 
@@ -1362,7 +1276,6 @@
 (defvar *env-counter* 0)  ; counter for closure env structs
 (defvar *interp-gensym-counter* 0)
 (defvar *spawn-counter* 0)    ; counter for spawn sites
-(defvar *uses-hashmap* nil)   ; emit hash function preamble if true
 (defvar *uses-threads* nil)   ; emit #include <pthread.h> if true
 (defvar *restart-counter* 0)  ; counter for restart-case sites
 (defvar *handler-counter* 0)  ; counter for handler-bind sites
@@ -1872,26 +1785,12 @@
                  (serialize-atom name)
                  (serialize-params params)
                  (mapcar #'serialize-atom-or-form rest))))
-      ;; (defn-ct name [params] body...)
-      ((sym= head "defn-ct")
-       (let* ((name (second form))
-              (params (third form))
-              (body (cdddr form)))
-         (format nil "(~a ~a ~a~{ ~a~})"
-                 (serialize-atom head)
-                 (serialize-atom name)
-                 (serialize-params params)
-                 (mapcar #'serialize-atom-or-form body))))
-      ;; (defmacro name [params] body...)
-      ((sym= head "defmacro")
-       (let* ((name (second form))
-              (params (third form))
-              (body (cdddr form)))
-         (format nil "(~a ~a ~a~{ ~a~})"
-                 (serialize-atom head)
-                 (serialize-atom name)
-                 (serialize-params params)
-                 (mapcar #'serialize-atom-or-form body))))
+      ;; (defn-ct/defmacro name [params] body...)
+      ((or (sym= head "defn-ct") (sym= head "defmacro"))
+       (format nil "(~a ~a ~a~{ ~a~})"
+               (serialize-atom head) (serialize-atom (second form))
+               (serialize-params (third form))
+               (mapcar #'serialize-atom-or-form (cdddr form))))
       ;; (struct Name [fields...])
       ((sym= head "struct")
        (format nil "(~a ~a ~a)"
@@ -2028,6 +1927,22 @@
                     result)
                   form))))))
 
+(defun gsym (prefix)
+  "Generate a unique sysp temp symbol with given prefix."
+  (intern (format nil "_~a~d" prefix (incf *sysp-gensym-counter*))))
+
+(defun vec-collect-macro (vec-expr loop-body-fn)
+  "Generate a macro expansion that creates a result vector, loops over vec-expr,
+   and calls loop-body-fn with (result-sym vref-sym idx-sym) to get the loop body forms.
+   Returns the (do ...) form."
+  (let ((vref (gsym "v")) (result (gsym "r")) (idx (gsym "i")))
+    (list 'do
+          (list 'let vref vec-expr)
+          (list 'let-mut result (list '|Vector|))
+          (list* 'for (list idx 0 (list 'len vref))
+                 (funcall loop-body-fn result vref idx))
+          result)))
+
 (defun install-builtin-macros ()
   "Install the standard macros: ->, ->>, when-let, dotimes, etc."
   ;; Threading macro: (-> x (f a) (g b)) => (g (f x a) b)
@@ -2062,20 +1977,17 @@
                    (list 'let name init)
                    (list* 'when name body)
                    nil))))
-  ;; dotimes: (dotimes [i n] body...) => (for [i 0 n] body...)
   (setf (gethash "dotimes" *macros*)
-        (lambda (form)
-          (let ((spec (second form))
-                (body (cddr form)))
-            (list* 'for (list (first spec) 0 (second spec)) body))))
-  ;; inc!: (inc! x) => (set! x (+ x 1))
-  (setf (gethash "inc!" *macros*)
-        (lambda (form)
-          (list 'set! (second form) (list '+ (second form) 1))))
-  ;; dec!: (dec! x) => (set! x (- x 1))
-  (setf (gethash "dec!" *macros*)
-        (lambda (form)
-          (list 'set! (second form) (list '- (second form) 1))))
+        (lambda (form) (list* 'for (list (first (second form)) 0 (second (second form))) (cddr form))))
+  (setf (gethash "inc!" *macros*) (lambda (f) (list 'set! (second f) (list '+ (second f) 1))))
+  (setf (gethash "dec!" *macros*) (lambda (f) (list 'set! (second f) (list '- (second f) 1))))
+  ;; Collection mutation macros — expand to library poly-fn calls with addr-of
+  (setf (gethash "vector-push!" *macros*)
+        (lambda (f) (list '_vector-push-impl (list 'addr-of (second f)) (third f))))
+  (setf (gethash "hash-set!" *macros*)
+        (lambda (f) (list '_hash-set-impl (list 'addr-of (second f)) (third f) (fourth f))))
+  (setf (gethash "hash-del!" *macros*)
+        (lambda (f) (list '_hash-del-impl (list 'addr-of (second f)) (third f))))
   ;; for-each: (for-each [x vec] body...) => vector iteration
   ;;           (for-each [k v m] body...)  => hash map iteration
   (setf (gethash "for-each" *macros*)
@@ -2108,19 +2020,13 @@
   ;; map, filter, reduce: now real poly defn functions in lib/core.sysp
   ;; keep: alias for filter (also in core.sysp now)
   ;; (removed macro definitions — these are now first-class HOFs)
-  ;; === Clojure-style aliases for hash maps ===
-  ;; assoc!: (assoc! m k v) => (hash-set! m k v)
-  (setf (gethash "assoc!" *macros*)
-        (lambda (form)
-          (list 'hash-set! (second form) (third form) (fourth form))))
-  ;; dissoc!: (dissoc! m k) => (hash-del! m k)
-  (setf (gethash "dissoc!" *macros*)
-        (lambda (form)
-          (list 'hash-del! (second form) (third form))))
-  ;; contains?: (contains? m k) => (hash-has? m k)
-  (setf (gethash "contains?" *macros*)
-        (lambda (form)
-          (list 'hash-has? (second form) (third form))))
+  ;; Simple aliases: (alias a b c) => (target a b c)
+  (dolist (alias '(("assoc!" hash-set! 3) ("dissoc!" hash-del! 2) ("contains?" hash-has? 2)))
+    (let ((target (second alias)) (arity (third alias)))
+      (setf (gethash (first alias) *macros*)
+            (if (= arity 2)
+                (lambda (form) (list target (second form) (third form)))
+                (lambda (form) (list target (second form) (third form) (fourth form)))))))
   ;; merge!: capture keys once, iterate, free temp vector
   (setf (gethash "merge!" *macros*)
         (lambda (form)
@@ -2134,253 +2040,144 @@
                         (list 'hash-set! (second form) k (list 'hash-get (third form) k)))))))
 
   ;; === Clojure-style collection predicates ===
-  ;; some: (some pred vec) => (do (let-mut _r 0) (for [_i 0 (vector-len vec)] (when (pred (vector-ref vec _i)) (set! _r 1) (break))) _r)
+  ;; some: (some pred vec) — returns 1 if any element matches
   (setf (gethash "some" *macros*)
         (lambda (form)
-          (let* ((pred (second form))
-                 (vec (third form))
-                 (sv (intern (format nil "_sv~d" (incf *sysp-gensym-counter*))))
-                 (r (intern (format nil "_sr~d" (incf *sysp-gensym-counter*))))
-                 (idx (intern (format nil "_si~d" (incf *sysp-gensym-counter*)))))
-            (list 'do
-                  (list 'let sv vec)
-                  (list 'let-mut r 0)
-                  (list 'for (list idx 0 (list 'len sv))
-                        (list 'when (list pred (list 'vector-ref sv idx))
-                              (list 'set! r 1)
-                              '(break)))
+          (let ((v (gsym "v")) (r (gsym "r")) (i (gsym "i")))
+            (list 'do (list 'let v (third form)) (list 'let-mut r 0)
+                  (list 'for (list i 0 (list 'len v))
+                        (list 'when (list (second form) (list 'vector-ref v i))
+                              (list 'set! r 1) '(break)))
                   r))))
-  ;; every?: (every? pred vec) => (do (let-mut _r 1) (for [...] (when (not (pred el)) (set! _r 0) (break))) _r)
+  ;; every?: (every? pred vec)
   (setf (gethash "every?" *macros*)
         (lambda (form)
-          (let* ((pred (second form))
-                 (vec (third form))
-                 (ev (intern (format nil "_ev~d" (incf *sysp-gensym-counter*))))
-                 (r (intern (format nil "_er~d" (incf *sysp-gensym-counter*))))
-                 (idx (intern (format nil "_ei~d" (incf *sysp-gensym-counter*)))))
-            (list 'do
-                  (list 'let ev vec)
-                  (list 'let-mut r 1)
-                  (list 'for (list idx 0 (list 'len ev))
-                        (list 'when (list 'not (list pred (list 'vector-ref ev idx)))
-                              (list 'set! r 0)
-                              '(break)))
+          (let ((v (gsym "v")) (r (gsym "r")) (i (gsym "i")))
+            (list 'do (list 'let v (third form)) (list 'let-mut r 1)
+                  (list 'for (list i 0 (list 'len v))
+                        (list 'when (list 'not (list (second form) (list 'vector-ref v i)))
+                              (list 'set! r 0) '(break)))
                   r))))
-  ;; not-any?: (not-any? pred vec) => (not (some pred vec))
-  (setf (gethash "not-any?" *macros*)
-        (lambda (form)
-          (list 'not (list 'some (second form) (third form)))))
-  ;; not-every?: (not-every? pred vec) => (not (every? pred vec))
-  (setf (gethash "not-every?" *macros*)
-        (lambda (form)
-          (list 'not (list 'every? (second form) (third form)))))
+  (setf (gethash "not-any?" *macros*) (lambda (f) (list 'not (list 'some (second f) (third f)))))
+  (setf (gethash "not-every?" *macros*) (lambda (f) (list 'not (list 'every? (second f) (third f)))))
 
-  ;; === Selection macros ===
+  ;; === Selection macros (using vec-collect-macro helper) ===
   ;; remove: like filter but inverted predicate
   (setf (gethash "remove" *macros*)
         (lambda (form)
-          (let* ((pred (second form))
-                 (vec (third form))
-                 (rv (intern (format nil "_rv~d" (incf *sysp-gensym-counter*))))
-                 (result (intern (format nil "_rr~d" (incf *sysp-gensym-counter*))))
-                 (idx (intern (format nil "_ri~d" (incf *sysp-gensym-counter*))))
-                 (elem (intern (format nil "_re~d" (incf *sysp-gensym-counter*)))))
-            (list 'do
-                  (list 'let rv vec)
-                  (list 'let-mut result (list '|Vector|))
-                  (list 'for (list idx 0 (list 'len rv))
-                        (list 'let elem (list 'vector-ref rv idx))
-                        (list 'when (list 'not (list pred elem))
-                              (list 'vector-push! result elem)))
-                  result))))
+          (let ((pred (second form)))
+            (vec-collect-macro (third form)
+              (lambda (r v i)
+                (let ((e (gsym "e")))
+                  (list (list 'let e (list 'vector-ref v i))
+                        (list 'when (list 'not (list pred e))
+                              (list 'vector-push! r e)))))))))
   ;; take: (take n vec)
   (setf (gethash "take" *macros*)
         (lambda (form)
-          (let* ((n (second form))
-                 (vec (third form))
-                 (tv (intern (format nil "_tv~d" (incf *sysp-gensym-counter*))))
-                 (result (intern (format nil "_tr~d" (incf *sysp-gensym-counter*))))
-                 (idx (intern (format nil "_ti~d" (incf *sysp-gensym-counter*))))
-                 (lim (intern (format nil "_tl~d" (incf *sysp-gensym-counter*)))))
-            (list 'do
-                  (list 'let tv vec)
-                  (list 'let-mut result (list '|Vector|))
+          (let* ((n (second form)) (vec (third form))
+                 (tv (gsym "v")) (result (gsym "r")) (idx (gsym "i"))
+                 (lim (gsym "l")))
+            (list 'do (list 'let tv vec) (list 'let-mut result (list '|Vector|))
                   (list 'let lim (list 'if (list '< n (list 'len tv)) n (list 'len tv)))
-                  (list 'for (list idx 0 lim)
-                        (list 'vector-push! result (list 'vector-ref tv idx)))
+                  (list 'for (list idx 0 lim) (list 'vector-push! result (list 'vector-ref tv idx)))
                   result))))
   ;; drop: (drop n vec)
   (setf (gethash "drop" *macros*)
         (lambda (form)
-          (let* ((n (second form))
-                 (vec (third form))
-                 (dv (intern (format nil "_dv~d" (incf *sysp-gensym-counter*))))
-                 (result (intern (format nil "_dr~d" (incf *sysp-gensym-counter*))))
-                 (idx (intern (format nil "_di~d" (incf *sysp-gensym-counter*)))))
-            (list 'do
-                  (list 'let dv vec)
-                  (list 'let-mut result (list '|Vector|))
+          (let* ((n (second form)) (dv (gsym "v")) (result (gsym "r")) (idx (gsym "i")))
+            (list 'do (list 'let dv (third form)) (list 'let-mut result (list '|Vector|))
                   (list 'for (list idx n (list 'len dv))
                         (list 'vector-push! result (list 'vector-ref dv idx)))
                   result))))
   ;; take-while: (take-while pred vec)
   (setf (gethash "take-while" *macros*)
         (lambda (form)
-          (let* ((pred (second form))
-                 (vec (third form))
-                 (twv (intern (format nil "_twv~d" (incf *sysp-gensym-counter*))))
-                 (result (intern (format nil "_twr~d" (incf *sysp-gensym-counter*))))
-                 (idx (intern (format nil "_twi~d" (incf *sysp-gensym-counter*))))
-                 (elem (intern (format nil "_twe~d" (incf *sysp-gensym-counter*)))))
-            (list 'do
-                  (list 'let twv vec)
-                  (list 'let-mut result (list '|Vector|))
-                  (list 'for (list idx 0 (list 'len twv))
-                        (list 'let elem (list 'vector-ref twv idx))
-                        (list 'when (list 'not (list pred elem))
-                              '(break))
-                        (list 'vector-push! result elem))
-                  result))))
+          (let ((pred (second form)))
+            (vec-collect-macro (third form)
+              (lambda (r v i)
+                (let ((e (gsym "e")))
+                  (list (list 'let e (list 'vector-ref v i))
+                        (list 'when (list 'not (list pred e)) '(break))
+                        (list 'vector-push! r e))))))))
   ;; drop-while: (drop-while pred vec)
   (setf (gethash "drop-while" *macros*)
         (lambda (form)
-          (let* ((pred (second form))
-                 (vec (third form))
-                 (dwv (intern (format nil "_dwv~d" (incf *sysp-gensym-counter*))))
-                 (result (intern (format nil "_dwr~d" (incf *sysp-gensym-counter*))))
-                 (idx (intern (format nil "_dwi~d" (incf *sysp-gensym-counter*))))
-                 (dropping (intern (format nil "_dwd~d" (incf *sysp-gensym-counter*)))))
-            (list 'do
-                  (list 'let dwv vec)
-                  (list 'let-mut result (list '|Vector|))
-                  (list 'let-mut dropping 1)
-                  (list 'for (list idx 0 (list 'len dwv))
-                        (list 'when (list 'and dropping (list 'not (list pred (list 'vector-ref dwv idx))))
-                              (list 'set! dropping 0))
-                        (list 'when (list 'not dropping)
-                              (list 'vector-push! result (list 'vector-ref dwv idx))))
-                  result))))
+          (let* ((pred (second form)) (v (gsym "v")) (r (gsym "r")) (i (gsym "i")) (d (gsym "d")))
+            (list 'do (list 'let v (third form)) (list 'let-mut r (list '|Vector|)) (list 'let-mut d 1)
+                  (list 'for (list i 0 (list 'len v))
+                        (list 'when (list 'and d (list 'not (list pred (list 'vector-ref v i))))
+                              (list 'set! d 0))
+                        (list 'when (list 'not d) (list 'vector-push! r (list 'vector-ref v i))))
+                  r))))
 
   ;; === Construction macros ===
   ;; range: (range n) or (range start end)
   (setf (gethash "range" *macros*)
         (lambda (form)
-          (let* ((result (intern (format nil "_rng~d" (incf *sysp-gensym-counter*))))
-                 (idx (intern (format nil "_ri~d" (incf *sysp-gensym-counter*)))))
-            (if (= (length form) 2)
-                ;; (range n) => 0..n
-                (list 'do
-                      (list 'let-mut result (list '|Vector|))
-                      (list 'for (list idx 0 (second form))
-                            (list 'vector-push! result idx))
-                      result)
-                ;; (range start end) => start..end
-                (list 'do
-                      (list 'let-mut result (list '|Vector|))
-                      (list 'for (list idx (second form) (third form))
-                            (list 'vector-push! result idx))
-                      result)))))
+          (let ((r (gsym "r")) (i (gsym "i"))
+                (start (if (= (length form) 2) 0 (second form)))
+                (end (if (= (length form) 2) (second form) (third form))))
+            (list 'do (list 'let-mut r (list '|Vector|))
+                  (list 'for (list i start end) (list 'vector-push! r i)) r))))
   ;; repeat: (repeat n val)
   (setf (gethash "repeat" *macros*)
         (lambda (form)
-          (let* ((n (second form))
-                 (val (third form))
-                 (result (intern (format nil "_rp~d" (incf *sysp-gensym-counter*))))
-                 (idx (intern (format nil "_rpi~d" (incf *sysp-gensym-counter*)))))
-            (list 'do
-                  (list 'let-mut result (list '|Vector|))
-                  (list 'for (list idx 0 n)
-                        (list 'vector-push! result val))
-                  result))))
+          (let ((r (gsym "r")) (i (gsym "i")))
+            (list 'do (list 'let-mut r (list '|Vector|))
+                  (list 'for (list i 0 (second form)) (list 'vector-push! r (third form))) r))))
   ;; reverse: (reverse vec)
   (setf (gethash "reverse" *macros*)
         (lambda (form)
-          (let* ((vec (second form))
-                 (rvv (intern (format nil "_rvv~d" (incf *sysp-gensym-counter*))))
-                 (result (intern (format nil "_rv~d" (incf *sysp-gensym-counter*))))
-                 (idx (intern (format nil "_rvi~d" (incf *sysp-gensym-counter*))))
-                 (ln (intern (format nil "_rvl~d" (incf *sysp-gensym-counter*)))))
-            (list 'do
-                  (list 'let rvv vec)
-                  (list 'let-mut result (list '|Vector|))
-                  (list 'let ln (list 'len rvv))
-                  (list 'for (list idx 0 ln)
-                        (list 'vector-push! result (list 'vector-ref rvv (list '- (list '- ln 1) idx))))
-                  result))))
+          (let ((v (gsym "v")) (r (gsym "r")) (i (gsym "i")) (n (gsym "n")))
+            (list 'do (list 'let v (second form)) (list 'let-mut r (list '|Vector|))
+                  (list 'let n (list 'len v))
+                  (list 'for (list i 0 n)
+                        (list 'vector-push! r (list 'vector-ref v (list '- (list '- n 1) i))))
+                  r))))
   ;; concat: (concat v1 v2)
   (setf (gethash "concat" *macros*)
         (lambda (form)
-          (let* ((v1 (second form))
-                 (v2 (third form))
-                 (cv1 (intern (format nil "_cv1~d" (incf *sysp-gensym-counter*))))
-                 (cv2 (intern (format nil "_cv2~d" (incf *sysp-gensym-counter*))))
-                 (result (intern (format nil "_cc~d" (incf *sysp-gensym-counter*))))
-                 (idx (intern (format nil "_ci~d" (incf *sysp-gensym-counter*)))))
-            (list 'do
-                  (list 'let cv1 v1)
-                  (list 'let cv2 v2)
-                  (list 'let-mut result (list '|Vector|))
-                  (list 'for (list idx 0 (list 'len cv1))
-                        (list 'vector-push! result (list 'vector-ref cv1 idx)))
-                  (list 'for (list idx 0 (list 'len cv2))
-                        (list 'vector-push! result (list 'vector-ref cv2 idx)))
-                  result))))
+          (let ((a (gsym "a")) (b (gsym "b")) (r (gsym "r")) (i (gsym "i")))
+            (list 'do (list 'let a (second form)) (list 'let b (third form))
+                  (list 'let-mut r (list '|Vector|))
+                  (list 'for (list i 0 (list 'len a)) (list 'vector-push! r (list 'vector-ref a i)))
+                  (list 'for (list i 0 (list 'len b)) (list 'vector-push! r (list 'vector-ref b i)))
+                  r))))
 
   ;; === Access macros ===
   ;; first: (first vec) => (vector-ref vec 0)
   (setf (gethash "first" *macros*)
         (lambda (form) (list 'vector-ref (second form) 0)))
-  ;; last: (last vec) => (vector-ref vec (- (vector-len vec) 1))
   (setf (gethash "last" *macros*)
         (lambda (form) (list 'vector-ref (second form) (list '- (list 'len (second form)) 1))))
-  ;; nth is now a builtin in *expr-dispatch* — dispatches by type
-  ;; (kept as comment for history)
-  ;; count: (count vec) => (vector-len vec)
-  (setf (gethash "count" *macros*)
-        (lambda (form) (list 'len (second form))))
-  ;; empty?: (empty? vec) => (== (vector-len vec) 0)
-  (setf (gethash "empty?" *macros*)
-        (lambda (form) (list '== (list 'len (second form)) 0)))
+  (setf (gethash "count" *macros*) (lambda (form) (list 'len (second form))))
+  (setf (gethash "empty?" *macros*) (lambda (form) (list '== (list 'len (second form)) 0)))
 
   ;; === Hash-map dependent collection macros ===
-  ;; distinct: (distinct vec) => use hash-map as seen set
-  ;; Note: generates hash-set! with first element to establish type, then loops
+  ;; distinct: (distinct vec) — deduplicate using hash-map as seen set
   (setf (gethash "distinct" *macros*)
         (lambda (form)
-          (let* ((vec (second form))
-                 (result (intern (format nil "_dsr~d" (incf *sysp-gensym-counter*))))
-                 (seen (intern (format nil "_dss~d" (incf *sysp-gensym-counter*))))
-                 (idx (intern (format nil "_dsi~d" (incf *sysp-gensym-counter*))))
-                 (elem (intern (format nil "_dse~d" (incf *sysp-gensym-counter*))))
-                 (vref (intern (format nil "_dsv~d" (incf *sysp-gensym-counter*)))))
-            ;; Use hash-map with first element to establish type
-            (list 'do
-                  (list 'let vref vec)
-                  (list 'let-mut result (list '|Vector| (list 'vector-ref vref 0)))
-                  (list 'let-mut seen (list '|HashMap| (list 'vector-ref vref 0) 1))
-                  (list 'for (list idx 1 (list 'len vref))
-                        (list 'let elem (list 'vector-ref vref idx))
-                        (list 'when (list 'not (list 'hash-has? seen elem))
-                              (list 'hash-set! seen elem 1)
-                              (list 'vector-push! result elem)))
-                  result))))
-  ;; frequencies: (frequencies vec) => hash-map counting occurrences
-  ;; Uses hash-map with first element to establish type
+          (let ((v (gsym "v")) (r (gsym "r")) (s (gsym "s")) (i (gsym "i")) (e (gsym "e")))
+            (list 'do (list 'let v (second form))
+                  (list 'let-mut r (list '|Vector| (list 'vector-ref v 0)))
+                  (list 'let-mut s (list '|HashMap| (list 'vector-ref v 0) 1))
+                  (list 'for (list i 1 (list 'len v))
+                        (list 'let e (list 'vector-ref v i))
+                        (list 'when (list 'not (list 'hash-has? s e))
+                              (list 'hash-set! s e 1) (list 'vector-push! r e)))
+                  r))))
+  ;; frequencies: (frequencies vec) — count occurrences
   (setf (gethash "frequencies" *macros*)
         (lambda (form)
-          (let* ((vec (second form))
-                 (m (intern (format nil "_fqm~d" (incf *sysp-gensym-counter*))))
-                 (idx (intern (format nil "_fqi~d" (incf *sysp-gensym-counter*))))
-                 (elem (intern (format nil "_fqe~d" (incf *sysp-gensym-counter*))))
-                 (vref (intern (format nil "_fqv~d" (incf *sysp-gensym-counter*)))))
-            (list 'do
-                  (list 'let vref vec)
-                  (list 'let-mut m (list '|HashMap| (list 'vector-ref vref 0) 1))
-                  (list 'for (list idx 1 (list 'len vref))
-                        (list 'let elem (list 'vector-ref vref idx))
-                        (list 'if (list 'hash-has? m elem)
-                              (list 'hash-set! m elem (list '+ (list 'hash-get m elem) 1))
-                              (list 'hash-set! m elem 1)))
+          (let ((v (gsym "v")) (m (gsym "m")) (i (gsym "i")) (e (gsym "e")))
+            (list 'do (list 'let v (second form))
+                  (list 'let-mut m (list '|HashMap| (list 'vector-ref v 0) 1))
+                  (list 'for (list i 1 (list 'len v))
+                        (list 'let e (list 'vector-ref v i))
+                        (list 'if (list 'hash-has? m e)
+                              (list 'hash-set! m e (list '+ (list 'hash-get m e) 1))
+                              (list 'hash-set! m e 1)))
                   m)))))
 
   ;; partial: (partial f a b) => (lambda [x] (f a b x))
@@ -2431,6 +2228,13 @@
          ((gethash head *generic-structs*)
           `(:generic ,head ,@(mapcar #'parse-type-expr (rest form))))
          (t form))))
+    ;; List with non-keyword head: (Vector :T), (HashMap :K :V) etc.
+    ((and (listp form) (symbolp (first form)))
+     (let ((head (symbol-name (first form))))
+       (cond
+         ((gethash head *generic-structs*)
+          `(:generic ,head ,@(mapcar #'parse-type-expr (rest form))))
+         (t form))))
     (t form)))
 
 (defparameter *primitive-type-map*
@@ -2442,7 +2246,7 @@
                     ("u8" . :u8) ("u16" . :u16) ("u32" . :u32) ("u64" . :u64)
                     ("float" . :float) ("double" . :double) ("f32" . :f32) ("f64" . :f64)
                     ("size" . :size) ("ptrdiff" . :ptrdiff) ("intptr" . :intptr) ("uintptr" . :uintptr)
-                    ("void" . :void) ("bool" . :bool) ("str" . :str)
+                    ("void" . :void) ("bool" . :bool) ("str" . (:ptr :char))
                     ("symbol" . :symbol) ("value" . :value) ("cons" . :cons) ("nil" . :nil))
               ht)
       (setf (gethash (car pair) ht) (cdr pair)))))
@@ -2473,134 +2277,77 @@
 
 ;;; === C Type Emission ===
 
+;; Primitive type → C type string mapping (shared by type-to-c)
+(defparameter *type-to-c-table*
+  '((:char . "char") (:short . "short") (:int . "int") (:long . "long") (:long-long . "long long")
+    (:uchar . "unsigned char") (:ushort . "unsigned short") (:uint . "unsigned int")
+    (:ulong . "unsigned long") (:ulong-long . "unsigned long long")
+    (:i8 . "int8_t") (:i16 . "int16_t") (:i32 . "int32_t") (:i64 . "int64_t")
+    (:u8 . "uint8_t") (:u16 . "uint16_t") (:u32 . "uint32_t") (:u64 . "uint64_t")
+    (:float . "float") (:double . "double") (:f32 . "float") (:f64 . "double")
+    (:size . "size_t") (:ptrdiff . "ptrdiff_t") (:intptr . "intptr_t") (:uintptr . "uintptr_t")
+    (:bool . "int") (:void . "void")
+    (:symbol . "Symbol") (:value . "Value") (:cons . "Value") (:nil . "Value")
+    (:list . "Value") (:variadic . "Value")))
+
 (defun type-to-c (tp)
-  (case (type-kind tp)
-    ;; Signed integers
-    (:char "char")
-    (:short "short")
-    (:int "int")
-    (:long "long")
-    (:long-long "long long")
-    ;; Unsigned integers
-    (:uchar "unsigned char")
-    (:ushort "unsigned short")
-    (:uint "unsigned int")
-    (:ulong "unsigned long")
-    (:ulong-long "unsigned long long")
-    ;; Fixed-width signed (C99 stdint.h)
-    (:i8 "int8_t")
-    (:i16 "int16_t")
-    (:i32 "int32_t")
-    (:i64 "int64_t")
-    ;; Fixed-width unsigned (C99 stdint.h)
-    (:u8 "uint8_t")
-    (:u16 "uint16_t")
-    (:u32 "uint32_t")
-    (:u64 "uint64_t")
-    ;; Floating point
-    (:float "float")
-    (:double "double")
-    (:f32 "float")
-    (:f64 "double")
-    ;; Size/pointer types (C99 stddef.h/stdint.h)
-    (:size "size_t")
-    (:ptrdiff "ptrdiff_t")
-    (:intptr "intptr_t")
-    (:uintptr "uintptr_t")
-    ;; Other
-    (:bool "int")
-    (:void "void")
-    (:str "const char*")
-    ;; Compound types
-    (:ptr (format nil "~a*" (type-to-c (second tp))))
-    (:struct (second tp))
-    (:enum (second tp))
-    (:array (type-to-c (second tp)))  ; array decl handled specially
-    (:vector (vector-type-c-name tp))
-    (:hashmap (hashmap-type-c-name tp))
-    (:tuple (tuple-type-c-name tp))
-    (:fn (fn-type-c-name tp))
-    (:symbol "Symbol")
-    (:value "Value")
-    (:cons "Value")  ; cons cells are Values (tagged)
-    (:nil "Value")   ; nil is a Value
-    (:list "Value")  ; lists are also Values (tagged cons chain)
-    (:variadic "Value")  ; variadic rest compiles to Value at runtime
-    (:union (union-type-c-name tp))
-    (:volatile (format nil "volatile ~a" (type-to-c (second tp))))
-    (:rc (format nil "_RC_~a*" (type-to-c (rc-inner-type tp))))
-    (:future (format nil "_spawn_~a*" (third tp)))  ; (:future T spawn-id) → _spawn_N*
-    (:values (values-type-c-name tp))
-    (:generic (let* ((name (second tp))
-                     (type-args (cddr tp))
-                     (mangled (instantiate-generic-struct name type-args)))
-                mangled))
-    (otherwise "int")))
+  (let ((prim (cdr (assoc (type-kind tp) *type-to-c-table*))))
+    (if prim prim
+      (case (type-kind tp)
+        (:ptr (format nil "~a*" (type-to-c (second tp))))
+        (:struct (second tp))
+        (:enum (second tp))
+        (:array (type-to-c (second tp)))
+        (:tuple (tuple-type-c-name tp))
+        (:fn (fn-type-c-name tp))
+        (:union (union-type-c-name tp))
+        (:volatile (format nil "volatile ~a" (type-to-c (second tp))))
+        (:rc (format nil "_RC_~a*" (type-to-c (rc-inner-type tp))))
+        (:future (format nil "_spawn_~a*" (third tp)))
+        (:values (values-type-c-name tp))
+        (:generic (instantiate-generic-struct (second tp) (cddr tp)))
+        (otherwise "int")))))
+
+(defparameter *mangle-type-table*
+  '((:int . "int") (:char . "char") (:short . "short") (:long . "long") (:long-long . "longlong")
+    (:uchar . "uchar") (:ushort . "ushort") (:uint . "uint") (:ulong . "ulong") (:ulong-long . "ulonglong")
+    (:i8 . "i8") (:i16 . "i16") (:i32 . "i32") (:i64 . "i64")
+    (:u8 . "u8") (:u16 . "u16") (:u32 . "u32") (:u64 . "u64")
+    (:size . "size") (:ptrdiff . "ptrdiff") (:intptr . "intptr") (:uintptr . "uintptr")
+    (:float . "float") (:double . "double") (:f32 . "f32") (:f64 . "f64")
+    (:bool . "bool") (:void . "void") (:symbol . "sym")
+    (:value . "val") (:cons . "cons") (:nil . "nil")))
 
 (defun mangle-type-name (tp)
-  (case (type-kind tp)
-    ;; Integer types
-    (:int "int")
-    (:char "char")
-    (:short "short")
-    (:long "long")
-    (:long-long "longlong")
-    (:uchar "uchar")
-    (:ushort "ushort")
-    (:uint "uint")
-    (:ulong "ulong")
-    (:ulong-long "ulonglong")
-    ;; Fixed-width integers
-    (:i8 "i8") (:i16 "i16") (:i32 "i32") (:i64 "i64")
-    (:u8 "u8") (:u16 "u16") (:u32 "u32") (:u64 "u64")
-    ;; Size types
-    (:size "size") (:ptrdiff "ptrdiff") (:intptr "intptr") (:uintptr "uintptr")
-    ;; Float types
-    (:float "float") (:double "double") (:f32 "f32") (:f64 "f64")
-    ;; Other primitives
-    (:bool "bool")
-    (:str "str")
-    (:void "void")
-    (:symbol "sym")
-    (:value "val")
-    (:cons "cons")
-    (:nil "nil")
-    ;; Compound types
-    (:ptr (format nil "ptr_~a" (mangle-type-name (second tp))))
-    (:struct (second tp))
-    (:enum (second tp))
-    (:array (format nil "arr_~a_~a" (mangle-type-name (second tp))
-                    (third tp)))
-    (:vector (vector-type-c-name tp))
-    (:hashmap (hashmap-type-c-name tp))
-    (:tuple (tuple-type-c-name tp))
-    (:fn (fn-type-c-name tp))
-    (:list (format nil "list_~a" (mangle-type-name (second tp))))
-    (:variadic (format nil "var_~a" (mangle-type-name (second tp))))
-    ;; Multiple return values
-    (:values (values-type-c-name tp))
-    ;; Union types
-    (:union (format nil "Union_~{~a~^_~}" (mapcar #'mangle-type-name (cdr tp))))
-    ;; RC-managed types
-    (:rc (format nil "rc_~a" (mangle-type-name (rc-inner-type tp))))
-    ;; Future types
-    (:future (format nil "future_~a" (mangle-type-name (second tp))))
-    ;; Generic struct instances
-    (:generic (format nil "~a~{_~a~}" (second tp) (mapcar #'mangle-type-name (cddr tp))))
-    (otherwise (warn "mangle-type-name: unhandled type ~a" tp) "unknown")))
+  (let ((prim (cdr (assoc (type-kind tp) *mangle-type-table*))))
+    (if prim prim
+      (case (type-kind tp)
+        (:ptr (if (eq (second tp) :char) "str"
+                   (format nil "ptr_~a" (mangle-type-name (second tp)))))
+        (:struct (second tp)) (:enum (second tp))
+        (:array (format nil "arr_~a_~a" (mangle-type-name (second tp)) (third tp)))
+        (:tuple (tuple-type-c-name tp)) (:fn (fn-type-c-name tp))
+        (:list (format nil "list_~a" (mangle-type-name (second tp))))
+        (:variadic (format nil "var_~a" (mangle-type-name (second tp))))
+        (:values (values-type-c-name tp))
+        (:union (format nil "Union_~{~a~^_~}" (mapcar #'mangle-type-name (cdr tp))))
+        (:rc (format nil "rc_~a" (mangle-type-name (rc-inner-type tp))))
+        (:future (format nil "future_~a" (mangle-type-name (second tp))))
+        (:generic (format nil "~a~{_~a~}" (second tp) (mapcar #'mangle-type-name (cddr tp))))
+        (otherwise (warn "mangle-type-name: unhandled type ~a" tp) "unknown")))))
 
 (defun vector-type-c-name (tp)
-  (let* ((elem (second tp))
-         (name (format nil "Vector_~a" (mangle-type-name elem))))
-    (ensure-vector-type name elem)
-    name))
+  "Get C type name for a Vector type, ensuring the struct is instantiated.
+   Works with both old (:vector elem) and new (:generic \"Vector\" elem) format."
+  (let ((elem (if (vector-type-p tp) (vector-elem-type tp) (second tp))))
+    (instantiate-generic-struct "Vector" (list elem))))
 
 (defun hashmap-type-c-name (tp)
-  (let* ((key-type (second tp))
-         (val-type (third tp))
-         (name (format nil "HashMap_~a_~a" (mangle-type-name key-type) (mangle-type-name val-type))))
-    (ensure-hashmap-type name key-type val-type)
-    name))
+  "Get C type name for a HashMap type, ensuring the struct is instantiated.
+   Works with both old (:hashmap k v) and new (:generic \"HashMap\" k v) format."
+  (let ((key-type (if (hashmap-type-p tp) (hashmap-key-type tp) (second tp)))
+        (val-type (if (hashmap-type-p tp) (hashmap-val-type tp) (third tp))))
+    (instantiate-generic-struct "HashMap" (list key-type val-type))))
 
 (defun tuple-type-c-name (tp)
   (let* ((elems (cdr tp))
@@ -2654,7 +2401,7 @@
               (lst (copy-list fields-raw)))
           (loop while lst do
             (let* ((fname (pop lst))
-                   (fname-str (string fname)))
+                   (fname-str (string-downcase (string fname))))
               ;; Parse the type annotation from the remaining list
               (when (and lst (or (keywordp (first lst))
                                  (and (listp (first lst)) (keywordp (car (first lst))))))
@@ -2672,8 +2419,63 @@
                           mangled
                           (loop for (fname . ftype) in concrete-fields
                                 append (list (type-to-c ftype) (sanitize-name fname))))
-                  *struct-defs*)))))
+                  *struct-defs*))
+          ;; Auto-generate helpers for known collection types
+          (generate-collection-helpers struct-name concrete-types mangled concrete-fields))))
     mangled))
+
+(defun generate-collection-helpers (struct-name concrete-types mangled fields)
+  "Auto-generate C helper functions for Vector and HashMap via runtime macros."
+  (cond
+    ((equal struct-name "Vector")
+     (let* ((elem-type (first concrete-types))
+            (c-elem (type-to-c elem-type))
+            (mk (mangle-type-name elem-type))
+            (guard (format nil "_vechelpers_~a" mk))
+            (va-promote (if (member c-elem '("char" "unsigned char" "short" "float") :test #'string=)
+                            (if (string= c-elem "float") "double" "int")
+                            c-elem)))
+       (unless (gethash guard *generated-types*)
+         (setf (gethash guard *generated-types*) t)
+         (pushnew "stdarg.h" *includes* :test #'string=)
+         (pushnew "runtime/vector.h" *includes* :test #'string=)
+         (push (format nil "SYSP_VECTOR_PUSH(~a, ~a, ~a)~%SYSP_VECTOR_MAKE(~a, ~a, ~a, ~a)~%"
+                       mangled c-elem mk mangled c-elem va-promote mk)
+               *functions*))))
+    ((equal struct-name "HashMap")
+     (let* ((key-type (first concrete-types))
+            (val-type (second concrete-types))
+            (ck (type-to-c key-type))
+            (cv (type-to-c val-type))
+            (mk (mangle-type-name key-type))
+            (mv (mangle-type-name val-type))
+            (is-str-key (str-type-p key-type))
+            (vec-k-name (vector-type-c-name (make-vector-type key-type)))
+            (vec-v-name (vector-type-c-name (make-vector-type val-type)))
+            (push-k (format nil "sysp_vecpush_~a" mk))
+            (push-v (format nil "sysp_vecpush_~a" mv))
+            (key-eq (if is-str-key "strcmp(m->keys[h], key) == 0" "m->keys[h] == key"))
+            (hash-expr (if is-str-key "_sysp_hash_str(key)"
+                           (format nil "_sysp_hash_int(*(unsigned int*)&key)")))
+            (rehash-expr (if is-str-key "_sysp_hash_str(ok[i])"
+                             (format nil "_sysp_hash_int(*(unsigned int*)&ok[i])"))))
+       (pushnew "runtime/hashmap.h" *includes* :test #'string=)
+       (push (format nil "SYSP_HASHMAP_GROW(~a, ~a, ~a, ~a, ~a, ~a)
+SYSP_HASHMAP_SET(~a, ~a, ~a, ~a, ~a, ~a, ~a)
+SYSP_HASHMAP_GET(~a, ~a, ~a, ~a, ~a, ~a, ~a)
+SYSP_HASHMAP_HAS(~a, ~a, ~a, ~a, ~a, ~a)
+SYSP_HASHMAP_DEL(~a, ~a, ~a, ~a, ~a, ~a)
+SYSP_HASHMAP_KEYS(~a, ~a, ~a, ~a, ~a)
+SYSP_HASHMAP_VALS(~a, ~a, ~a, ~a, ~a)~%"
+                     mk mv mangled ck cv rehash-expr
+                     mk mv mangled ck cv hash-expr key-eq
+                     mk mv mangled ck cv hash-expr key-eq
+                     mk mv mangled ck hash-expr key-eq
+                     mk mv mangled ck hash-expr key-eq
+                     mk mv mangled vec-k-name push-k
+                     mk mv mangled vec-v-name push-v)
+             *functions*)))
+    (t nil)))
 
 (defun subst-type-params (type-form subst-table)
   "Substitute type parameters in a type form using a substitution table.
@@ -2701,17 +2503,7 @@
          (t (cons (car type-form) (mapcar (lambda (x) (subst-type-params x subst-table)) (cdr type-form)))))))
     (t type-form)))
 
-(defun ensure-vector-type (name elem-type)
-  (unless (gethash name *generated-types*)
-    (setf (gethash name *generated-types*) t)
-    (push (format nil "typedef struct { ~a* data; int len; int cap; } ~a;~%"
-                  (type-to-c elem-type) name)
-          *type-decls*)
-    ;; Register fields so (get v data), (get v len), (get v cap) type-check
-    (setf (gethash name *structs*)
-          (list (cons "data" (make-ptr-type elem-type))
-                (cons "len" :int)
-                (cons "cap" :int)))))
+;; ensure-vector-type removed — Vector is now a generic struct, instantiated via instantiate-generic-struct
 
 (defun ensure-tuple-type (name elem-types)
   (unless (gethash name *generated-types*)
@@ -2722,108 +2514,8 @@
       (push (format nil "typedef struct {~%~{~a~%~}} ~a;~%" fields name)
             *type-decls*))))
 
-(defun ensure-hashmap-type (name key-type val-type)
-  "Generate C struct + helpers for a hash map type (open addressing, linear probing)."
-  (unless (gethash name *generated-types*)
-    (setf (gethash name *generated-types*) t)
-    (setf *uses-hashmap* t)
-    (let* ((ck (type-to-c key-type))
-           (cv (type-to-c val-type))
-           (mk (mangle-type-name key-type))
-           (mv (mangle-type-name val-type))
-           (is-str-key (eq key-type :str))
-           ;; Ensure vector types for keys/vals
-           (vec-k-name (vector-type-c-name (make-vector-type key-type)))
-           (vec-v-name (vector-type-c-name (make-vector-type val-type)))
-           (push-k-name (format nil "sysp_vecpush_~a" mk))
-           (push-v-name (format nil "sysp_vecpush_~a" mv)))
-      ;; Ensure vector push helpers for keys/vals
-      (ensure-vector-push-helper push-k-name vec-k-name ck)
-      (ensure-vector-push-helper push-v-name vec-v-name cv)
-      ;; Struct: { keys, vals, occ, len, cap }
-      (push (format nil "typedef struct { ~a* keys; ~a* vals; char* occ; int len; int cap; } ~a;~%"
-                    ck cv name)
-            *type-decls*)
-      ;; Register fields so (get m keys), (get m len) etc. type-check
-      (setf (gethash name *structs*)
-            (list (cons "keys" (make-ptr-type key-type))
-                  (cons "vals" (make-ptr-type val-type))
-                  (cons "occ" (make-ptr-type :char))
-                  (cons "len" :int)
-                  (cons "cap" :int)))
-      ;; key comparison expression
-      (let ((key-eq (if is-str-key
-                        "strcmp(m->keys[h], key) == 0"
-                        "m->keys[h] == key"))
-            (hash-call (if is-str-key
-                           "_sysp_hash_str(key)"
-                           (format nil "_sysp_hash_int(*(unsigned int*)&key)"))))
-        ;; grow helper
-        (push (format nil "static void _hm_grow_~a_~a(~a* m) {
-  int oc = m->cap; ~a* ok = m->keys; ~a* ov = m->vals; char* oo = m->occ;
-  m->cap = oc ? oc * 2 : 8; m->len = 0;
-  m->keys = calloc(m->cap, sizeof(~a)); m->vals = calloc(m->cap, sizeof(~a));
-  m->occ = calloc(m->cap, 1);
-  for (int i = 0; i < oc; i++) { if (oo[i] == 1) { unsigned int h = ~a % m->cap;~a while (m->occ[h]) h = (h + 1) % m->cap; m->keys[h] = ok[i]; m->vals[h] = ov[i]; m->occ[h] = 1; m->len++; } }
-  free(ok); free(ov); free(oo);
-}~%"
-                      mk mv name ck cv ck cv
-                      ;; hash the OLD key during rehash
-                      (if is-str-key "_sysp_hash_str(ok[i])" (format nil "_sysp_hash_int(*(unsigned int*)&ok[i])"))
-                      ;; for str keys during rehash, no extra step needed; hash already computed above
-                      "")
-              *functions*)
-        ;; set helper
-        (push (format nil "static void _hm_set_~a_~a(~a* m, ~a key, ~a val) {
-  if (m->len * 4 >= m->cap * 3) _hm_grow_~a_~a(m);
-  unsigned int h = ~a % m->cap;
-  while (m->occ[h] == 1) { if (~a) { m->vals[h] = val; return; } h = (h + 1) % m->cap; }
-  m->keys[h] = key; m->vals[h] = val; m->occ[h] = 1; m->len++;
-}~%"
-                      mk mv name ck cv mk mv hash-call key-eq)
-              *functions*)
-        ;; get helper
-        (push (format nil "static ~a _hm_get_~a_~a(~a* m, ~a key) {
-  if (!m->cap) return (~a){0};
-  unsigned int h = ~a % m->cap;
-  while (m->occ[h]) { if (m->occ[h] == 1 && ~a) return m->vals[h]; h = (h + 1) % m->cap; }
-  return (~a){0};
-}~%"
-                      cv mk mv name ck cv hash-call key-eq cv)
-              *functions*)
-        ;; has helper
-        (push (format nil "static int _hm_has_~a_~a(~a* m, ~a key) {
-  if (!m->cap) return 0;
-  unsigned int h = ~a % m->cap;
-  while (m->occ[h]) { if (m->occ[h] == 1 && ~a) return 1; h = (h + 1) % m->cap; }
-  return 0;
-}~%"
-                      mk mv name ck hash-call key-eq)
-              *functions*)
-        ;; del helper
-        (push (format nil "static void _hm_del_~a_~a(~a* m, ~a key) {
-  if (!m->cap) return;
-  unsigned int h = ~a % m->cap;
-  while (m->occ[h]) { if (m->occ[h] == 1 && ~a) { m->occ[h] = 2; m->len--; return; } h = (h + 1) % m->cap; }
-}~%"
-                      mk mv name ck hash-call key-eq)
-              *functions*)
-        ;; keys helper
-        (push (format nil "static ~a _hm_keys_~a_~a(~a* m) {
-  ~a r = {NULL, 0, 0};
-  for (int i = 0; i < m->cap; i++) { if (m->occ[i] == 1) ~a(&r, m->keys[i]); }
-  return r;
-}~%"
-                      vec-k-name mk mv name vec-k-name push-k-name)
-              *functions*)
-        ;; vals helper
-        (push (format nil "static ~a _hm_vals_~a_~a(~a* m) {
-  ~a r = {NULL, 0, 0};
-  for (int i = 0; i < m->cap; i++) { if (m->occ[i] == 1) ~a(&r, m->vals[i]); }
-  return r;
-}~%"
-                      vec-v-name mk mv name vec-v-name push-v-name)
-              *functions*)))))
+;; ensure-hashmap-type removed — HashMap is now a generic struct, instantiated via instantiate-generic-struct
+;; C helpers are generated by generate-collection-helpers called from instantiate-generic-struct
 
 (defun ensure-fn-type (name arg-types ret-type)
   (unless (gethash name *generated-types*)
@@ -2899,20 +2591,7 @@
   "Get the C type name for a union type, ensuring it's generated."
   (ensure-union-type tp))
 
-(defun ensure-vector-helper (name c-elem c-vec)
-  "Emit a helper function for creating vectors of a specific type"
-  (unless (gethash name *generated-types*)
-    (setf (gethash name *generated-types*) t)
-    (pushnew "stdarg.h" *includes* :test #'string=)
-    ;; Emit: Vector_T sysp_mkvec_T(int n, ...) { ... }
-    (push (format nil "static ~a ~a(int n, ...) { va_list ap; va_start(ap, n); ~a* d = malloc(sizeof(~a) * n); for(int i = 0; i < n; i++) d[i] = va_arg(ap, ~a); va_end(ap); return (~a){d, n, n}; }~%"
-                  c-vec name c-elem c-elem
-                  ;; For small types, va_arg promotes to int
-                  (if (member c-elem '("char" "unsigned char" "short" "float") :test #'string=)
-                      (if (string= c-elem "float") "double" "int")
-                      c-elem)
-                  c-vec)
-          *functions*)))
+;; ensure-vector-helper removed — now generated by generate-collection-helpers
 
 (defun wrap-as-union (code concrete-type union-type)
   "Generate C code to wrap a concrete value into a union type.
@@ -2923,17 +2602,7 @@
         (format nil "~a_from_~a(~a)" union-name mname code))
       code))
 
-(defun ensure-vector-push-helper (name c-vec c-elem)
-  "Emit a helper function for pushing to vectors of a specific type.
-   Handles stack-to-heap transition: cap=0 means stack/compound-literal data,
-   so we malloc+memcpy instead of realloc (can't realloc stack memory)."
-  (unless (gethash name *generated-types*)
-    (setf (gethash name *generated-types*) t)
-    (pushnew "string.h" *includes* :test #'string=)
-    ;; Emit: void sysp_vecpush_T(Vector_T* v, T val) { ... }
-    (push (format nil "static void ~a(~a* v, ~a val) { if(v->len >= v->cap) { int _nc = (v->cap > 0) ? v->cap * 2 : (v->len > 0 ? v->len * 2 : 4); ~a* _nd = malloc(sizeof(~a) * _nc); if(v->len > 0) memcpy(_nd, v->data, sizeof(~a) * v->len); if(v->cap > 0) free(v->data); v->data = _nd; v->cap = _nc; } v->data[v->len++] = val; }~%"
-                  name c-vec c-elem c-elem c-elem c-elem)
-          *functions*)))
+;; ensure-vector-push-helper removed — now generated by generate-collection-helpers
 
 ;;; === Statement Lifting (expressions that are really statements) ===
 
@@ -3031,7 +2700,7 @@
         ;; Larger than signed max - use unsigned long long
         (values (format nil "~dULL" form) :ulong-long))))
     ((floatp form) (values (format nil "~f" form) :float))
-    ((stringp form) (values (format nil "~s" form) :str))
+    ((stringp form) (values (format nil "~s" form) '(:ptr :char)))
     ((symbolp form)
      (let* ((raw-name (string form))
             (name (resolve-name raw-name)))
@@ -3121,18 +2790,14 @@
 (defparameter *expr-dispatch*
   '(("if" . compile-if-expr) ("do" . compile-do-expr) ("cond" . compile-cond-expr)
     ("get" . compile-get) ("Vector" . compile-vector)
-    ("vector-push!" . compile-vector-push)
     ("HashMap" . compile-hash-map)
-    ("hash-get" . compile-hash-get) ("hash-set!" . compile-hash-set)
-    ("hash-has?" . compile-hash-has) ("hash-del!" . compile-hash-del)
-    ("hash-keys" . compile-hash-keys) ("hash-vals" . compile-hash-vals)
     ("tuple" . compile-tuple) ("tuple-ref" . compile-tuple-ref)
     ("lambda" . compile-lambda)
     ("array-ref" . compile-array-ref) ("array-set!" . compile-array-set)
     ("make-array" . compile-make-array)
     ("set!" . compile-set-expr)
     ("addr-of" . compile-addr-of) ("deref" . compile-deref)
-    ("cast" . compile-cast) ("sizeof" . compile-sizeof)
+    ("cast" . compile-cast) ("sizeof" . compile-sizeof) ("sizeof-val" . compile-sizeof-val)
     ("runtype" . compile-runtype) ("as" . compile-as)
     ("cons" . compile-cons) ("car" . compile-car) ("cdr" . compile-cdr)
     ("nil?" . compile-nilp) ("list" . compile-list-expr)
@@ -3631,13 +3296,8 @@
                    (release-stmts (mapcan
                                    (lambda (entry)
                                      (let ((c-name (car entry))
-                                           (kind (cdr entry)))
-                                       (case kind
-                                         (:vector (list (format nil "  if (~a.cap > 0) free(~a.data);" c-name c-name)))
-                                         (:hashmap (list (format nil "  free(~a.keys); free(~a.vals); free(~a.occ);"
-                                                                 c-name c-name c-name)))
-                                         (:string (list (format nil "  free((char*)~a);" c-name)))
-                                         (otherwise nil))))
+                                           (tp (cdr entry)))
+                                       (emit-drop c-name tp)))
                                    releases)))
               (values type (append body-stmts last-stmts release-stmts))))))))
 
@@ -3716,21 +3376,16 @@
            (is-ptr-struct (and (not is-rc)
                                (eq (type-kind tp) :ptr)
                                (consp (second tp))
-                               (eq (type-kind (second tp)) :struct)))
+                               (member (type-kind (second tp)) '(:struct :generic))))
            (struct-type (cond (is-rc (rc-inner-type tp))
                               (is-ptr-struct (second tp))
                               (t tp)))
-           ;; Handle generic struct types
+           ;; Handle generic struct types (Vector/HashMap are now generic structs)
            (struct-name (cond
                           ((eq (type-kind struct-type) :struct) (second struct-type))
                           ((eq (type-kind struct-type) :generic)
                            ;; Instantiate and use mangled name
                            (instantiate-generic-struct (second struct-type) (cddr struct-type)))
-                          ;; Vector/HashMap types are registered as structs by ensure-*-type
-                          ((eq (type-kind struct-type) :vector)
-                           (vector-type-c-name struct-type))
-                          ((eq (type-kind struct-type) :hashmap)
-                           (hashmap-type-c-name struct-type))
                           (t nil)))
            (field-type (if (and struct-name (gethash struct-name *structs*))
                            (let ((fields (gethash struct-name *structs*)))
@@ -3757,8 +3412,8 @@
                       ((and *current-fn-name* *current-let-target*
                             (let ((inferred (gethash (format nil "~a:~a" *current-fn-name* *current-let-target*)
                                                      *infer-locals*)))
-                              (when (and inferred (eq (type-kind inferred) :vector))
-                                (second inferred)))))
+                              (when (and inferred (vector-type-p inferred))
+                                (vector-elem-type inferred)))))
                       (t :int)))
          (vec-type (make-vector-type elem-type))
          (c-name (type-to-c vec-type))
@@ -3777,43 +3432,16 @@
                     vec-type)
             ;; Escaping or unknown: heap-allocate via helper
             (let ((helper-name (format nil "sysp_mkvec_~a" (mangle-type-name elem-type))))
-              (ensure-vector-helper helper-name c-elem c-name)
+              ;; Helper is auto-generated by generate-collection-helpers
+              ;; Just ensure the type is instantiated
+              (vector-type-c-name vec-type)
               (values (format nil "~a(~d~{, ~a~})" helper-name n (mapcar #'first compiled))
                       vec-type))))))
 
 (define-accessor vector-ref "~a.data[~a]"
-  (if (eq (type-kind tp) :vector)
-      (second tp)
+  (if (vector-type-p tp)
+      (vector-elem-type tp)
       :int))
-
-(defun compile-vector-set (form env)
-  "(vector-set! vec idx val)"
-  (multiple-value-bind (vec vt) (compile-expr (second form) env)
-    (multiple-value-bind (idx it) (compile-expr (third form) env)
-      (declare (ignore it))
-      (multiple-value-bind (val val-type) (compile-expr (fourth form) env)
-        (declare (ignore val-type))
-        (let ((elem-type (if (eq (type-kind vt) :vector)
-                             (second vt)
-                             :int)))
-          (values (format nil "(~a.data[~a] = ~a)" vec idx val) elem-type))))))
-
-(defun compile-vector-push (form env)
-  "(vector-push! vec val) — push to dynamic vector (C99 compliant)"
-  (multiple-value-bind (vec vt) (compile-expr (second form) env)
-    (multiple-value-bind (val val-type) (compile-expr (third form) env)
-      (declare (ignore val-type))
-      (let* ((elem-type (if (eq (type-kind vt) :vector)
-                            (second vt)
-                            :int))
-             (c-vec (type-to-c vt))
-             (c-elem (type-to-c elem-type))
-             (helper-name (format nil "sysp_vecpush_~a" (mangle-type-name elem-type))))
-        (ensure-vector-push-helper helper-name c-vec c-elem)
-        (values (format nil "~a(&~a, ~a)" helper-name vec val)
-                :void)))))
-
-(define-len vector-len "~a.len")
 
 ;;; === Hash Map Operations ===
 
@@ -3822,7 +3450,7 @@
   (let ((args (rest form)))
     (if (null args)
         ;; Empty: infer from context or default to str->int
-        (let* ((key-type :str) (val-type :int)
+        (let* ((key-type '(:ptr :char)) (val-type :int)
                (hm-type (make-hashmap-type key-type val-type))
                (c-name (type-to-c hm-type)))
           (values (format nil "(~a){NULL, NULL, NULL, 0, 0}" c-name) hm-type))
@@ -3850,171 +3478,43 @@
           (push (format nil "  ~a ~a = (~a){NULL, NULL, NULL, 0, 0};" c-name tmp c-name) *pending-stmts*)
           (values tmp hm-type)))))
 
-(defun compile-hash-get (form env)
-  "(hash-get m k)"
-  (multiple-value-bind (m mt) (compile-expr (second form) env)
-    (multiple-value-bind (k kt) (compile-expr (third form) env)
-      (declare (ignore kt))
-      (let* ((key-type (if (eq (type-kind mt) :hashmap) (second mt) :str))
-             (val-type (if (eq (type-kind mt) :hashmap) (third mt) :int))
-             (mk (mangle-type-name key-type))
-             (mv (mangle-type-name val-type)))
-        (values (format nil "_hm_get_~a_~a(&~a, ~a)" mk mv m k) val-type)))))
-
-(defun compile-hash-set (form env)
-  "(hash-set! m k v)"
-  (multiple-value-bind (m mt) (compile-expr (second form) env)
-    (multiple-value-bind (k kt) (compile-expr (third form) env)
-      (declare (ignore kt))
-      (multiple-value-bind (v vt) (compile-expr (fourth form) env)
-        (declare (ignore vt))
-        (let* ((key-type (if (eq (type-kind mt) :hashmap) (second mt) :str))
-               (val-type (if (eq (type-kind mt) :hashmap) (third mt) :int))
-               (mk (mangle-type-name key-type))
-               (mv (mangle-type-name val-type)))
-          (values (format nil "_hm_set_~a_~a(&~a, ~a, ~a)" mk mv m k v) :void))))))
-
-(defun compile-hash-has (form env)
-  "(hash-has? m k)"
-  (multiple-value-bind (m mt) (compile-expr (second form) env)
-    (multiple-value-bind (k kt) (compile-expr (third form) env)
-      (declare (ignore kt))
-      (let* ((key-type (if (eq (type-kind mt) :hashmap) (second mt) :str))
-             (val-type (if (eq (type-kind mt) :hashmap) (third mt) :int))
-             (mk (mangle-type-name key-type))
-             (mv (mangle-type-name val-type)))
-        (values (format nil "_hm_has_~a_~a(&~a, ~a)" mk mv m k) :bool)))))
-
-(defun compile-hash-del (form env)
-  "(hash-del! m k)"
-  (multiple-value-bind (m mt) (compile-expr (second form) env)
-    (multiple-value-bind (k kt) (compile-expr (third form) env)
-      (declare (ignore kt))
-      (let* ((key-type (if (eq (type-kind mt) :hashmap) (second mt) :str))
-             (val-type (if (eq (type-kind mt) :hashmap) (third mt) :int))
-             (mk (mangle-type-name key-type))
-             (mv (mangle-type-name val-type)))
-        (values (format nil "_hm_del_~a_~a(&~a, ~a)" mk mv m k) :void)))))
-
-(defun compile-hash-len (form env)
-  "(hash-len m)"
-  (multiple-value-bind (m mt) (compile-expr (second form) env)
-    (declare (ignore mt))
-    (values (format nil "~a.len" m) :int)))
-
-(defun compile-hash-keys (form env)
-  "(hash-keys m)"
-  (multiple-value-bind (m mt) (compile-expr (second form) env)
-    (let* ((key-type (if (eq (type-kind mt) :hashmap) (second mt) :str))
-           (val-type (if (eq (type-kind mt) :hashmap) (third mt) :int))
-           (mk (mangle-type-name key-type))
-           (mv (mangle-type-name val-type)))
-      (values (format nil "_hm_keys_~a_~a(&~a)" mk mv m)
-              (make-vector-type key-type)))))
-
-(defun compile-hash-vals (form env)
-  "(hash-vals m)"
-  (multiple-value-bind (m mt) (compile-expr (second form) env)
-    (let* ((key-type (if (eq (type-kind mt) :hashmap) (second mt) :str))
-           (val-type (if (eq (type-kind mt) :hashmap) (third mt) :int))
-           (mk (mangle-type-name key-type))
-           (mv (mangle-type-name val-type)))
-      (values (format nil "_hm_vals_~a_~a(&~a)" mk mv m)
-              (make-vector-type val-type)))))
-
-(defun compile-hash-free-stmt (form env)
-  "(hash-free m) — free internal arrays of a hash map"
-  (let ((*pending-stmts* nil))
-    (multiple-value-bind (m mt) (compile-expr (second form) env)
-      (declare (ignore mt))
-      (append *pending-stmts*
-              (list (format nil "  free(~a.keys); free(~a.vals); free(~a.occ);" m m m))))))
-
-(defun compile-vector-free-stmt (form env)
-  "(vector-free v) — free data array of a vector"
-  (let ((*pending-stmts* nil))
-    (multiple-value-bind (v vt) (compile-expr (second form) env)
-      (declare (ignore vt))
-      (append *pending-stmts*
-              (list (format nil "  free(~a.data);" v))))))
-
 ;;; === String Builtins ===
 
 (defun ensure-string-helpers ()
-  "Emit C helper functions for string operations, guarded by *generated-types*."
-  (unless (gethash "_sysp_str_helpers" *generated-types*)
-    (setf (gethash "_sysp_str_helpers" *generated-types*) t)
-    (pushnew "string.h" *includes* :test #'string=)
-    (pushnew "ctype.h" *includes* :test #'string=)
-    (pushnew "stdio.h" *includes* :test #'string=)
-    ;; str-concat: allocate new string from two parts
-    (push "static const char* _sysp_str_concat(const char* a, const char* b) { int la = strlen(a), lb = strlen(b); char* r = malloc(la + lb + 1); memcpy(r, a, la); memcpy(r + la, b, lb + 1); return r; }
-"
-          *functions*)
-    ;; str-slice: extract substring [start, end)
-    (push "static const char* _sysp_str_slice(const char* s, int start, int end) { int slen = strlen(s); if (start < 0) start = 0; if (end > slen) end = slen; if (start >= end) { char* r = malloc(1); r[0] = 0; return r; } int n = end - start; char* r = malloc(n + 1); memcpy(r, s + start, n); r[n] = 0; return r; }
-"
-          *functions*)
-    ;; str-upper
-    (push "static const char* _sysp_str_upper(const char* s) { int n = strlen(s); char* r = malloc(n + 1); for (int i = 0; i <= n; i++) r[i] = toupper((unsigned char)s[i]); return r; }
-"
-          *functions*)
-    ;; str-lower
-    (push "static const char* _sysp_str_lower(const char* s) { int n = strlen(s); char* r = malloc(n + 1); for (int i = 0; i <= n; i++) r[i] = tolower((unsigned char)s[i]); return r; }
-"
-          *functions*)
-    ;; str-from-int
-    (push "static const char* _sysp_str_from_int(int v) { char buf[32]; snprintf(buf, sizeof(buf), \"%d\", v); int n = strlen(buf); char* r = malloc(n + 1); memcpy(r, buf, n + 1); return r; }
-"
-          *functions*)
-    ;; str-from-float
-    (push "static const char* _sysp_str_from_float(double v) { char buf[64]; snprintf(buf, sizeof(buf), \"%g\", v); int n = strlen(buf); char* r = malloc(n + 1); memcpy(r, buf, n + 1); return r; }
-"
-          *functions*)
-    ;; str-trim
-    (push "static const char* _sysp_str_trim(const char* s) { while (*s && (*s == ' ' || *s == '\\t' || *s == '\\n' || *s == '\\r')) s++; int n = strlen(s); while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\\t' || s[n-1] == '\\n' || s[n-1] == '\\r')) n--; char* r = malloc(n + 1); memcpy(r, s, n); r[n] = 0; return r; }
-"
-          *functions*)
-    ;; str-replace
-    (push "static const char* _sysp_str_replace(const char* s, const char* old, const char* new_s) { int slen = strlen(s), olen = strlen(old), nlen = strlen(new_s); if (olen == 0) { int n = slen; char* r = malloc(n + 1); memcpy(r, s, n + 1); return r; } int count = 0; const char* p = s; while ((p = strstr(p, old))) { count++; p += olen; } char* r = malloc(slen + count * (nlen - olen) + 1); char* w = r; p = s; while (1) { const char* f = strstr(p, old); if (!f) { strcpy(w, p); break; } memcpy(w, p, f - p); w += f - p; memcpy(w, new_s, nlen); w += nlen; p = f + olen; } return r; }
-"
-          *functions*)
-    ;; str-join (takes Vector_str and delimiter)
-    (push "static const char* _sysp_str_join(const char** data, int len, const char* delim) { if (len == 0) { char* r = malloc(1); r[0] = 0; return r; } int dlen = strlen(delim), total = 0; for (int i = 0; i < len; i++) total += strlen(data[i]); total += dlen * (len - 1); char* r = malloc(total + 1); char* w = r; for (int i = 0; i < len; i++) { if (i > 0) { memcpy(w, delim, dlen); w += dlen; } int n = strlen(data[i]); memcpy(w, data[i], n); w += n; } *w = 0; return r; }
-"
-          *functions*)))
+  "Include the string runtime header."
+  (pushnew "runtime/string.h" *includes* :test #'string=))
 
 ;;; === Printable / Show Auto-Derivation ===
 
 (defun type-to-show-format (tp)
   "Return printf format specifier for a primitive type, or nil for complex types needing show_X()."
-  (case (type-kind tp)
-    (:char "%c")
-    (:short "%hd")
-    (:int "%d")
-    (:long "%ld")
-    (:long-long "%lld")
-    (:uchar "%u")
-    (:ushort "%hu")
-    (:uint "%u")
-    (:ulong "%lu")
-    (:ulong-long "%llu")
-    (:i8 "%\" PRId8 \"")
-    (:i16 "%\" PRId16 \"")
-    (:i32 "%\" PRId32 \"")
-    (:i64 "%\" PRId64 \"")
-    (:u8 "%\" PRIu8 \"")
-    (:u16 "%\" PRIu16 \"")
-    (:u32 "%\" PRIu32 \"")
-    (:u64 "%\" PRIu64 \"")
-    (:float "%g")
-    (:f32 "%g")
-    (:double "%g")
-    (:f64 "%g")
-    (:size "%zu")
-    (:bool "%s")
-    (:str "%s")
-    (otherwise nil)))
+  (if (str-type-p tp) "%s"
+    (case (type-kind tp)
+      (:char "%c")
+      (:short "%hd")
+      (:int "%d")
+      (:long "%ld")
+      (:long-long "%lld")
+      (:uchar "%u")
+      (:ushort "%hu")
+      (:uint "%u")
+      (:ulong "%lu")
+      (:ulong-long "%llu")
+      (:i8 "%\" PRId8 \"")
+      (:i16 "%\" PRId16 \"")
+      (:i32 "%\" PRId32 \"")
+      (:i64 "%\" PRId64 \"")
+      (:u8 "%\" PRIu8 \"")
+      (:u16 "%\" PRIu16 \"")
+      (:u32 "%\" PRIu32 \"")
+      (:u64 "%\" PRIu64 \"")
+      (:float "%g")
+      (:f32 "%g")
+      (:double "%g")
+      (:f64 "%g")
+      (:size "%zu")
+      (:bool "%s")
+      (otherwise nil))))
 
 (defun ensure-show-helper (tp)
   "Ensure a show_TypeName C function exists for type TP. Auto-generates for primitives, structs, vectors, hashmaps."
@@ -4023,200 +3523,91 @@
          (guard-key (format nil "_show_~a" mangled)))
     (unless (gethash guard-key *generated-types*)
       (setf (gethash guard-key *generated-types*) t)
-      (pushnew "stdio.h" *includes* :test #'string=)
-      (pushnew "string.h" *includes* :test #'string=)
-      (pushnew "stdlib.h" *includes* :test #'string=)
+      (pushnew "runtime/show.h" *includes* :test #'string=)
       (let ((kind (type-kind tp)))
         (cond
-          ;; --- Primitive show helpers ---
-          ((eq kind :int)
-           (push (format nil "static const char* show_int(int x) { int n = snprintf(NULL, 0, \"%d\", x); char* b = malloc(n+1); snprintf(b, n+1, \"%d\", x); return b; }~%") *functions*))
-          ((eq kind :long)
-           (push (format nil "static const char* show_long(long x) { int n = snprintf(NULL, 0, \"%ld\", x); char* b = malloc(n+1); snprintf(b, n+1, \"%ld\", x); return b; }~%") *functions*))
-          ((eq kind :long-long)
-           (push (format nil "static const char* show_longlong(long long x) { int n = snprintf(NULL, 0, \"%lld\", x); char* b = malloc(n+1); snprintf(b, n+1, \"%lld\", x); return b; }~%") *functions*))
-          ((eq kind :short)
-           (push (format nil "static const char* show_short(short x) { int n = snprintf(NULL, 0, \"%hd\", x); char* b = malloc(n+1); snprintf(b, n+1, \"%hd\", x); return b; }~%") *functions*))
-          ((eq kind :char)
-           (push (format nil "static const char* show_char(char x) { char* b = malloc(2); b[0] = x; b[1] = 0; return b; }~%") *functions*))
-          ((member kind '(:uchar :ushort :uint :ulong :ulong-long))
-           (let* ((c-type (type-to-c tp))
-                  (fmt (type-to-show-format tp)))
-             (push (format nil "static const char* ~a(~a x) { int n = snprintf(NULL, 0, \"~a\", x); char* b = malloc(n+1); snprintf(b, n+1, \"~a\", x); return b; }~%" fn-name c-type fmt fmt) *functions*)))
-          ((member kind '(:i8 :i16 :i32 :i64 :u8 :u16 :u32 :u64))
-           (let ((c-type (type-to-c tp)))
-             (pushnew "inttypes.h" *includes* :test #'string=)
-             (push (format nil "static const char* ~a(~a x) { char buf[64]; snprintf(buf, sizeof(buf), ~a, x); char* b = malloc(strlen(buf)+1); memcpy(b, buf, strlen(buf)+1); return b; }~%"
-                           fn-name c-type
-                           (case kind
-                             (:i8 "\"%\" PRId8") (:i16 "\"%\" PRId16") (:i32 "\"%\" PRId32") (:i64 "\"%\" PRId64")
-                             (:u8 "\"%\" PRIu8") (:u16 "\"%\" PRIu16") (:u32 "\"%\" PRIu32") (:u64 "\"%\" PRIu64")))
-                   *functions*)))
+          ;; Primitives handled by runtime/show.h (char, str/ptr-char, bool are static functions)
+          ((or (member kind '(:char :bool)) (str-type-p tp)) nil) ; already in show.h
+          ((member kind '(:int :long :long-long :short :uchar :ushort :uint :ulong :ulong-long :size))
+           (push (format nil "SYSP_SHOW_SNPRINTF(~a, ~a, \"~a\")~%" fn-name (type-to-c tp) (type-to-show-format tp)) *functions*))
           ((member kind '(:float :double :f32 :f64))
-           (let ((c-type (type-to-c tp)))
-             (push (format nil "static const char* ~a(~a x) { int n = snprintf(NULL, 0, \"%g\", (double)x); char* b = malloc(n+1); snprintf(b, n+1, \"%g\", (double)x); return b; }~%" fn-name c-type) *functions*)))
-          ((eq kind :str)
-           (push (format nil "static const char* show_str(const char* x) { int n = strlen(x); char* b = malloc(n+1); memcpy(b, x, n+1); return b; }~%") *functions*))
-          ((eq kind :bool)
-           (push (format nil "static const char* show_bool(int x) { return x ? strdup(\"true\") : strdup(\"false\"); }~%") *functions*))
-          ((eq kind :size)
-           (push (format nil "static const char* show_size(size_t x) { int n = snprintf(NULL, 0, \"%%zu\", x); char* b = malloc(n+1); snprintf(b, n+1, \"%%zu\", x); return b; }~%") *functions*))
+           (push (format nil "SYSP_SHOW_SNPRINTF(~a, ~a, \"%g\")~%" fn-name (type-to-c tp)) *functions*))
+          ((member kind '(:i8 :i16 :i32 :i64 :u8 :u16 :u32 :u64))
+           (pushnew "inttypes.h" *includes* :test #'string=)
+           (push (format nil "SYSP_SHOW_PRI(~a, ~a, ~a)~%" fn-name (type-to-c tp)
+                         (case kind
+                           (:i8 "\"%\" PRId8") (:i16 "\"%\" PRId16") (:i32 "\"%\" PRId32") (:i64 "\"%\" PRId64")
+                           (:u8 "\"%\" PRIu8") (:u16 "\"%\" PRIu16") (:u32 "\"%\" PRIu32") (:u64 "\"%\" PRIu64")))
+                 *functions*))
 
           ;; --- Struct show ---
           ((eq kind :struct)
            (let* ((struct-name (second tp))
                   (fields (gethash struct-name *structs*))
-                  (c-struct (type-to-c tp)))
-             (unless fields
-               (error "ensure-show-helper: unknown struct ~a" struct-name))
-             ;; Ensure show helpers for all complex fields first
+                  (c-struct (type-to-c tp))
+                  (arg-parts nil) (complex-decls nil) (complex-frees nil) (fi 0))
+             (unless fields (error "ensure-show-helper: unknown struct ~a" struct-name))
              (dolist (f fields)
-               (let ((ft (cdr f)))
-                 (unless (type-to-show-format ft)
-                   (ensure-show-helper ft))))
-             ;; Build the function
-             (let ((has-complex (some (lambda (f) (null (type-to-show-format (cdr f)))) fields))
-                   (fmt-parts nil)
-                   (arg-parts nil)
-                   (complex-decls nil)
-                   (complex-frees nil)
-                   (field-idx 0))
-               (dolist (f fields)
-                 (let* ((fname (car f))
-                        (ftype (cdr f))
-                        (prim-fmt (type-to-show-format ftype))
-                        (accessor (format nil "self.~a" (sanitize-name fname))))
-                   (push (format nil "~a: " fname) fmt-parts)
-                   (if prim-fmt
-                       (progn
-                         (push prim-fmt fmt-parts)
-                         (if (eq (type-kind ftype) :bool)
-                             (push (format nil "(~a ? \"true\" : \"false\")" accessor) arg-parts)
-                             (push accessor arg-parts)))
-                       ;; Complex type: call show recursively
-                       (let ((tmp (format nil "_f~d" field-idx)))
-                         (push (format nil "  const char* ~a = show_~a(~a);~%"
-                                       tmp (mangle-type-name ftype) accessor)
-                               complex-decls)
-                         (push "%s" fmt-parts)
-                         (push tmp arg-parts)
-                         (push (format nil "  free((char*)~a);~%" tmp) complex-frees)))
-                   (incf field-idx)))
-               ;; Build format string: "StructName{f1: %d, f2: %s}"
-               (setf fmt-parts (nreverse fmt-parts))
-               (setf arg-parts (nreverse arg-parts))
-               (setf complex-decls (nreverse complex-decls))
-               (setf complex-frees (nreverse complex-frees))
-               ;; Interleave fields with ", "
-               (let* ((field-count (length fields))
-                      (fmt-str (with-output-to-string (s)
-                                 (write-string struct-name s)
-                                 (write-char #\{ s)
-                                 (let ((i 0))
-                                   (dolist (f fields)
-                                     (when (> i 0) (write-string ", " s))
-                                     ;; field-name: format
-                                     (write-string (car f) s)
-                                     (write-string ": " s)
-                                     (let* ((ftype (cdr f))
-                                            (prim-fmt (type-to-show-format ftype)))
-                                       (if prim-fmt
-                                           (write-string prim-fmt s)
-                                           (write-string "%s" s)))
-                                     (incf i)))
-                                 (write-char #\} s)))
-                      (args-str (format nil "~{~a~^, ~}" arg-parts)))
-                 (push (format nil "static const char* ~a(~a self) {~%~{~a~}  int _len = snprintf(NULL, 0, \"~a\", ~a);~%  char* _buf = malloc(_len + 1);~%  snprintf(_buf, _len + 1, \"~a\", ~a);~%~{~a~}  return _buf;~%}~%"
-                               fn-name c-struct
-                               complex-decls
-                               fmt-str args-str
-                               fmt-str args-str
-                               complex-frees)
-                       *functions*)))))
-
-          ;; --- Vector show ---
-          ((eq kind :vector)
-           (let* ((elem-type (second tp))
-                  (c-vec (type-to-c tp))
-                  (elem-mangled (mangle-type-name elem-type))
-                  (show-elem (format nil "show_~a" elem-mangled)))
-             ;; Ensure show helper for element type
-             (ensure-show-helper elem-type)
-             (push (format nil "static const char* ~a(~a self) {
-  if (self.len == 0) { char* r = malloc(3); memcpy(r, \"[]\", 3); return r; }
-  const char** parts = malloc(sizeof(const char*) * self.len);
-  int total = 2;
-  for (int i = 0; i < self.len; i++) {
-    parts[i] = ~a(self.data[i]);
-    total += strlen(parts[i]);
-    if (i > 0) total += 2;
-  }
-  char* buf = malloc(total + 1);
-  char* p = buf; *p++ = '[';
-  for (int i = 0; i < self.len; i++) {
-    if (i > 0) { *p++ = ','; *p++ = ' '; }
-    int n = strlen(parts[i]); memcpy(p, parts[i], n); p += n;
-    free((char*)parts[i]);
-  }
-  *p++ = ']'; *p = '\\0'; free(parts);
-  return buf;
-}~%" fn-name c-vec show-elem)
-                   *functions*)))
-
-          ;; --- Hashmap show ---
-          ((eq kind :hashmap)
-           (let* ((key-type (second tp))
-                  (val-type (third tp))
-                  (c-hm (type-to-c tp)))
-             (ensure-show-helper key-type)
-             (ensure-show-helper val-type)
-             (let ((show-k (format nil "show_~a" (mangle-type-name key-type)))
-                   (show-v (format nil "show_~a" (mangle-type-name val-type))))
-               (push (format nil "static const char* ~a(~a self) {
-  if (self.len == 0) { char* r = malloc(3); memcpy(r, \"{}\", 3); return r; }
-  const char** parts = malloc(sizeof(const char*) * self.len);
-  int total = 2, idx = 0;
-  for (int i = 0; i < self.cap; i++) {
-    if (!self.occ[i]) continue;
-    const char* ks = ~a(self.keys[i]);
-    const char* vs = ~a(self.vals[i]);
-    int kn = strlen(ks), vn = strlen(vs);
-    char* entry = malloc(kn + 2 + vn + 1);
-    memcpy(entry, ks, kn); entry[kn] = ':'; entry[kn+1] = ' ';
-    memcpy(entry + kn + 2, vs, vn + 1);
-    free((char*)ks); free((char*)vs);
-    parts[idx] = entry;
-    total += strlen(entry);
-    if (idx > 0) total += 2;
-    idx++;
-  }
-  char* buf = malloc(total + 1);
-  char* p = buf; *p++ = '{';
-  for (int i = 0; i < idx; i++) {
-    if (i > 0) { *p++ = ','; *p++ = ' '; }
-    int n = strlen(parts[i]); memcpy(p, parts[i], n); p += n;
-    free((char*)parts[i]);
-  }
-  *p++ = '}'; *p = '\\0'; free(parts);
-  return buf;
-}~%" fn-name c-hm show-k show-v)
+               (unless (type-to-show-format (cdr f)) (ensure-show-helper (cdr f))))
+             ;; Build format string and args in one pass
+             (let ((fmt-str (with-output-to-string (s)
+                              (write-string struct-name s) (write-char #\{ s)
+                              (let ((i 0))
+                                (dolist (f fields)
+                                  (when (> i 0) (write-string ", " s))
+                                  (write-string (car f) s) (write-string ": " s)
+                                  (let* ((ftype (cdr f)) (prim-fmt (type-to-show-format ftype))
+                                         (acc (format nil "self.~a" (sanitize-name (car f)))))
+                                    (if prim-fmt
+                                        (progn (write-string prim-fmt s)
+                                               (push (if (eq (type-kind ftype) :bool)
+                                                         (format nil "(~a ? \"true\" : \"false\")" acc) acc)
+                                                     arg-parts))
+                                        (let ((tmp (format nil "_f~d" fi)))
+                                          (write-string "%s" s)
+                                          (push (format nil "  const char* ~a = show_~a(~a);~%" tmp (mangle-type-name ftype) acc) complex-decls)
+                                          (push tmp arg-parts)
+                                          (push (format nil "  free((char*)~a);~%" tmp) complex-frees))))
+                                  (incf i) (incf fi)))
+                              (write-char #\} s)))
+                   (args-str (format nil "~{~a~^, ~}" (nreverse arg-parts))))
+               (push (format nil "static const char* ~a(~a self) {~%~{~a~}  int _len = snprintf(NULL, 0, \"~a\", ~a);~%  char* _buf = malloc(_len + 1);~%  snprintf(_buf, _len + 1, \"~a\", ~a);~%~{~a~}  return _buf;~%}~%"
+                             fn-name c-struct (nreverse complex-decls)
+                             fmt-str args-str fmt-str args-str (nreverse complex-frees))
                      *functions*))))
 
-          ;; --- Generic struct (instantiated) ---
+          ;; --- Generic struct (instantiated) --- handles Vector/HashMap show via macros
           ((eq kind :generic)
            (let* ((struct-name (second tp))
                   (type-args (cddr tp))
                   (mangled-struct (instantiate-generic-struct struct-name type-args))
                   (concrete-tp (make-struct-type mangled-struct)))
-             ;; Delegate to the concrete struct show
-             (ensure-show-helper concrete-tp)
-             ;; Alias: show_Generic_A_B just calls show_MangedConcrete
-             (unless (string= fn-name (format nil "show_~a" mangled-struct))
-               (push (format nil "static const char* ~a(~a self) { return show_~a(self); }~%"
-                             fn-name (type-to-c tp) mangled-struct)
-                     *functions*))))
+             (cond
+               ((equal struct-name "Vector")
+                (let ((elem-type (first type-args)))
+                  (ensure-show-helper elem-type)
+                  (pushnew "runtime/vector.h" *includes* :test #'string=)
+                  (push (format nil "SYSP_VECTOR_SHOW(~a, show_~a, ~a)~%"
+                                mangled-struct (mangle-type-name elem-type) fn-name)
+                        *functions*)))
+               ((equal struct-name "HashMap")
+                (let ((key-type (first type-args))
+                      (val-type (second type-args)))
+                  (ensure-show-helper key-type)
+                  (ensure-show-helper val-type)
+                  (pushnew "runtime/hashmap.h" *includes* :test #'string=)
+                  (push (format nil "SYSP_HASHMAP_SHOW(~a, show_~a, show_~a, ~a)~%"
+                                mangled-struct (mangle-type-name key-type)
+                                (mangle-type-name val-type) fn-name)
+                        *functions*)))
+               (t
+                (ensure-show-helper concrete-tp)
+                (unless (string= fn-name (format nil "show_~a" mangled-struct))
+                  (push (format nil "static const char* ~a(~a self) { return show_~a(self); }~%"
+                                fn-name (type-to-c tp) mangled-struct)
+                        *functions*))))))
 
-          (t (warn "ensure-show-helper: unhandled type ~a" tp)))))))
+          (t (warn "ensure-show-helper: unhandled type ~a" tp)))))))  ;; cond+let+unless+let*+defun
 
 (defun ensure-str-split-helper ()
   "Emit C helper for str-split. Returns Vector_str."
@@ -4224,50 +3615,59 @@
     (setf (gethash "_sysp_str_split" *generated-types*) t)
     (ensure-string-helpers)
     ;; Ensure Vector_str type exists
-    (let* ((vec-type (make-vector-type :str))
-           (c-vec (type-to-c vec-type))
+    (let* ((vec-type (make-vector-type '(:ptr :char)))
+           (c-vec (type-to-c vec-type))  ;; triggers instantiate-generic-struct → generate-collection-helpers
            (push-name "sysp_vecpush_str"))
-      (ensure-vector-push-helper push-name c-vec "const char*")
       ;; str-split: split on delimiter, return Vector_str
       (push (format nil "static ~a _sysp_str_split(const char* s, const char* delim) { ~a r = {NULL, 0, 0}; int dlen = strlen(delim); if (dlen == 0) { for (int i = 0; s[i]; i++) { char* c = malloc(2); c[0] = s[i]; c[1] = 0; ~a(&r, c); } return r; } const char* p = s; while (1) { const char* f = strstr(p, delim); if (!f) { int n = strlen(p); char* c = malloc(n + 1); memcpy(c, p, n + 1); ~a(&r, c); break; } int n = f - p; char* c = malloc(n + 1); memcpy(c, p, n); c[n] = 0; ~a(&r, c); p = f + dlen; } return r; }~%"
                     c-vec c-vec push-name push-name push-name)
             *functions*))))
 
-(defun compile-str-len (form env)
-  "(str-len s)"
-  (pushnew "string.h" *includes* :test #'string=)
-  (multiple-value-bind (s st) (compile-expr (second form) env)
-    (declare (ignore st))
-    (values (format nil "(int)strlen(~a)" s) :int)))
+;; Macro for defining simple string compile functions
+(defmacro define-str-1 (name c-fmt ret-type &key alloc include)
+  "Define a unary string function compiler: (name arg) -> c-fmt with ~a for arg."
+  `(defun ,(intern (format nil "COMPILE-STR-~a" name)) (form env)
+     ,@(when include `((pushnew ,include *includes* :test #'string=)))
+     ,@(when (eq alloc :string) '((ensure-string-helpers)))
+     (multiple-value-bind (a at) (compile-expr (second form) env)
+       (declare (ignore at))
+       (values ,(if (eq alloc :string)
+                    `(lift-string-alloc (format nil ,c-fmt a))
+                    `(format nil ,c-fmt a))
+               ,ret-type))))
+
+(defmacro define-str-2 (name c-fmt ret-type &key alloc include)
+  "Define a binary string function compiler: (name a b) -> c-fmt with two ~a."
+  `(defun ,(intern (format nil "COMPILE-STR-~a" name)) (form env)
+     ,@(when include `((pushnew ,include *includes* :test #'string=)))
+     ,@(when (eq alloc :string) '((ensure-string-helpers)))
+     (multiple-value-bind (a at) (compile-expr (second form) env)
+       (declare (ignore at))
+       (multiple-value-bind (b bt) (compile-expr (third form) env)
+         (declare (ignore bt))
+         (values ,(if (eq alloc :string)
+                      `(lift-string-alloc (format nil ,c-fmt a b))
+                      `(format nil ,c-fmt a b))
+                 ,ret-type)))))
+
+(define-str-1 len "(int)strlen(~a)" :int :include "string.h")
+(define-str-2 eq "(strcmp(~a, ~a) == 0)" :bool :include "string.h")
+(define-str-2 contains "(strstr(~a, ~a) != NULL)" :bool :include "string.h")
+(define-str-1 upper "_sysp_str_upper(~a)" '(:ptr :char) :alloc :string)
+(define-str-1 lower "_sysp_str_lower(~a)" '(:ptr :char) :alloc :string)
+(define-str-1 trim "_sysp_str_trim(~a)" '(:ptr :char) :alloc :string)
+(define-str-1 from-int "_sysp_str_from_int(~a)" '(:ptr :char) :alloc :string)
+(define-str-1 from-float "_sysp_str_from_float(~a)" '(:ptr :char) :alloc :string)
+(define-str-2 concat "_sysp_str_concat(~a, ~a)" '(:ptr :char) :alloc :string)
 
 (defun compile-str-ref (form env)
-  "(str-ref s i)"
   (multiple-value-bind (s st) (compile-expr (second form) env)
     (declare (ignore st))
     (multiple-value-bind (i it) (compile-expr (third form) env)
       (declare (ignore it))
       (values (format nil "~a[~a]" s i) :char))))
 
-(defun compile-str-eq (form env)
-  "(str-eq? a b)"
-  (pushnew "string.h" *includes* :test #'string=)
-  (multiple-value-bind (a at) (compile-expr (second form) env)
-    (declare (ignore at))
-    (multiple-value-bind (b bt) (compile-expr (third form) env)
-      (declare (ignore bt))
-      (values (format nil "(strcmp(~a, ~a) == 0)" a b) :bool))))
-
-(defun compile-str-contains (form env)
-  "(str-contains? s sub)"
-  (pushnew "string.h" *includes* :test #'string=)
-  (multiple-value-bind (s st) (compile-expr (second form) env)
-    (declare (ignore st))
-    (multiple-value-bind (sub subt) (compile-expr (third form) env)
-      (declare (ignore subt))
-      (values (format nil "(strstr(~a, ~a) != NULL)" s sub) :bool))))
-
 (defun compile-str-find (form env)
-  "(str-find s sub) — index of sub in s, or -1"
   (pushnew "string.h" *includes* :test #'string=)
   (multiple-value-bind (s st) (compile-expr (second form) env)
     (declare (ignore st))
@@ -4275,7 +3675,6 @@
       (declare (ignore subt))
       (let ((tmp (fresh-tmp))
             (ptr-tmp (fresh-tmp)))
-        ;; LIFO: push int computation first so it emits after ptr decl
         (push (format nil "  int ~a = ~a ? (int)(~a - ~a) : -1;" tmp ptr-tmp ptr-tmp s) *pending-stmts*)
         (push (format nil "  const char* ~a = strstr(~a, ~a);" ptr-tmp s sub) *pending-stmts*)
         (values tmp :int)))))
@@ -4292,17 +3691,7 @@
     (push tmp *pending-string-frees*)
     tmp))
 
-(defun compile-str-concat (form env)
-  "(str-concat a b)"
-  (ensure-string-helpers)
-  (multiple-value-bind (a at) (compile-expr (second form) env)
-    (declare (ignore at))
-    (multiple-value-bind (b bt) (compile-expr (third form) env)
-      (declare (ignore bt))
-      (values (lift-string-alloc (format nil "_sysp_str_concat(~a, ~a)" a b)) :str))))
-
 (defun compile-str-slice (form env)
-  "(str-slice s start end)"
   (ensure-string-helpers)
   (multiple-value-bind (s st) (compile-expr (second form) env)
     (declare (ignore st))
@@ -4310,21 +3699,7 @@
       (declare (ignore start-t))
       (multiple-value-bind (end end-t) (compile-expr (fourth form) env)
         (declare (ignore end-t))
-        (values (lift-string-alloc (format nil "_sysp_str_slice(~a, ~a, ~a)" s start end)) :str)))))
-
-(defun compile-str-upper (form env)
-  "(str-upper s)"
-  (ensure-string-helpers)
-  (multiple-value-bind (s st) (compile-expr (second form) env)
-    (declare (ignore st))
-    (values (lift-string-alloc (format nil "_sysp_str_upper(~a)" s)) :str)))
-
-(defun compile-str-lower (form env)
-  "(str-lower s)"
-  (ensure-string-helpers)
-  (multiple-value-bind (s st) (compile-expr (second form) env)
-    (declare (ignore st))
-    (values (lift-string-alloc (format nil "_sysp_str_lower(~a)" s)) :str)))
+        (values (lift-string-alloc (format nil "_sysp_str_slice(~a, ~a, ~a)" s start end)) '(:ptr :char))))))
 
 (defun compile-str-split (form env)
   "(str-split s delim)"
@@ -4334,24 +3709,10 @@
     (multiple-value-bind (d dt) (compile-expr (third form) env)
       (declare (ignore dt))
       (values (format nil "_sysp_str_split(~a, ~a)" s d)
-              (make-vector-type :str)))))
+              (make-vector-type '(:ptr :char))))))
 
-(defun compile-str-from-int (form env)
-  "(str-from-int n)"
-  (ensure-string-helpers)
-  (multiple-value-bind (n nt) (compile-expr (second form) env)
-    (declare (ignore nt))
-    (values (lift-string-alloc (format nil "_sysp_str_from_int(~a)" n)) :str)))
-
-(defun compile-str-from-float (form env)
-  "(str-from-float f)"
-  (ensure-string-helpers)
-  (multiple-value-bind (f ft) (compile-expr (second form) env)
-    (declare (ignore ft))
-    (values (lift-string-alloc (format nil "_sysp_str_from_float(~a)" f)) :str)))
 
 (defun compile-str-starts (form env)
-  "(str-starts? s prefix)"
   (pushnew "string.h" *includes* :test #'string=)
   (multiple-value-bind (s st) (compile-expr (second form) env)
     (declare (ignore st))
@@ -4373,15 +3734,8 @@
         (values (format nil "(~a >= ~a && strcmp(~a + ~a - ~a, ~a) == 0)"
                         tmp-slen tmp-flen s tmp-slen tmp-flen sfx) :bool)))))
 
-(defun compile-str-trim (form env)
-  "(str-trim s)"
-  (ensure-string-helpers)
-  (multiple-value-bind (s st) (compile-expr (second form) env)
-    (declare (ignore st))
-    (values (lift-string-alloc (format nil "_sysp_str_trim(~a)" s)) :str)))
-
+;; str-replace has 3 args, can't use define-str-2
 (defun compile-str-replace (form env)
-  "(str-replace s old new)"
   (ensure-string-helpers)
   (multiple-value-bind (s st) (compile-expr (second form) env)
     (declare (ignore st))
@@ -4389,7 +3743,7 @@
       (declare (ignore ot))
       (multiple-value-bind (new-s nt) (compile-expr (fourth form) env)
         (declare (ignore nt))
-        (values (lift-string-alloc (format nil "_sysp_str_replace(~a, ~a, ~a)" s old new-s)) :str)))))
+        (values (lift-string-alloc (format nil "_sysp_str_replace(~a, ~a, ~a)" s old new-s)) '(:ptr :char))))))
 
 (defun compile-str-join (form env)
   "(str-join vec delim)"
@@ -4398,7 +3752,7 @@
     (declare (ignore vt))
     (multiple-value-bind (d dt) (compile-expr (third form) env)
       (declare (ignore dt))
-      (values (lift-string-alloc (format nil "_sysp_str_join(~a.data, ~a.len, ~a)" v v d)) :str))))
+      (values (lift-string-alloc (format nil "_sysp_str_join(~a.data, ~a.len, ~a)" v v d)) '(:ptr :char)))))
 
 (defun parse-fmt-string (fmt-str)
   "Parse a format string into segments. Returns list of (:lit \"text\") and (:expr \"code\").
@@ -4454,7 +3808,7 @@
          (segments (parse-fmt-string fmt-str)))
     (if (null segments)
         ;; Empty format string
-        (values "\"\"" :str)
+        (values "\"\"" '(:ptr :char))
         ;; Build chain of str-concat calls
         (let ((parts nil))
           ;; Compile each segment to a C expression
@@ -4472,7 +3826,7 @@
                  (multiple-value-bind (code tp) (compile-expr expr-form env)
                    ;; Auto-convert non-strings
                    (cond
-                     ((eq tp :str) (push code parts))
+                     ((str-type-p tp) (push code parts))
                      ((member tp '(:int :i8 :i16 :i32 :i64 :u8 :u16 :u32 :u64
                                    :char :short :long :long-long :size))
                       (push (lift-string-alloc (format nil "_sysp_str_from_int(~a)" code)) parts))
@@ -4484,13 +3838,13 @@
           (setf parts (nreverse parts))
           (if (= (length parts) 1)
               ;; Single part — just return it
-              (values (first parts) :str)
+              (values (first parts) '(:ptr :char))
               ;; Multiple parts — chain str-concat, lifting each to a temp
               (let ((result (first parts)))
                 (dolist (p (rest parts))
                   (setf result (lift-string-alloc
                                 (format nil "_sysp_str_concat(~a, ~a)" result p))))
-                (values result :str)))))))
+                (values result '(:ptr :char))))))))
 
 (defun compile-tuple (form env)
   "(tuple elem ...)"
@@ -4565,16 +3919,14 @@
    :str -> coll[idx], (:array T N) -> coll[idx]"
   (multiple-value-bind (coll coll-type) (compile-expr (second form) env)
     (let ((idx-form (third form)))
-      (case (type-kind coll-type)
-        (:vector
-         (multiple-value-bind (idx-code it) (compile-expr idx-form env)
-           (declare (ignore it))
-           (values (format nil "~a.data[~a]" coll idx-code)
-                   (second coll-type))))
-        (:str
-         (multiple-value-bind (idx-code it) (compile-expr idx-form env)
-           (declare (ignore it))
-           (values (format nil "~a[~a]" coll idx-code) :char)))
+      (cond
+       ((vector-type-p coll-type)
+        (multiple-value-bind (idx-code it) (compile-expr idx-form env)
+          (declare (ignore it))
+          (values (format nil "~a.data[~a]" coll idx-code)
+                  (vector-elem-type coll-type))))
+       (t
+       (case (type-kind coll-type)
         (:tuple
          ;; Tuple requires literal integer index
          (let* ((idx (if (numberp idx-form) idx-form
@@ -4594,7 +3946,7 @@
          ;; Fallback: treat as vector-ref for backward compat
          (multiple-value-bind (idx-code it) (compile-expr idx-form env)
            (declare (ignore it))
-           (values (format nil "~a.data[~a]" coll idx-code) :int)))))))
+           (values (format nil "~a.data[~a]" coll idx-code) :int)))))))))
 
 (defun compile-array-literal (form env)
   "(array :type val1 val2 ...) — C compound literal: (type[]){val1, val2, ...}
@@ -5199,7 +4551,7 @@
                 (is-ptr-struct (and (not is-rc)
                                     (eq (type-kind tp) :ptr)
                                     (consp (second tp))
-                                    (eq (type-kind (second tp)) :struct)))
+                                    (member (type-kind (second tp)) '(:struct :generic))))
                 (accessor (cond (is-rc
                                  (format nil "~a->data.~a" obj (sanitize-name field)))
                                 (is-ptr-struct
@@ -5210,7 +4562,11 @@
              (let* ((struct-type (cond (is-rc (rc-inner-type tp))
                                        (is-ptr-struct (second tp))
                                        (t tp)))
-                    (struct-name (when (eq (type-kind struct-type) :struct) (second struct-type)))
+                    (struct-name (cond
+                                  ((eq (type-kind struct-type) :struct) (second struct-type))
+                                  ((eq (type-kind struct-type) :generic)
+                                   (instantiate-generic-struct (second struct-type) (cddr struct-type)))
+                                  (t nil)))
                     (field-type (when struct-name
                                   (cdr (assoc field (gethash struct-name *structs*) :test #'equal))))
                     (coerced (if field-type (maybe-coerce val-code val-type field-type) val-code)))
@@ -5274,7 +4630,7 @@
                          (parse-type-annotation (second form)))))
     (multiple-value-bind (code tp) (compile-expr (third form) env)
       ;; Vector→ptr cast: extract .data
-      (let ((src-code (if (and (eq (type-kind (resolve-type tp)) :vector)
+      (let ((src-code (if (and (vector-type-p (resolve-type tp))
                                (eq (type-kind target-type) :ptr))
                           (format nil "~a.data" code)
                           code)))
@@ -5289,6 +4645,12 @@
                 :int)
         (values (format nil "sizeof(~a)" (sanitize-name (string arg)))
                 :int))))
+
+(defun compile-sizeof-val (form env)
+  "(sizeof-val expr) — compile expr for type inference, emit sizeof(C_TYPE)"
+  (multiple-value-bind (code tp) (compile-expr (second form) env)
+    (declare (ignore code))
+    (values (format nil "sizeof(%s)" (type-to-c tp)) :int)))
 
 ;;; === Union Type Ops ===
 
@@ -5315,7 +4677,8 @@
     (:int (format nil "val_int(~a)" code))
     (:float (format nil "val_float(~a)" code))
     (:f32 (format nil "val_float((double)~a)" code))
-    (:str (format nil "val_str(~a)" code))
+    (:ptr (if (str-type-p tp) (format nil "val_str(~a)" code)
+               (format nil "val_int(~a)" code)))
     (:symbol (format nil "val_sym(~a)" code))
     (:value code)  ; already a Value
     (:cons code)   ; cons is already a Value
@@ -5811,7 +5174,7 @@
         ;; First param name
         (pop lst)
         ;; Check if next is a compound type annotation (list)
-        (when (and lst (listp (first lst)) (keywordp (car (first lst))))
+        (when (and lst (listp (first lst)))
           (let* ((type-ann (first lst))
                  (ann-name (symbol-name (car type-ann))))
             ;; If it's a generic struct, extract type params
@@ -5851,8 +5214,8 @@
     (loop while lst do
       (let ((item (pop lst)))
         (cond
-          ;; Compound type annotation (list like (Vector :T))
-          ((and (listp item) (keywordp (car item)))
+          ;; Compound type annotation (list like (Vector :T) or (:ptr :char))
+          ((listp item)
            (push (subst-type-in-ann item subst-table) result))
           ;; Keyword type annotation
           ((keywordp item)
@@ -5887,99 +5250,43 @@
         (setf stmts (append stmts new-stmts))))
     stmts))
 
+(defparameter *stmt-dispatch*
+  '(("let" . compile-let-stmt) ("let-mut" . compile-let-stmt)
+    ("let-array" . compile-let-array-stmt)
+    ("print" . compile-print-stmt) ("println" . compile-println-stmt) ("printf" . compile-printf-stmt)
+    ("if" . compile-if-stmt) ("when" . compile-when-stmt) ("unless" . compile-unless-stmt)
+    ("while" . compile-while-stmt) ("for" . compile-for-stmt)
+    ("set!" . compile-set-stmt) ("return" . compile-return-stmt) ("recur" . compile-recur-stmt)
+    ("cond" . compile-cond-stmt) ("match" . compile-match-stmt)
+    ("block" . compile-block-stmt) ("do" . compile-block-stmt)
+    ("ptr-free" . compile-ptr-free-stmt) ("ptr-set!" . compile-ptr-set-stmt)
+    ("c-stmt" . compile-c-stmt) ("c-tmpl" . compile-c-tmpl-stmt)
+    ("do-while" . compile-do-while-stmt) ("switch" . compile-switch-stmt)
+    ("kernel-launch" . compile-kernel-launch-stmt) ("asm!" . compile-asm-stmt)
+    ("let-values" . compile-let-values-stmt)))
+
 (defun compile-stmt (form env)
   "Compile a single form as a statement, return list of C statement strings"
-  ;; Try macro expansion first
   (when (and (listp form) (symbolp (first form)))
     (multiple-value-bind (expanded was-expanded) (macroexpand-1-sysp form)
       (when was-expanded
         (return-from compile-stmt (compile-stmt (macroexpand-all expanded) env)))))
-  (cond
-    ((and (listp form) (sym= (first form) "let"))
-     (compile-let-stmt form env))
-    ((and (listp form) (sym= (first form) "let-mut"))
-     (compile-let-stmt form env))  ; same as let for now, mut is future annotation
-    ((and (listp form) (sym= (first form) "let-array"))
-     (compile-let-array-stmt form env))
-    ((and (listp form) (sym= (first form) "print"))
-     (compile-print-stmt form env))
-    ((and (listp form) (sym= (first form) "println"))
-     (compile-println-stmt form env))
-    ((and (listp form) (sym= (first form) "printf"))
-     (compile-printf-stmt form env))
-    ((and (listp form) (sym= (first form) "if"))
-     (compile-if-stmt form env))
-    ((and (listp form) (sym= (first form) "when"))
-     (compile-when-stmt form env))
-    ((and (listp form) (sym= (first form) "unless"))
-     (compile-unless-stmt form env))
-    ((and (listp form) (sym= (first form) "while"))
-     (compile-while-stmt form env))
-    ((and (listp form) (sym= (first form) "for"))
-     (compile-for-stmt form env))
-    ((and (listp form) (sym= (first form) "set!"))
-     (compile-set-stmt form env))
-    ((and (listp form) (sym= (first form) "return"))
-     (compile-return-stmt form env))
-    ((and (listp form) (sym= (first form) "break"))
-     (list "  break;"))
-    ((and (listp form) (sym= (first form) "continue"))
-     (list "  continue;"))
-    ((and (listp form) (sym= (first form) "recur"))
-     (compile-recur-stmt form env))
-    ((and (listp form) (sym= (first form) "cond"))
-     (compile-cond-stmt form env))
-    ((and (listp form) (sym= (first form) "match"))
-     (compile-match-stmt form env))
-    ((and (listp form) (sym= (first form) "block"))
-     (compile-block-stmt form env))
-    ((and (listp form) (sym= (first form) "do"))
-     ;; do = scoped block with cleanup (same as block)
-     (compile-block-stmt form env))
-    ((and (listp form) (sym= (first form) "ptr-free"))
-     (compile-ptr-free-stmt form env))
-    ((and (listp form) (sym= (first form) "ptr-set!"))
-     (compile-ptr-set-stmt form env))
-    ((and (listp form) (sym= (first form) "c-stmt"))
-     (compile-c-stmt form env))
-    ((and (listp form) (sym= (first form) "c-tmpl"))
-     (compile-c-tmpl-stmt form env))
-    ((and (listp form) (sym= (first form) "do-while"))
-     (compile-do-while-stmt form env))
-    ((and (listp form) (sym= (first form) "switch"))
-     (compile-switch-stmt form env))
-    ((and (listp form) (sym= (first form) "pragma"))
-     (list (format nil "#pragma ~a" (second form))))
-    ((and (listp form) (sym= (first form) "kernel-launch"))
-     (compile-kernel-launch-stmt form env))
-    ((and (listp form) (sym= (first form) "asm!"))
-     (compile-asm-stmt form env))
-    ((and (listp form) (sym= (first form) "let-values"))
-     (compile-let-values-stmt form env))
-    ((and (listp form) (sym= (first form) "hash-set!"))
-     (let ((*pending-stmts* nil))
-       (multiple-value-bind (code tp) (compile-hash-set form env)
-         (declare (ignore tp))
-         (append *pending-stmts* (list (format nil "  ~a;" code))))))
-    ((and (listp form) (sym= (first form) "hash-del!"))
-     (let ((*pending-stmts* nil))
-       (multiple-value-bind (code tp) (compile-hash-del form env)
-         (declare (ignore tp))
-         (append *pending-stmts* (list (format nil "  ~a;" code))))))
-    ((and (listp form) (sym= (first form) "hash-free"))
-     (compile-hash-free-stmt form env))
-    ((and (listp form) (sym= (first form) "vector-free"))
-     (compile-vector-free-stmt form env))
-    (t (let ((*pending-stmts* nil)
-             (*pending-string-frees* nil))
-         (multiple-value-bind (code tp) (compile-expr form env)
-           (declare (ignore tp))
-           (let ((str-free-stmts (mapcar (lambda (tmp)
-                                           (format nil "  free((char*)~a);" tmp))
-                                         *pending-string-frees*)))
-             (append *pending-stmts*
-                     (list (format nil "  ~a;" code))
-                     str-free-stmts)))))))
+  (when (and (listp form) (symbolp (first form)))
+    (let* ((name (symbol-name (first form)))
+           (handler (cdr (assoc name *stmt-dispatch* :test #'string-equal))))
+      (when handler (return-from compile-stmt (funcall handler form env)))
+      (cond
+        ((string-equal name "break") (return-from compile-stmt (list "  break;")))
+        ((string-equal name "continue") (return-from compile-stmt (list "  continue;")))
+        ((string-equal name "pragma")
+         (return-from compile-stmt (list (format nil "#pragma ~a" (second form)))))
+        )))
+  ;; Default: compile as expression statement
+  (let ((*pending-stmts* nil) (*pending-string-frees* nil))
+    (multiple-value-bind (code tp) (compile-expr form env)
+      (declare (ignore tp))
+      (let ((frees (mapcar (lambda (tmp) (format nil "  free((char*)~a);" tmp)) *pending-string-frees*)))
+        (append *pending-stmts* (list (format nil "  ~a;" code)) frees)))))
 
 (defun compile-let-stmt (form env)
   "(let name expr) or (let name :type expr) or (let name (make-array :type size))
@@ -6043,16 +5350,16 @@
                  (should-release (or (eq ea-result :local)
                                      (and (null ea-result)
                                           (not (symbolp init-form))))))
-            (when (and (eq (type-kind final-type) :vector) should-release)
+            (when (and (vector-type-p final-type) should-release)
               (env-add-data-release env c-name final-type))
-            (when (and (eq (type-kind final-type) :hashmap) should-release)
+            (when (and (hashmap-type-p final-type) should-release)
               (env-add-data-release env c-name final-type))
             ;; For strings: only register for scope-exit free when the init
             ;; actually produced string allocations (tracked via *pending-string-frees*).
             ;; This avoids false positives on borrows like (vector-ref v i).
-            (when (and (eq final-type :str) str-frees
+            (when (and (str-type-p final-type) str-frees
                        (or (eq ea-result :local) (null ea-result)))
-              (env-add-data-release env c-name :str)))
+              (env-add-data-release env c-name '(:ptr :char))))
           ;; Determine if this is an RC copy (variable → variable, needs retain)
           (let* ((rc-copy-p (and (rc-type-p final-type)
                                  (symbolp init-form)
@@ -6081,7 +5388,7 @@
             ;; temp (init-code) is aliased by c-name — don't free it.
             (let* ((str-free-stmts
                      (when str-frees
-                       (let ((exclude (when (member (cons c-name :str) (env-data-releases env) :test #'equal)
+                       (let ((exclude (when (member (cons c-name '(:ptr :char)) (env-data-releases env) :test #'equal)
                                         init-code)))
                          (mapcan (lambda (tmp)
                                    (unless (and exclude (string= tmp exclude))
@@ -6089,111 +5396,59 @@
                                  str-frees)))))
               (append lifted-stmts decl str-free-stmts))))))))
 
-(defun format-print-arg (val-code val-type)
-  "Return format string and arg for a typed value (C99 format specifiers)
-   Uses inttypes.h macros for portable fixed-width printing."
-  (case (type-kind val-type)
-    ;; Signed integers
-    (:char (values "%c" val-code))
-    (:short (values "%hd" val-code))
-    (:int (values "%d" val-code))
-    (:long (values "%ld" val-code))
-    (:long-long (values "%lld" val-code))
-    ;; Unsigned integers
-    (:uchar (values "%u" val-code))
-    (:ushort (values "%hu" val-code))
-    (:uint (values "%u" val-code))
-    (:ulong (values "%lu" val-code))
-    (:ulong-long (values "%llu" val-code))
-    ;; Fixed-width signed (portable via inttypes.h macros)
-    (:i8 (values :pri "PRId8" val-code))
-    (:i16 (values :pri "PRId16" val-code))
-    (:i32 (values :pri "PRId32" val-code))
-    (:i64 (values :pri "PRId64" val-code))
-    ;; Fixed-width unsigned (portable via inttypes.h macros)
-    (:u8 (values :pri "PRIu8" val-code))
-    (:u16 (values :pri "PRIu16" val-code))
-    (:u32 (values :pri "PRIu32" val-code))
-    (:u64 (values :pri "PRIu64" val-code))
-    ;; Floating point
-    (:float (values "%f" val-code))
-    (:f32 (values "%f" val-code))
-    (:double (values "%f" val-code))
-    (:f64 (values "%f" val-code))
-    ;; Size/pointer types (C99)
-    (:size (values "%zu" val-code))
-    (:ptrdiff (values "%td" val-code))
-    (:intptr (values :pri "PRIdPTR" val-code))
-    (:uintptr (values :pri "PRIuPTR" val-code))
-    ;; Strings and chars
-    (:str (values "%s" val-code))
-    ;; Bool
-    (:bool (values "%s" (format nil "(~a ? \"true\" : \"false\")" val-code)))
-    ;; Value types
-    ((:value :cons) (values :value-print val-code))
-    ;; Structs, vectors, hashmaps, generics — auto-derive show
-    (:struct
-     (ensure-show-helper val-type)
-     (values :show (format nil "show_~a(~a)" (mangle-type-name val-type) val-code)))
-    (:generic
-     (ensure-show-helper val-type)
-     (values :show (format nil "show_~a(~a)" (mangle-type-name val-type) val-code)))
-    (:vector
-     (ensure-show-helper val-type)
-     (values :show (format nil "show_~a(~a)" (mangle-type-name val-type) val-code)))
-    (:hashmap
-     (ensure-show-helper val-type)
-     (values :show (format nil "show_~a(~a)" (mangle-type-name val-type) val-code)))
-    ;; Default to %d for unknown int-like types
-    (otherwise (values "%d" val-code))))
+(defparameter *printf-formats*
+  '((:char . "%c") (:short . "%hd") (:int . "%d") (:long . "%ld") (:long-long . "%lld")
+    (:uchar . "%u") (:ushort . "%hu") (:uint . "%u") (:ulong . "%lu") (:ulong-long . "%llu")
+    (:float . "%f") (:f32 . "%f") (:double . "%f") (:f64 . "%f")
+    (:size . "%zu") (:ptrdiff . "%td")))
 
-(defun compile-print-stmt (form env)
-  "(print expr) — print without newline"
-  (let ((*pending-stmts* nil)
-        (*pending-string-frees* nil))
+(defparameter *pri-formats*
+  '((:i8 . "PRId8") (:i16 . "PRId16") (:i32 . "PRId32") (:i64 . "PRId64")
+    (:u8 . "PRIu8") (:u16 . "PRIu16") (:u32 . "PRIu32") (:u64 . "PRIu64")
+    (:intptr . "PRIdPTR") (:uintptr . "PRIuPTR")))
+
+(defun format-print-arg (val-code val-type)
+  "Return format string and arg for a typed value."
+  (let* ((kind (type-kind val-type))
+         (fmt (cdr (assoc kind *printf-formats*)))
+         (pri (cdr (assoc kind *pri-formats*))))
+    (cond
+      ((str-type-p val-type) (values "%s" val-code))
+      (fmt (values fmt val-code))
+      (pri (values :pri pri val-code))
+      ((eq kind :bool) (values "%s" (format nil "(~a ? \"true\" : \"false\")" val-code)))
+      ((member kind '(:value :cons)) (values :value-print val-code))
+      ((member kind '(:struct :generic))
+       (ensure-show-helper val-type)
+       (values :show (format nil "show_~a(~a)" (mangle-type-name val-type) val-code)))
+      (t (values "%d" val-code)))))
+
+(defun compile-print-impl (form env newline-p)
+  "Shared impl for print/println. Emits printf with optional \\n suffix."
+  (let ((*pending-stmts* nil) (*pending-string-frees* nil)
+        (nl (if newline-p "\\n" "")))
     (multiple-value-bind (val-code val-type) (compile-expr (second form) env)
       (multiple-value-bind (fmt arg) (format-print-arg val-code val-type)
-        (let ((str-free-stmts (mapcar (lambda (tmp) (format nil "  free((char*)~a);" tmp))
-                                      *pending-string-frees*)))
+        (let ((frees (mapcar (lambda (tmp) (format nil "  free((char*)~a);" tmp)) *pending-string-frees*)))
           (append *pending-stmts*
                   (cond
                     ((eq fmt :value-print)
-                     (list (format nil "  sysp_print_value(~a);" arg)))
+                     (if newline-p
+                         (list (format nil "  sysp_print_value(~a); printf(\"\\n\");" arg))
+                         (list (format nil "  sysp_print_value(~a);" arg))))
                     ((eq fmt :show)
                      (let ((tmp (fresh-tmp)))
                        (list (format nil "  const char* ~a = ~a;" tmp arg)
-                             (format nil "  printf(\"%s\", ~a);" tmp)
+                             (format nil "  printf(\"%s~a\", ~a);" nl tmp)
                              (format nil "  free((char*)~a);" tmp))))
                     ((eq fmt :pri)
-                     (list (format nil "  printf(\"%\" ~a, ~a);" arg val-code)))
-                    (t
-                     (list (format nil "  printf(\"~a\", ~a);" fmt arg))))
-                  str-free-stmts))))))
+                     (list (format nil "  printf(\"%\" ~a \"~a\", ~a);" arg nl val-code)))
+                    (t (list (format nil "  printf(\"~a~a\", ~a);" fmt nl arg))))
+                  frees))))))
 
+(defun compile-print-stmt (form env) (compile-print-impl form env nil))
 (defun compile-println-stmt (form env)
-  "(println expr) or (println) — print with newline"
-  (if (null (rest form))
-      (list "  printf(\"\\n\");")
-      (let ((*pending-stmts* nil)
-            (*pending-string-frees* nil))
-        (multiple-value-bind (val-code val-type) (compile-expr (second form) env)
-          (multiple-value-bind (fmt arg) (format-print-arg val-code val-type)
-            (let ((str-free-stmts (mapcar (lambda (tmp) (format nil "  free((char*)~a);" tmp))
-                                          *pending-string-frees*)))
-              (append *pending-stmts*
-                      (cond
-                        ((eq fmt :value-print)
-                         (list (format nil "  sysp_print_value(~a); printf(\"\\n\");" arg)))
-                        ((eq fmt :show)
-                         (let ((tmp (fresh-tmp)))
-                           (list (format nil "  const char* ~a = ~a;" tmp arg)
-                                 (format nil "  printf(\"%s\\n\", ~a);" tmp)
-                                 (format nil "  free((char*)~a);" tmp))))
-                        ((eq fmt :pri)
-                         (list (format nil "  printf(\"%\" ~a \"\\n\", ~a);" arg val-code)))
-                        (t
-                         (list (format nil "  printf(\"~a\\n\", ~a);" fmt arg))))
-                      str-free-stmts)))))))
+  (if (null (rest form)) (list "  printf(\"\\n\");") (compile-print-impl form env t)))
 
 (defun c-escape-string (s)
   "Escape a CL string for C string literal content.
@@ -6249,27 +5504,18 @@
             (push "  }" result)))
         (nreverse result)))))
 
-(defun compile-when-stmt (form env)
-  "(when cond body...)"
+(defun compile-when-unless-impl (form env negate-p)
   (multiple-value-bind (cond-code ct) (compile-expr (second form) env)
     (declare (ignore ct))
     (let ((body-env (make-env :parent env))
-          (result (list (format nil "  if (~a) {" cond-code))))
+          (result (list (format nil (if negate-p "  if (!(~a)) {" "  if (~a) {") cond-code))))
       (dolist (s (compile-body (cddr form) body-env))
         (push (format nil "  ~a" s) result))
       (push "  }" result)
       (nreverse result))))
 
-(defun compile-unless-stmt (form env)
-  "(unless cond body...)"
-  (multiple-value-bind (cond-code ct) (compile-expr (second form) env)
-    (declare (ignore ct))
-    (let ((body-env (make-env :parent env))
-          (result (list (format nil "  if (!(~a)) {" cond-code))))
-      (dolist (s (compile-body (cddr form) body-env))
-        (push (format nil "  ~a" s) result))
-      (push "  }" result)
-      (nreverse result))))
+(defun compile-when-stmt (form env) (compile-when-unless-impl form env nil))
+(defun compile-unless-stmt (form env) (compile-when-unless-impl form env t))
 
 (defun compile-while-stmt (form env)
   "(while cond body...)"
@@ -6377,7 +5623,7 @@
     (multiple-value-bind (code tp) (compile-set-expr form env)
       ;; Free intermediate string temps (not the one being assigned to the target)
       (let ((str-free-stmts (mapcar (lambda (tmp) (format nil "  free((char*)~a);" tmp))
-                                    (if (and (eq tp :str) *pending-string-frees*)
+                                    (if (and (str-type-p tp) *pending-string-frees*)
                                         (rest *pending-string-frees*)
                                         *pending-string-frees*))))
         (append *pending-stmts*
@@ -6392,7 +5638,7 @@
           (declare (ignore tp))
           ;; Free intermediate string temps (not the returned value itself)
           (let ((str-free-stmts (mapcar (lambda (tmp) (format nil "  free((char*)~a);" tmp))
-                                        (if (and (eq tp :str) *pending-string-frees*)
+                                        (if (and (str-type-p tp) *pending-string-frees*)
                                             (rest *pending-string-frees*)
                                             *pending-string-frees*))))
             (append str-free-stmts (list (format nil "  return ~a;" code))))))
@@ -6689,8 +5935,8 @@
    Handles multi-token types like :fn (:int :int) :int, (:list :int), (:variadic :int), (:cons T1 T2)."
   (let ((sym (pop lst)))
     (cond
-      ;; Parenthesized type: (:ptr :void), (:fn (...) :ret), etc.
-      ((and (listp sym) (keywordp (car sym)))
+      ;; Parenthesized type: (:ptr :void), (:fn (...) :ret), (Vector :T), etc.
+      ((listp sym)
        (cons (parse-type-expr sym) lst))
       ;; Function type: :fn (arg-types...) :ret-type
       ((and (keywordp sym)
@@ -6764,8 +6010,8 @@
                            (let ((result (parse-type-from-list lst)))
                              (setf lst (cdr result))
                              (car result)))
-                          ;; Parenthesized type annotation: name (:ptr :void) ...
-                          ((and lst (listp (first lst)) (keywordp (car (first lst))))
+                          ;; Parenthesized type annotation: name (:ptr :void) ... or name (Vector :T) ...
+                          ((and lst (listp (first lst)))
                            (parse-type-expr (pop lst)))
                           ;; No annotation — use inferred or default to :int
                           ((and inferred-arg-types
@@ -6843,8 +6089,11 @@
    Stores method implementations as templates for monomorphization."
   (let* ((trait-name (string (second form)))
          (type-form (third form))
-         ;; type-form is either a symbol (Point) or list (Vector :T)
-         (type-name (if (listp type-form) (string (first type-form)) (string type-form)))
+         ;; type-form is a symbol (Point), keyword (:str), or list (Vector :T)
+         (type-name (cond
+                      ((listp type-form) (string (first type-form)))
+                      ((keywordp type-form) (string-downcase (symbol-name type-form)))
+                      (t (string type-form))))
          (impl-key (format nil "~a:~a" trait-name type-name))
          (method-table (or (gethash impl-key *trait-impls*)
                            (make-hash-table :test 'equal)))
@@ -7002,15 +6251,12 @@
                      arg-types)
              (let ((ret-tokens (type-to-annotation-tokens ret-type)))
                (if (= (length ret-tokens) 1) (first ret-tokens) ret-tokens)))))
-    ;; Compound vector type: (:vector elem) -> (:Vector :elem-type)
-    ((and (consp tp) (eq (car tp) :vector))
-     (let ((elem-tokens (type-to-annotation-tokens (second tp))))
-       (list (cons (intern "Vector" :keyword) elem-tokens))))
-    ;; Compound hashmap type: (:hashmap k v) -> (:HashMap :k :v)
-    ((and (consp tp) (eq (car tp) :hashmap))
-     (let ((key-tokens (type-to-annotation-tokens (second tp)))
-           (val-tokens (type-to-annotation-tokens (third tp))))
-       (list (append (list (intern "HashMap" :keyword)) key-tokens val-tokens))))
+    ;; Generic types: (:generic "Vector" :int) -> (:Vector :int), etc.
+    ((and (consp tp) (eq (car tp) :generic))
+     (let* ((name (second tp))
+            (params (cddr tp))
+            (param-tokens (mapcan #'type-to-annotation-tokens params)))
+       (list (cons (intern name :keyword) param-tokens))))
     ;; Pointer type: (:ptr :int) -> (:PTR-INT)
     ((and (consp tp) (eq (car tp) :ptr))
      (let ((inner-tokens (type-to-annotation-tokens (second tp))))
@@ -7872,187 +7118,15 @@
       (incf form-idx))))
 
 (defun emit-condition-preamble (out)
-  "Emit the condition system runtime (restart/handler stacks, signal, invoke-restart)."
-  (format out "/* Condition system runtime */~%")
-  (format out "#include <setjmp.h>~%")
-  (format out "#include <string.h>~%~%")
-  (format out "typedef struct _sysp_restart {~%")
-  (format out "    const char* name;~%")
-  (format out "    jmp_buf buf;~%")
-  (format out "    void* value;~%")
-  (format out "    char _vbuf[16];~%")
-  (format out "    struct _sysp_restart* next;~%")
-  (format out "} _sysp_restart;~%~%")
-  (format out "typedef struct _sysp_handler {~%")
-  (format out "    const char* type;~%")
-  (format out "    void (*fn)(void*, void*);~%")
-  (format out "    void* env;~%")
-  (format out "    struct _sysp_handler* next;~%")
-  (format out "} _sysp_handler;~%~%")
-  (format out "static SYSP_TLS _sysp_restart* _restart_stack = NULL;~%")
-  (format out "static SYSP_TLS _sysp_handler* _handler_stack = NULL;~%~%")
-  (format out "static void _sysp_signal(const char* type, void* val) {~%")
-  (format out "    _sysp_handler* h = _handler_stack;~%")
-  (format out "    while (h) {~%")
-  (format out "        if (strcmp(h->type, type) == 0) {~%")
-  (format out "            h->fn(h->env, val);~%")
-  (format out "        }~%")
-  (format out "        h = h->next;~%")
-  (format out "    }~%")
-  (format out "    fprintf(stderr, \"Unhandled condition: %s\\n\", type);~%")
-  (format out "    abort();~%")
-  (format out "}~%~%")
-  (format out "static void _sysp_invoke_restart(const char* name, void* val, size_t vsize) {~%")
-  (format out "    _sysp_restart* r = _restart_stack;~%")
-  (format out "    while (r) {~%")
-  (format out "        if (strcmp(r->name, name) == 0) {~%")
-  (format out "            if (val && vsize <= sizeof(r->_vbuf)) {~%")
-  (format out "                memcpy(r->_vbuf, val, vsize);~%")
-  (format out "                r->value = r->_vbuf;~%")
-  (format out "            } else {~%")
-  (format out "                r->value = val;~%")
-  (format out "            }~%")
-  (format out "            longjmp(r->buf, 1);~%")
-  (format out "        }~%")
-  (format out "        r = r->next;~%")
-  (format out "    }~%")
-  (format out "    fprintf(stderr, \"No restart: %s\\n\", name);~%")
-  (format out "    abort();~%")
-  (format out "}~%~%"))
+  "Emit the condition system runtime via #include."
+  (format out "#include \"runtime/conditions.h\"~%~%"))
 
 (defun emit-value-preamble (out)
-  "Emit the Value/Cons/Symbol type system preamble with readable formatting"
-  ;; Type definitions
-  (format out "/*~%")
-  (format out " * Value Type System~%")
-  (format out " * Tagged union for dynamic values: nil, int, float, string, symbol, cons~%")
-  (format out " */~%~%")
-
-  (format out "typedef uint32_t Symbol;~%")
-  (format out "typedef struct Cons Cons;~%~%")
-
-  (format out "typedef enum {~%")
-  (format out "    VAL_NIL,~%")
-  (format out "    VAL_INT,~%")
-  (format out "    VAL_FLOAT,~%")
-  (format out "    VAL_STR,~%")
-  (format out "    VAL_SYM,~%")
-  (format out "    VAL_CONS~%")
-  (format out "} ValueTag;~%~%")
-
-  (format out "typedef struct {~%")
-  (format out "    ValueTag tag;~%")
-  (format out "    union {~%")
-  (format out "        int as_int;~%")
-  (format out "        double as_float;~%")
-  (format out "        const char* as_str;~%")
-  (format out "        Symbol as_sym;~%")
-  (format out "        Cons* as_cons;~%")
-  (format out "    };~%")
-  (format out "} Value;~%~%")
-
-  (format out "struct Cons {~%")
-  (format out "    Value car;~%")
-  (format out "    Value cdr;~%")
-  (format out "    int refcount;~%")
-  (format out "};~%~%")
-
-  ;; Value constructors
-  (format out "/* Value constructors */~%")
-  (format out "static Value val_nil(void) {~%")
-  (format out "    return (Value){.tag = VAL_NIL};~%")
-  (format out "}~%~%")
-
-  (format out "static Value val_int(int x) {~%")
-  (format out "    Value v = {.tag = VAL_INT};~%")
-  (format out "    v.as_int = x;~%")
-  (format out "    return v;~%")
-  (format out "}~%~%")
-
-  (format out "static Value val_float(double x) {~%")
-  (format out "    Value v = {.tag = VAL_FLOAT};~%")
-  (format out "    v.as_float = x;~%")
-  (format out "    return v;~%")
-  (format out "}~%~%")
-
-  (format out "static Value val_str(const char* x) {~%")
-  (format out "    Value v = {.tag = VAL_STR};~%")
-  (format out "    v.as_str = x;~%")
-  (format out "    return v;~%")
-  (format out "}~%~%")
-
-  (format out "static Value val_sym(Symbol x) {~%")
-  (format out "    Value v = {.tag = VAL_SYM};~%")
-  (format out "    v.as_sym = x;~%")
-  (format out "    return v;~%")
-  (format out "}~%~%")
-
-  (format out "static Value val_cons(Cons* x) {~%")
-  (format out "    Value v = {.tag = VAL_CONS};~%")
-  (format out "    v.as_cons = x;~%")
-  (format out "    return v;~%")
-  (format out "}~%~%")
-
-  (format out "static Cons* make_cons(Value car, Value cdr) {~%")
-  (format out "    Cons* c = malloc(sizeof(Cons));~%")
-  (format out "    c->car = car;~%")
-  (format out "    c->cdr = cdr;~%")
-  (format out "    c->refcount = 1;~%")
-  (format out "    return c;~%")
-  (format out "}~%~%")
-
-  ;; Reference counting
-  (format out "/* Reference counting */~%")
-  (format out "static Value val_retain(Value v) {~%")
-  (format out "    if (v.tag == VAL_CONS && v.as_cons)~%")
-  (format out "        RC_INC(v.as_cons->refcount);~%")
-  (format out "    return v;~%")
-  (format out "}~%~%")
-
-  (format out "static void val_release(Value v) {~%")
-  (format out "    if (v.tag == VAL_CONS && v.as_cons && RC_DEC(v.as_cons->refcount) == 1) {~%")
-  (format out "        val_release(v.as_cons->car);~%")
-  (format out "        val_release(v.as_cons->cdr);~%")
-  (format out "        free(v.as_cons);~%")
-  (format out "    }~%")
-  (format out "}~%~%")
-
-  ;; Accessors (borrow semantics)
-  (format out "/* Accessors (borrow semantics - caller retains if storing) */~%")
-  (format out "static Value sysp_car(Value v) { return v.as_cons->car; }~%")
-  (format out "static Value sysp_cdr(Value v) { return v.as_cons->cdr; }~%")
-  (format out "static int sysp_nilp(Value v) { return v.tag == VAL_NIL; }~%~%")
-
-  (format out "static int sysp_sym_eq(Value a, Value b) {~%")
-  (format out "    return a.tag == VAL_SYM && b.tag == VAL_SYM && a.as_sym == b.as_sym;~%")
-  (format out "}~%~%")
-
-  ;; List operations
-  (format out "/* List operations */~%")
-  (format out "static Value sysp_append(Value lst, Value tail) {~%")
-  (format out "    if (lst.tag == VAL_NIL)~%")
-  (format out "        return val_retain(tail);~%")
-  (format out "    return val_cons(make_cons(val_retain(lst.as_cons->car),~%")
-  (format out "                              sysp_append(lst.as_cons->cdr, tail)));~%")
-  (format out "}~%~%")
-
-  (format out "static Value sysp_list(int n, ...) {~%")
-  (format out "    va_list args;~%")
-  (format out "    va_start(args, n);~%")
-  (format out "    Value result = val_nil();~%")
-  (format out "    Value* values = malloc(n * sizeof(Value));~%")
-  (format out "    for (int i = 0; i < n; i++)~%")
-  (format out "        values[i] = va_arg(args, Value);~%")
-  (format out "    va_end(args);~%")
-  (format out "    for (int i = n - 1; i >= 0; i--)~%")
-  (format out "        result = val_cons(make_cons(val_retain(values[i]), result));~%")
-  (format out "    free(values);~%")
-  (format out "    return result;~%")
-  (format out "}~%~%")
-
+  "Emit the Value/Cons/Symbol type system. Static parts via runtime/value.h,
+   dynamic parts (symbol table, gensym counter, SYM_* defines) inline."
+  ;; Gensym counter
   (format out "static SYSP_TLS uint32_t _sysp_gensym = 0x80000000;~%~%")
-
-  ;; Symbol table for printing
+  ;; Symbol table (must come before #include so sysp_print_value can reference _sym_names)
   (let ((max-id *symbol-counter*))
     (format out "static const char* _sym_names[~d] = {~%" (1+ max-id))
     (format out "    \"\"")
@@ -8061,47 +7135,8 @@
         (maphash (lambda (n id) (when (= id i) (setf name n))) *symbol-table*)
         (format out ",~%    \"~a\"" (or name ""))))
     (format out "~%};~%~%"))
-
-  ;; Print function
-  (format out "static void sysp_print_value(Value v) {~%")
-  (format out "    switch (v.tag) {~%")
-  (format out "    case VAL_NIL:~%")
-  (format out "        printf(\"nil\");~%")
-  (format out "        break;~%")
-  (format out "    case VAL_INT:~%")
-  (format out "        printf(\"%d\", v.as_int);~%")
-  (format out "        break;~%")
-  (format out "    case VAL_FLOAT:~%")
-  (format out "        printf(\"%f\", v.as_float);~%")
-  (format out "        break;~%")
-  (format out "    case VAL_STR:~%")
-  (format out "        printf(\"%s\", v.as_str);~%")
-  (format out "        break;~%")
-  (format out "    case VAL_SYM:~%")
-  (format out "        if (v.as_sym < sizeof(_sym_names)/sizeof(_sym_names[0]))~%")
-  (format out "            printf(\"%s\", _sym_names[v.as_sym]);~%")
-  (format out "        else~%")
-  (format out "            printf(\"g%u\", v.as_sym);~%")
-  (format out "        break;~%")
-  (format out "    case VAL_CONS: {~%")
-  (format out "        printf(\"(\");~%")
-  (format out "        sysp_print_value(v.as_cons->car);~%")
-  (format out "        Value tail = v.as_cons->cdr;~%")
-  (format out "        while (tail.tag == VAL_CONS) {~%")
-  (format out "            printf(\" \");~%")
-  (format out "            sysp_print_value(tail.as_cons->car);~%")
-  (format out "            tail = tail.as_cons->cdr;~%")
-  (format out "        }~%")
-  (format out "        if (tail.tag != VAL_NIL) {~%")
-  (format out "            printf(\" . \");~%")
-  (format out "            sysp_print_value(tail);~%")
-  (format out "        }~%")
-  (format out "        printf(\")\");~%")
-  (format out "        break;~%")
-  (format out "    }~%")
-  (format out "    }~%")
-  (format out "}~%~%")
-
+  ;; Static runtime (types, constructors, RC, print, list ops)
+  (format out "#include \"runtime/value.h\"~%~%")
   ;; Symbol defines
   (format out "/* Symbol constants */~%")
   (maphash (lambda (name id)
@@ -8122,50 +7157,12 @@
     (when *uses-threads*
       (format out "#include <pthread.h>~%"))
     (dolist (inc *includes*)
-      (format out "#include <~a>~%" inc))
+      (if (eql 0 (search "runtime/" inc))
+          (format out "#include \"~a\"~%" inc)
+          (format out "#include <~a>~%" inc)))
     (format out "~%")
-    ;; Thread safety macros (always emitted — zero cost if single-threaded)
-    (format out "/* Thread safety macros */~%")
-    (format out "#ifndef SYSP_NO_THREADS~%")
-    (format out "  #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__)~%")
-    (format out "    #include <stdatomic.h>~%")
-    (format out "    #define RC_INC(x) atomic_fetch_add_explicit(&(x), 1, memory_order_relaxed)~%")
-    (format out "    #define RC_DEC(x) atomic_fetch_sub_explicit(&(x), 1, memory_order_acq_rel)~%")
-    (format out "    #define SYSP_TLS _Thread_local~%")
-    (format out "  #elif defined(__GNUC__) || defined(__clang__)~%")
-    (format out "    #define RC_INC(x) __sync_fetch_and_add(&(x), 1)~%")
-    (format out "    #define RC_DEC(x) __sync_fetch_and_sub(&(x), 1)~%")
-    (format out "    #define SYSP_TLS __thread~%")
-    (format out "  #elif defined(_MSC_VER)~%")
-    (format out "    #include <intrin.h>~%")
-    (format out "    #define RC_INC(x) _InterlockedIncrement((long*)&(x))~%")
-    (format out "    #define RC_DEC(x) _InterlockedDecrement((long*)&(x))~%")
-    (format out "    #define SYSP_TLS __declspec(thread)~%")
-    (format out "  #else~%")
-    (format out "    #warning \"Unknown compiler: define RC_INC/RC_DEC or -DSYSP_NO_THREADS\"~%")
-    (format out "    #define RC_INC(x) (++(x))~%")
-    (format out "    #define RC_DEC(x) (--(x))~%")
-    (format out "    #define SYSP_TLS~%")
-    (format out "  #endif~%")
-    (format out "#else~%")
-    (format out "  #define RC_INC(x) (++(x))~%")
-    (format out "  #define RC_DEC(x) (--(x))~%")
-    (format out "  #define SYSP_TLS~%")
-    (format out "#endif~%~%")
-    ;; Hash function preamble (if needed)
-    (when *uses-hashmap*
-      (pushnew "string.h" *includes* :test #'string=)
-      (format out "/* Hash functions (FNV-1a for strings, integer hash for ints) */~%")
-      (format out "static unsigned int _sysp_hash_str(const char* s) {~%")
-      (format out "  unsigned int h = 2166136261u;~%")
-      (format out "  for (; *s; s++) h = (h ^ (unsigned char)*s) * 16777619u;~%")
-      (format out "  return h;~%")
-      (format out "}~%")
-      (format out "static unsigned int _sysp_hash_int(unsigned int u) {~%")
-      (format out "  u = ((u >> 16) ^ u) * 0x45d9f3bu;~%")
-      (format out "  u = ((u >> 16) ^ u) * 0x45d9f3bu;~%")
-      (format out "  return (u >> 16) ^ u;~%")
-      (format out "}~%~%"))
+    (format out "#include \"runtime/threads.h\"~%~%")
+    ;; Hash functions now in runtime/hashmap.h (included via *includes* when needed)
     ;; Condition system preamble (if needed)
     (when *uses-conditions*
       (emit-condition-preamble out))
@@ -8198,64 +7195,39 @@
       (terpri out))))
 
 (defun reset-state ()
-  (setf *structs* (make-hash-table :test 'equal))
-  (setf *enums* (make-hash-table :test 'equal))
-  (setf *functions* nil)
-  (setf *struct-defs* nil)
-  (setf *lambda-counter* 0)
-  (setf *temp-counter* 0)
-  (setf *generated-types* (make-hash-table :test 'equal))
-  (setf *type-decls* nil)
-  (setf *forward-decls* nil)
-  (setf *top-level-vars* nil)
-  (setf *lambda-forward-decls* nil)
+  ;; Reset all hash tables
+  (dolist (ht '(*structs* *enums* *generated-types* *symbol-table* *macro-fns*
+                *type-aliases* *name-overrides* *poly-fns* *mono-instances* *auto-poly-fns*
+                *included-files* *direct-fns* *defn-wrappers* *raw-lambda-names* *extern-fns*
+                *escape-info* *sysp-modules* *imports*
+                *generic-structs* *generic-struct-instances*
+                *traits* *trait-impls* *method-to-trait*))
+    (setf (symbol-value ht) (make-hash-table :test 'equal)))
+  ;; Reset lists
+  (dolist (var '(*functions* *struct-defs* *type-decls* *forward-decls* *top-level-vars*
+                *lambda-forward-decls* *includes* *string-literals* *function-comments*
+                *struct-comments* *var-comments* *exports* *pending-string-frees*))
+    (setf (symbol-value var) nil))
+  ;; Reset counters
+  (setf *lambda-counter* 0 *temp-counter* 0 *symbol-counter* 0 *interp-gensym-counter* 0
+        *env-counter* 0 *spawn-counter* 0 *restart-counter* 0 *handler-counter* 0
+        *handler-wrap-counter* 0 *sysp-gensym-counter* #x80000000)
+  ;; Reset flags
+  (setf *uses-value-type* nil *uses-threads* nil *uses-conditions* nil)
+  ;; Reset env
   (setf *global-env* (make-env))
-  (setf *includes* nil)
-  (setf *string-literals* nil)
-  (setf *symbol-table* (make-hash-table :test 'equal))
-  (setf *symbol-counter* 0)
-  (setf *sysp-gensym-counter* #x80000000)
-  (setf *uses-value-type* nil)
-  (setf *macro-fns* (make-hash-table :test 'equal))
-  (setf *interp-gensym-counter* 0)
-  (setf *function-comments* nil)
-  (setf *struct-comments* nil)
-  (setf *var-comments* nil)
-  (setf *type-aliases* (make-hash-table :test 'equal))
-  (setf *name-overrides* (make-hash-table :test 'equal))
-  (setf *poly-fns* (make-hash-table :test #'equal))
-  (setf *mono-instances* (make-hash-table :test #'equal))
-  (setf *auto-poly-fns* (make-hash-table :test #'equal))
-  (setf *included-files* (make-hash-table :test 'equal))
-  (setf *direct-fns* (make-hash-table :test 'equal))
-  (setf *defn-wrappers* (make-hash-table :test 'equal))
-  (setf *raw-lambda-names* (make-hash-table :test 'equal))
-  (setf *extern-fns* (make-hash-table :test 'equal))
-  (setf *env-counter* 0)
-  (setf *spawn-counter* 0)
-  (setf *uses-threads* nil)
-  (setf *restart-counter* 0)
-  (setf *handler-counter* 0)
-  (setf *handler-wrap-counter* 0)
-  (setf *uses-conditions* nil)
-  (setf *exports* nil)
-  (setf *escape-info* (make-hash-table :test 'equal))
-  (setf *uses-hashmap* nil)
-  (setf *pending-string-frees* nil)
-  (setf *sysp-modules* (make-hash-table :test 'equal))
-  (setf *imports* (make-hash-table :test 'equal))
-  (setf *generic-structs* (make-hash-table :test 'equal))
-  (setf *generic-struct-instances* (make-hash-table :test 'equal))
-  (setf *traits* (make-hash-table :test 'equal))
-  (setf *trait-impls* (make-hash-table :test 'equal))
-  (setf *method-to-trait* (make-hash-table :test 'equal))
-  ;; Register built-in poly-fns for migrated collection operations
   (register-builtin-poly-fns))
 
 (defun register-builtin-poly-fns ()
-  "No-op: all poly-fns now live in library files (collections.sysp, strings.sysp).
-   Kept as hook point for future compiler-level poly-fns if needed."
-  nil)
+  "Register built-in generic structs for Vector and HashMap.
+   These are defined here so the compiler knows their structure
+   before any library files are loaded."
+  ;; Vector: (struct (Vector :T) [data (:ptr :T) len :int cap :int])
+  (setf (gethash "Vector" *generic-structs*)
+        (list '(:T) '(data (:ptr :T) len :int cap :int)))
+  ;; HashMap: (struct (HashMap :K :V) [keys (:ptr :K) vals (:ptr :V) occ (:ptr :char) len :int cap :int])
+  (setf (gethash "HashMap" *generic-structs*)
+        (list '(:K :V) '(keys (:ptr :K) vals (:ptr :V) occ (:ptr :char) len :int cap :int))))
 
 ;;; === Escape Analysis ===
 
@@ -8318,7 +7290,7 @@
                                          "cond" "match" "+" "-" "*" "/" "%" "=" "!=" "<" ">" "<=" ">="
                                          "and" "or" "not" "cast" "addr-of" "sizeof" "deref"
                                          "array-ref" "array-set!" "vector-ref" "vector-set!"
-                                         "vector-push!" "vector-free" "len"
+                                         "vector-push!" "vector-free" "len" "sizeof-val"
                                          "hash-get" "hash-set!" "hash-has?" "hash-del!"
                                          "hash-keys" "hash-vals" "hash-free"
                                          "inc" "dec" "bit-and" "bit-or" "bit-xor" "bit-not"

@@ -1,12 +1,150 @@
-;; collections.sysp — generic collection operations
-;; Vector/HashMap types are compiler builtins (need malloc/realloc).
-;; Access operations live here as library poly-fns.
+;; collections.sysp — pure library Vector and HashMap operations
+;; No part of the compiler depends on these types.
 
-(defn len [x :?] :int
-  (get x len))
+(include "stdlib.h")
+(include "string.h")
+(include "runtime/vector.h")
+(include "runtime/hashmap.h")
+
+(extern malloc [size :int] (:ptr :void))
+(extern realloc [ptr (:ptr :void) size :int] (:ptr :void))
+(extern free [ptr (:ptr :void)] :void)
+(extern memcpy [dst (:ptr :void) src (:ptr :void) n :int] (:ptr :void))
+
+;;; === Universal len — poly-fn for any collection with .len field ===
+
+(defn len [c :?] :int (get c len))
+
+;;; === Trait: Indexed — read access by int index ===
+
+(deftrait Indexed [:T]
+  (nth [self i] :int))
+
+(impl Indexed (:Vector :T)
+  (defn nth [v (:Vector :T) i :int] :T (array-ref (get v data) i)))
+
+;;; === Trait: Keyed — read access by key ===
+
+(deftrait Keyed [:K :V]
+  (hash-get [self k] :V)
+  (hash-has? [self k] :bool)
+  (hash-len [self] :int))
+
+(impl Keyed (:HashMap :K :V)
+  (defn hash-get [m (:HashMap :K :V) key :K] :V
+    (when (== (get m cap) 0) (return (cast :V 0)))
+    (let-mut h (cast :int (% (_sysp_hash_key key) (cast :uint (get m cap)))))
+    (while (!= (cast :int (array-ref (get m occ) h)) 0)
+      (when (== (cast :int (array-ref (get m occ) h)) 1)
+        (when (_sysp_key_eq (array-ref (get m keys) h) key)
+          (return (array-ref (get m vals) h))))
+      (set! h (% (+ h 1) (get m cap))))
+    (cast :V 0))
+
+  (defn hash-has? [m (:HashMap :K :V) key :K] :bool
+    (when (== (get m cap) 0) (return 0))
+    (let-mut h (cast :int (% (_sysp_hash_key key) (cast :uint (get m cap)))))
+    (while (!= (cast :int (array-ref (get m occ) h)) 0)
+      (when (== (cast :int (array-ref (get m occ) h)) 1)
+        (when (_sysp_key_eq (array-ref (get m keys) h) key)
+          (return 1)))
+      (set! h (% (+ h 1) (get m cap))))
+    0)
+
+  (defn hash-len [m (:HashMap :K :V)] :int (get m len)))
+
+;;; === Poly-fns: backward-compat aliases ===
 
 (defn vector-ref [v :? i :int] :?
   (array-ref (get v data) i))
 
 (defn vector-set! [v :? i :int val :?] :?
   (array-set! (get v data) i val))
+
+;;; === Mutating ops (take ptr, macros add addr-of) ===
+
+(defn _vector-push-impl [vp (:ptr :?) elem :?] :void
+  (when (== (get (deref vp) len) (get (deref vp) cap))
+    (let new-cap (if (== (get (deref vp) cap) 0) 4 (* (get (deref vp) cap) 2)))
+    (set! (get (deref vp) data)
+          (cast (:ptr :?) (realloc (cast (:ptr :void) (get (deref vp) data))
+                                   (* new-cap (sizeof-val elem)))))
+    (set! (get (deref vp) cap) new-cap))
+  (array-set! (get (deref vp) data) (get (deref vp) len) elem)
+  (set! (get (deref vp) len) (+ (get (deref vp) len) 1)))
+
+(defn _vector-free-impl [v :?] :void
+  (when (> (get v cap) 0)
+    (free (cast (:ptr :void) (get v data)))))
+
+(defn _hm_grow [mp (:ptr :?) dummy-k :? dummy-v :?] :void
+  (let oc (get (deref mp) cap))
+  (let ok (get (deref mp) keys))
+  (let ov (get (deref mp) vals))
+  (let oo (get (deref mp) occ))
+  (let nc (if (== oc 0) 8 (* oc 2)))
+  (set! (get (deref mp) cap) nc)
+  (set! (get (deref mp) len) 0)
+  (set! (get (deref mp) keys) (cast (:ptr :?) (malloc (* nc (sizeof-val dummy-k)))))
+  (set! (get (deref mp) vals) (cast (:ptr :?) (malloc (* nc (sizeof-val dummy-v)))))
+  (set! (get (deref mp) occ) (cast (:ptr :char) (malloc nc)))
+  (for [i 0 nc] (array-set! (get (deref mp) occ) i (cast :char 0)))
+  (for [i 0 oc]
+    (when (== (cast :int (array-ref oo i)) 1)
+      (let key (array-ref ok i))
+      (let-mut h (cast :int (% (_sysp_hash_key key) (cast :uint nc))))
+      (while (!= (cast :int (array-ref (get (deref mp) occ) h)) 0)
+        (set! h (% (+ h 1) nc)))
+      (array-set! (get (deref mp) keys) h key)
+      (array-set! (get (deref mp) vals) h (array-ref ov i))
+      (array-set! (get (deref mp) occ) h (cast :char 1))
+      (set! (get (deref mp) len) (+ (get (deref mp) len) 1))))
+  (when (> oc 0)
+    (free (cast (:ptr :void) ok))
+    (free (cast (:ptr :void) ov))
+    (free (cast (:ptr :void) oo))))
+
+(defn _hash-set-impl [mp (:ptr :?) key :? val :?] :void
+  (when (>= (* (get (deref mp) len) 4) (* (get (deref mp) cap) 3))
+    (_hm_grow mp key val))
+  (let-mut h (cast :int (% (_sysp_hash_key key) (cast :uint (get (deref mp) cap)))))
+  (while (== (cast :int (array-ref (get (deref mp) occ) h)) 1)
+    (when (_sysp_key_eq (array-ref (get (deref mp) keys) h) key)
+      (array-set! (get (deref mp) vals) h val)
+      (return))
+    (set! h (% (+ h 1) (get (deref mp) cap))))
+  (array-set! (get (deref mp) keys) h key)
+  (array-set! (get (deref mp) vals) h val)
+  (array-set! (get (deref mp) occ) h (cast :char 1))
+  (set! (get (deref mp) len) (+ (get (deref mp) len) 1)))
+
+(defn _hash-del-impl [mp (:ptr :?) key :?] :void
+  (when (== (get (deref mp) cap) 0) (return))
+  (let-mut h (cast :int (% (_sysp_hash_key key) (cast :uint (get (deref mp) cap)))))
+  (while (!= (cast :int (array-ref (get (deref mp) occ) h)) 0)
+    (when (== (cast :int (array-ref (get (deref mp) occ) h)) 1)
+      (when (_sysp_key_eq (array-ref (get (deref mp) keys) h) key)
+        (array-set! (get (deref mp) occ) h (cast :char 2))
+        (set! (get (deref mp) len) (- (get (deref mp) len) 1))
+        (return)))
+    (set! h (% (+ h 1) (get (deref mp) cap)))))
+
+(defn hash-keys [m :?] :?
+  (let-mut r (Vector))
+  (for [i 0 (get m cap)]
+    (when (== (cast :int (array-ref (get m occ) i)) 1)
+      (_vector-push-impl (addr-of r) (array-ref (get m keys) i))))
+  r)
+
+(defn hash-vals [m :?] :?
+  (let-mut r (Vector))
+  (for [i 0 (get m cap)]
+    (when (== (cast :int (array-ref (get m occ) i)) 1)
+      (_vector-push-impl (addr-of r) (array-ref (get m vals) i))))
+  r)
+
+(defn _hash-free-impl [m :?] :void
+  (when (> (get m cap) 0)
+    (free (cast (:ptr :void) (get m keys)))
+    (free (cast (:ptr :void) (get m vals)))
+    (free (cast (:ptr :void) (get m occ)))))
