@@ -56,7 +56,9 @@
 
 (extern fputc  ((c :int) (f :ptr-void)) :int)
 (extern feof   ((f :ptr-void)) :int)
-(extern strcmp ((a :cstr) (b :cstr)) :int)
+(extern fflush ((f :ptr-void)) :int)
+(extern strcmp     ((a :cstr) (b :cstr)) :int)
+(extern strcasecmp ((a :cstr) (b :cstr)) :int)
 
 ; ---- env operations (assoc list of (sym-id . value)) ----
 
@@ -82,7 +84,7 @@
 ; ---- name comparison ----
 
 (defn name-is? ((id :u32) (s :cstr)) :int
-  (= (strcmp (sym_name id) s) 0))
+  (= (strcasecmp (sym_name id) s) 0))
 
 ; ---- macro env (separate from value env) ----
 ; Macros stored as a list of (sym-id . closure-value).
@@ -162,6 +164,8 @@
     ((!= (name-is? id (cstr "println")) 0)
        (val_println (eval-form (val_car args) env mac))
        (val_nil))
+    ((!= (name-is? id (cstr "macroexpand")) 0)
+       (macro-expand-all (eval-form (val_car args) env mac) env mac))
     (else
       ;; Look up id as a user fn in env, or macro in mac. Apply if found.
       (let ((mfn (env-lookup mac id)))
@@ -254,6 +258,25 @@
     (let ((new-env (bind-list params args env)))
       (eval-body body new-env mac))))
 
+; ---- macro expansion (for compile-time use by sysp-ir) ----
+
+(defn macro-expand-once ((form :Value) (env :Value) (mac :Value)) :Value
+  (if (= (is_cons form) 0) form
+      (let ((head (val_car form)))
+        (if (= (is_sym head) 0) form
+            (let ((mfn (env-lookup mac (val_sym_of head))))
+              (if (!= (is_nil mfn) 0) form
+                  (apply-fn mfn (val_cdr form) env mac)))))))
+
+(defn macro-expand-all ((form :Value) (env :Value) (mac :Value)) :Value
+  ;; Expand top-level until fixpoint, then recurse into the structure.
+  (let ((once (macro-expand-once form env mac)))
+    (if (= (val_eq once form) 0)
+        (macro-expand-all once env mac)
+        (if (= (is_cons form) 0) form
+            (val_cons (macro-expand-all (val_car form) env mac)
+                      (macro-expand-all (val_cdr form) env mac))))))
+
 ; ---- top-level form handling ----
 
 (defn handle-form ((form :Value) (env :Value) (mac :Value)) :Value
@@ -305,5 +328,6 @@
                 ;; Print only if result is non-nil (defn/defmacro return nil).
                 (when (= (is_nil result) 0)
                   (write_sexp out result)
-                  (fputc 10 out)))))))))
+                  (fputc 10 out)
+                  (fflush out)))))))))
   0)

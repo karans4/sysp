@@ -23,10 +23,57 @@
           append (expand-uses (parse-file (second f)))
         else collect f))
 
+(defparameter *interp-binary* "runtime/interp")
+
+(defun expand-macros (forms)
+  "If any form is a (defmacro ...), spawn the interpreter, register all
+   defmacros, and request macroexpand for every other form. Returns the
+   transformed form list. If no defmacros are present, returns forms
+   unchanged (no subprocess overhead)."
+  (let ((macros nil) (others nil))
+    (dolist (f forms)
+      (if (and (consp f) (eq (first f) 'defmacro))
+          (push f macros)
+          (push f others)))
+    (setf macros (nreverse macros) others (nreverse others))
+    (cond
+      ((null macros) forms)
+      (t (run-interp-expand macros others)))))
+
+(defun run-interp-expand (defmacros others)
+  (unless (probe-file *interp-binary*)
+    (error "expand-macros: ~a not found. Build via runtime/build-interp.sh"
+           *interp-binary*))
+  (let* ((proc (sb-ext:run-program *interp-binary* nil
+                                   :wait nil
+                                   :input :stream
+                                   :output :stream
+                                   :error :output))
+         (in  (sb-ext:process-input proc))
+         (out (sb-ext:process-output proc)))
+    (unwind-protect
+         (progn
+           ;; Register all macros first.
+           (dolist (m defmacros) (format in "~s~%" m))
+           (force-output in)
+           ;; Drain any output (defmacro emits nothing, but be safe).
+           (loop while (listen out) do (read-char out))
+           ;; For each non-macro form, ask for the macroexpand.
+           (let ((result nil))
+             (dolist (o others)
+               (format in "(macroexpand '~s)~%" o)
+               (force-output in)
+               (push (read out nil :eof) result))
+             (nreverse result)))
+      (close in)
+      (sb-ext:process-wait proc)
+      (sb-ext:process-close proc))))
+
 (defun compile-program (forms &optional (out t))
   "Compile a top-level program: (use ...), (include ...), (defstruct ...),
    (extern-struct ...), (extern ...), (define ...), (enum ...), (defn ...)."
   (setf forms (expand-uses forms))
+  (setf forms (expand-macros forms))
   (let (includes structs extern-structs defines externs defns)
     (dolist (f forms)
       (case (first f)

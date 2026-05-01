@@ -1,0 +1,17 @@
+; A sysp program with a user-defined macro, compiled end-to-end by sysp-ir.
+; The compiler spawns runtime/interp, registers the macro, and asks for
+; expansions of each subsequent form. The expansion is then compiled to C.
+
+(defmacro inc (x) `(+ ~x 1))
+
+(defmacro double (x) `(* ~x 2))
+
+(defmacro inc-and-double (x)
+  `(double (inc ~x)))
+
+(defn main () :int
+  ; Each macro use is expanded at compile time.
+  (let ((a (inc 10))                       ; → (+ 10 1) = 11
+        (b (double 7))                     ; → (* 7 2) = 14
+        (c (inc-and-double 4)))            ; → (* (+ 4 1) 2) = 10
+    (+ (+ a b) c)))                        ; 11 + 14 + 10 = 35

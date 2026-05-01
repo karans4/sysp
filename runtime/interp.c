@@ -20,6 +20,8 @@ Value eval_let(Value args, Value env, Value mac);
 Value eval_let_bindings(Value bindings, Value env, Value mac);
 Value eval_body(Value body, Value env, Value mac);
 Value apply_fn(Value fn, Value args, Value env, Value mac);
+Value macro_expand_once(Value form, Value env, Value mac);
+Value macro_expand_all(Value form, Value env, Value mac);
 Value handle_form(Value form, Value env, Value mac);
 int main();
 
@@ -69,7 +71,7 @@ Value bind_list(Value params, Value args, Value env) {
 
 int name_is_p(uint32_t id, const char* s) {
   const char* t1 = sym_name(id);
-  int t2 = strcmp(t1, s);
+  int t2 = strcasecmp(t1, s);
   return (t2 == 0);
 }
 
@@ -330,23 +332,32 @@ Value dispatch(uint32_t id, Value args, Value env, Value mac, Value form) {
                                       Value t244 = val_nil();
                                       return t244;
                                     } else {
-                                      Value t245 = env_lookup(mac, id);
-                                      Value mfn = t245;
-                                      int t246 = is_nil(mfn);
-                                      if ((t246 == 0)) {
-                                        Value t253 = apply_fn(mfn, args, env, mac);
+                                      const char* t245 = "macroexpand";
+                                      int t246 = name_is_p(id, t245);
+                                      if ((t246 != 0)) {
+                                        Value t253 = val_car(args);
                                         Value t254 = eval_form(t253, env, mac);
-                                        return t254;
+                                        Value t255 = macro_expand_all(t254, env, mac);
+                                        return t255;
                                       } else {
-                                        Value t255 = env_lookup(env, id);
-                                        Value fn = t255;
-                                        int t256 = is_nil(fn);
-                                        if ((t256 == 0)) {
-                                          Value t263 = eval_args(args, env, mac);
-                                          Value t264 = apply_fn(fn, t263, env, mac);
-                                          return t264;
+                                        Value t256 = env_lookup(mac, id);
+                                        Value mfn = t256;
+                                        int t257 = is_nil(mfn);
+                                        if ((t257 == 0)) {
+                                          Value t264 = apply_fn(mfn, args, env, mac);
+                                          Value t265 = eval_form(t264, env, mac);
+                                          return t265;
                                         } else {
-                                          return form;
+                                          Value t266 = env_lookup(env, id);
+                                          Value fn = t266;
+                                          int t267 = is_nil(fn);
+                                          if ((t267 == 0)) {
+                                            Value t274 = eval_args(args, env, mac);
+                                            Value t275 = apply_fn(fn, t274, env, mac);
+                                            return t275;
+                                          } else {
+                                            return form;
+                                          }
                                         }
                                       }
                                     }
@@ -539,6 +550,54 @@ Value apply_fn(Value fn, Value args, Value env, Value mac) {
   return t4;
 }
 
+Value macro_expand_once(Value form, Value env, Value mac) {
+  int t1 = is_cons(form);
+  if ((t1 == 0)) {
+    return form;
+  } else {
+    Value t8 = val_car(form);
+    Value head = t8;
+    int t9 = is_sym(head);
+    if ((t9 == 0)) {
+      return form;
+    } else {
+      uint32_t t16 = val_sym_of(head);
+      Value t17 = env_lookup(mac, t16);
+      Value mfn = t17;
+      int t18 = is_nil(mfn);
+      if ((t18 != 0)) {
+        return form;
+      } else {
+        Value t25 = val_cdr(form);
+        Value t26 = apply_fn(mfn, t25, env, mac);
+        return t26;
+      }
+    }
+  }
+}
+
+Value macro_expand_all(Value form, Value env, Value mac) {
+  Value t1 = macro_expand_once(form, env, mac);
+  Value once = t1;
+  int t2 = val_eq(once, form);
+  if ((t2 == 0)) {
+    Value t9 = macro_expand_all(once, env, mac);
+    return t9;
+  } else {
+    int t10 = is_cons(form);
+    if ((t10 == 0)) {
+      return form;
+    } else {
+      Value t17 = val_car(form);
+      Value t18 = macro_expand_all(t17, env, mac);
+      Value t19 = val_cdr(form);
+      Value t20 = macro_expand_all(t19, env, mac);
+      Value t21 = val_cons(t18, t20);
+      return t21;
+    }
+  }
+}
+
 Value handle_form(Value form, Value env, Value mac) {
   int t1 = is_cons(form);
   if ((t1 == 0)) {
@@ -642,6 +701,7 @@ int main() {
       if ((t26 == 0)) {
         write_sexp(out, result);
         int t31 = fputc(10, out);
+        int t32 = fflush(out);
       } else {
       }
     } else {

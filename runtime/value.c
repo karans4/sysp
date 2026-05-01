@@ -134,8 +134,11 @@ static void symtab_grow(void) {
 }
 
 uint32_t intern_sym(const char* name) {
-    for (uint32_t i = 0; i < g_symtab.count; i++) {
-        if (strcmp(g_symtab.names[i], name) == 0) return i;
+    /* Case-insensitive lookup but preserve the FIRST seen form's case for
+     * printing — matches CL's reader behavior where 'inc' and 'INC' are
+     * the same symbol but the printed form depends on the readtable. */
+    for (uint32_t j = 0; j < g_symtab.count; j++) {
+        if (strcasecmp(g_symtab.names[j], name) == 0) return j;
     }
     if (g_symtab.count >= g_symtab.cap) symtab_grow();
     g_symtab.names[g_symtab.count] = strdup(name);
