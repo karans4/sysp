@@ -111,6 +111,71 @@
       (emit (make-ir-instr :dst d :type :cstr :op :cstr-lit :args (list s)))
       (values d :cstr))))
 
+(defun ptr-of (inner-type)
+  (intern (format nil "PTR-~A" (symbol-name inner-type)) :keyword))
+
+(defun ptr-inner (ty)
+  "Strip the :ptr- prefix or unwrap (:ptr T)."
+  (cond
+    ((and (consp ty) (eq (first ty) :ptr)) (second ty))
+    ((eq ty :ptr-void) :u8)   ; treat void* as opaque byte ptr for deref purposes
+    ((and (keywordp ty)
+          (let ((s (symbol-name ty)))
+            (and (> (length s) 4) (string-equal s "PTR-" :end1 4))))
+     (intern (subseq (symbol-name ty) 4) :keyword))
+    (t (error "not a pointer type: ~A" ty))))
+
+(defmethod lower-form ((head (eql 'addr-of)) args env)
+  (let* ((sym (first args))
+         (b (assoc sym env)))
+    (unless b (error "addr-of: unbound ~A" sym))
+    (let ((d (fresh-tmp))
+          (pty (ptr-of (cdr b))))
+      (emit (make-ir-instr :dst d :type pty :op :addr-of :args (list sym)))
+      (values d pty))))
+
+(defmethod lower-form ((head (eql 'cast)) args env)
+  (let* ((target-ty (first args))
+         (val-expr (second args)))
+    (multiple-value-bind (vn _vty) (lower val-expr env)
+      (declare (ignore _vty))
+      (let ((d (fresh-tmp)))
+        (emit (make-ir-instr :dst d :type target-ty :op :cast
+                             :args (list target-ty vn)))
+        (values d target-ty)))))
+
+(defmethod lower-form ((head (eql 'deref)) args env)
+  (multiple-value-bind (pn pty) (lower (first args) env)
+    (let ((inner (ptr-inner pty))
+          (d (fresh-tmp)))
+      (emit (make-ir-instr :dst d :type inner :op :deref :args (list pn)))
+      (values d inner))))
+
+(defmethod lower-form ((head (eql 'ptr-ref)) args env)
+  ;; (ptr-ref p i) → p[i]
+  (multiple-value-bind (pn pty) (lower (first args) env)
+    (multiple-value-bind (in _) (lower (second args) env) (declare (ignore _))
+      (let ((inner (ptr-inner pty))
+            (d (fresh-tmp)))
+        (emit (make-ir-instr :dst d :type inner :op :ptr-ref :args (list pn in)))
+        (values d inner)))))
+
+(defmethod lower-form ((head (eql 'ptr-set!)) args env)
+  ;; (ptr-set! p val) → *p = val;
+  (multiple-value-bind (pn _pty) (lower (first args) env) (declare (ignore _pty))
+    (multiple-value-bind (vn _vty) (lower (second args) env) (declare (ignore _vty))
+      (emit (make-ir-instr :dst nil :type :unit :op :ptr-set :args (list pn vn)))
+      (values nil :unit))))
+
+(defmethod lower-form ((head (eql 'ptr-set-at!)) args env)
+  ;; (ptr-set-at! p i val) → p[i] = val;
+  (multiple-value-bind (pn _pty) (lower (first args) env) (declare (ignore _pty))
+    (multiple-value-bind (in _ity) (lower (second args) env) (declare (ignore _ity))
+      (multiple-value-bind (vn _vty) (lower (third args) env) (declare (ignore _vty))
+        (emit (make-ir-instr :dst nil :type :unit :op :ptr-set-at
+                             :args (list pn in vn)))
+        (values nil :unit)))))
+
 (defmethod lower-form ((head (eql 'set!)) args env)
   ;; (set! target expr) — re-assign. Currently int-only.
   (let ((target (first args)))
@@ -118,6 +183,39 @@
       (emit (make-ir-instr :dst nil :type vty :op :set
                            :args (list target vn)))
       (values target vty))))
+
+(defmethod lower-form ((head (eql 'do)) args env)
+  ;; (do e1 e2 ... eN) — sequential, value is eN.
+  (let (last-n last-ty)
+    (dolist (e args)
+      (multiple-value-bind (n ty) (lower e env)
+        (setf last-n n last-ty ty)))
+    (values last-n last-ty)))
+
+(defmethod lower-form ((head (eql 'when)) args env)
+  ;; (when cond body...) — branch with no value; result is :unit.
+  (let* ((cond-expr (first args))
+         (body-forms (rest args))
+         (then-blk (fresh-blk "WTHEN"))
+         (else-blk (fresh-blk "WELSE"))
+         (cont-blk (fresh-blk "WCONT")))
+    (multiple-value-bind (cn _) (lower cond-expr env) (declare (ignore _))
+      (finish-block (list :br cn then-blk else-blk cont-blk nil nil)))
+    (start-block then-blk nil)
+    (dolist (e body-forms) (lower e env))
+    (finish-block (list :jump cont-blk nil))
+    (start-block else-blk nil)
+    (finish-block (list :jump cont-blk nil))
+    (start-block cont-blk nil)
+    (values nil :unit)))
+
+(defmethod lower-form ((head (eql 'return)) args env)
+  ;; Early return. Finishes current block with :ret; subsequent code in
+  ;; the same lexical position continues in a fresh (likely-dead) block.
+  (multiple-value-bind (vn _) (lower (first args) env) (declare (ignore _))
+    (finish-block (list :ret vn))
+    (start-block (fresh-blk "AFTER-RET") nil)
+    (values vn :unit)))
 
 (defmethod lower-form ((head (eql 'while)) args env)
   ;; (while cond body...) — body is a sequence; while returns unit.
@@ -218,6 +316,8 @@
           (multiple-value-bind (n ty) (lower s env)
             (declare (ignore ty))
             (setf last-n n)))
-        (finish-block (list :ret last-n)))
+        (if (eq ret-type :unit)
+            (finish-block (list :ret-unit))
+            (finish-block (list :ret last-n))))
       (make-ir-fn :name name :params params :ret-type ret-type
                   :blocks (nreverse *blocks*)))))

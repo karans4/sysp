@@ -198,4 +198,20 @@
                           (nameref (second args)))))
       (:unary   (let ((args (ir-instr-args i)))
                   (format out "~a ~a = ~a~a;~%"
-                          ty dst (first args) (nameref (second args))))))))
+                          ty dst (first args) (nameref (second args)))))
+      (:addr-of (format out "~a ~a = &~a;~%"
+                        ty dst (c-name (first (ir-instr-args i)))))
+      (:cast    (let ((args (ir-instr-args i)))
+                  (format out "~a ~a = (~a)~a;~%"
+                          ty dst (c-type (first args)) (nameref (second args)))))
+      (:deref   (format out "~a ~a = *~a;~%" ty dst (nameref (first (ir-instr-args i)))))
+      (:ptr-ref (let ((args (ir-instr-args i)))
+                  (format out "~a ~a = ~a[~a];~%"
+                          ty dst (nameref (first args)) (nameref (second args)))))
+      (:ptr-set (let ((args (ir-instr-args i)))
+                  (format out "*~a = ~a;~%"
+                          (nameref (first args)) (nameref (second args)))))
+      (:ptr-set-at (let ((args (ir-instr-args i)))
+                     (format out "~a[~a] = ~a;~%"
+                             (nameref (first args)) (nameref (second args))
+                             (nameref (third args))))))))

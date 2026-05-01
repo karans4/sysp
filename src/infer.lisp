@@ -132,6 +132,48 @@
   (unless (stringp (first args)) (error "cstr expects a string literal"))
   :cstr)
 
+(defmethod infer-form ((head (eql 'addr-of)) args env)
+  (let* ((sym (first args))
+         (b (assoc sym env)))
+    (unless b (error "addr-of: unbound ~A" sym))
+    (let ((inner (resolve-type (cdr b))))
+      (intern (format nil "PTR-~A" (symbol-name inner)) :keyword))))
+
+(defmethod infer-form ((head (eql 'cast)) args env)
+  (infer (second args) env)   ; type-check the expr but discard its type
+  (first args))               ; result type is the cast target
+
+(defmethod infer-form ((head (eql 'deref)) args env)
+  (let ((pty (resolve-type (infer (first args) env))))
+    (cond
+      ((and (keywordp pty)
+            (let ((s (symbol-name pty)))
+              (and (> (length s) 4) (string-equal s "PTR-" :end1 4))))
+       (intern (subseq (symbol-name pty) 4) :keyword))
+      ((eq pty :ptr-void) :u8)
+      (t (error "deref: expected pointer, got ~A" pty)))))
+
+(defmethod infer-form ((head (eql 'ptr-ref)) args env)
+  (let ((pty (resolve-type (infer (first args) env))))
+    (ensure-int-typed (second args) env)
+    (cond
+      ((and (keywordp pty)
+            (let ((s (symbol-name pty)))
+              (and (> (length s) 4) (string-equal s "PTR-" :end1 4))))
+       (intern (subseq (symbol-name pty) 4) :keyword))
+      (t :int))))
+
+(defmethod infer-form ((head (eql 'ptr-set!)) args env)
+  (infer (first args) env)
+  (infer (second args) env)
+  :unit)
+
+(defmethod infer-form ((head (eql 'ptr-set-at!)) args env)
+  (infer (first args) env)
+  (ensure-int-typed (second args) env)
+  (infer (third args) env)
+  :unit)
+
 (defmethod infer-form ((head (eql 'let)) args env)
   (let* ((bindings (first args))
          (body (rest args))
@@ -156,6 +198,23 @@
     (unless tgt-ty (error "infer: set! on unbound ~A" target))
     (unify tgt-ty (infer (second args) env))
     :unit))
+
+(defmethod infer-form ((head (eql 'do)) args env)
+  (let (last-ty)
+    (dolist (e args) (setf last-ty (infer e env)))
+    last-ty))
+
+(defmethod infer-form ((head (eql 'when)) args env)
+  (unify (infer (first args) env) :bool)
+  (dolist (b (rest args)) (infer b env))
+  :unit)
+
+(defmethod infer-form ((head (eql 'return)) args env)
+  ;; Treat return as :unit-typed; the inferred type of the body up to the
+  ;; return is what the fn signature must match. We don't have full sig
+  ;; visibility here, so just type-check the value and report :unit.
+  (infer (first args) env)
+  :unit)
 
 (defmethod infer-form ((head (eql 'while)) args env)
   (unify (infer (first args) env) :bool)

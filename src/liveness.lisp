@@ -6,14 +6,22 @@
 (defun instr-uses (i)
   "Variables this instruction reads."
   (case (ir-instr-op i)
-    (:const   nil)
-    (:str-lit nil)
-    (:copy    (list (first (ir-instr-args i))))
-    (:prim    (rest (ir-instr-args i)))
-    (:call    (rest (ir-instr-args i)))
-    (:release (ir-instr-args i))
-    (:retain  (ir-instr-args i))
-    (:set     (list (second (ir-instr-args i))))))   ; src only; target is a write
+    (:const     nil)
+    (:str-lit   nil)
+    (:cstr-lit  nil)
+    (:copy      (list (first (ir-instr-args i))))
+    (:prim      (rest (ir-instr-args i)))
+    (:call      (rest (ir-instr-args i)))
+    (:release   (ir-instr-args i))
+    (:retain    (ir-instr-args i))
+    (:set       (list (second (ir-instr-args i))))   ; src only; target is a write
+    (:unary     (list (second (ir-instr-args i))))   ; (op-string val) → reads val
+    (:addr-of   (ir-instr-args i))                    ; reads the named binding
+    (:cast      (list (second (ir-instr-args i))))   ; (target-type val) → reads val
+    (:deref     (ir-instr-args i))
+    (:ptr-ref   (ir-instr-args i))
+    (:ptr-set   (ir-instr-args i))
+    (:ptr-set-at (ir-instr-args i))))
 
 (defun term-uses (term)
   "Variables the terminator reads (including transferred-out)."
