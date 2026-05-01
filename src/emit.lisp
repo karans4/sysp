@@ -5,7 +5,32 @@
 ;;; --- name / type formatting ---
 
 (defun c-type (ty)
-  (case ty (:int "int") (:bool "int") (:unit "void") (:string "String") (t "int")))
+  (cond
+    ((eq ty :int)    "int")
+    ((eq ty :bool)   "int")
+    ((eq ty :unit)   "void")
+    ((eq ty :string) "String")
+    ((eq ty :cstr)   "const char*")
+    ((eq ty :u8)     "uint8_t")
+    ((eq ty :u16)    "uint16_t")
+    ((eq ty :u32)    "uint32_t")
+    ((eq ty :u64)    "uint64_t")
+    ((eq ty :i8)     "int8_t")
+    ((eq ty :i16)    "int16_t")
+    ((eq ty :i32)    "int32_t")
+    ((eq ty :i64)    "int64_t")
+    ((eq ty :size)   "size_t")
+    ((eq ty :ptr-void) "void*")
+    ;; :ptr-T → "T*"
+    ((and (keywordp ty)
+          (let ((s (symbol-name ty)))
+            (and (> (length s) 4) (string= s "PTR-" :end1 4))))
+     (let ((inner (intern (subseq (symbol-name ty) 4) :keyword)))
+       (concatenate 'string (c-type inner) "*")))
+    ;; (:ptr T)
+    ((and (consp ty) (eq (first ty) :ptr))
+     (concatenate 'string (c-type (second ty)) "*"))
+    (t "int")))   ; fallback
 
 (defun c-escape-string (s)
   (with-output-to-string (out)
@@ -143,4 +168,7 @@
       (:set     (let ((args (ir-instr-args i)))
                   (format out "~a = ~a;~%"
                           (c-name (first args))
-                          (nameref (second args))))))))
+                          (nameref (second args)))))
+      (:unary   (let ((args (ir-instr-args i)))
+                  (format out "~a ~a = ~a~a;~%"
+                          ty dst (first args) (nameref (second args))))))))

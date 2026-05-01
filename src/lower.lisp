@@ -67,9 +67,33 @@
 (defmethod lower-form ((head (eql '-)) args env) (lower-binop '- :int args env))
 (defmethod lower-form ((head (eql '*)) args env) (lower-binop '* :int args env))
 (defmethod lower-form ((head (eql '/)) args env) (lower-binop '/ :int args env))
-(defmethod lower-form ((head (eql '<)) args env) (lower-binop '< :bool args env))
-(defmethod lower-form ((head (eql '>)) args env) (lower-binop '> :bool args env))
-(defmethod lower-form ((head (eql '=)) args env) (lower-binop '== :bool args env))
+(defmethod lower-form ((head (eql '%)) args env) (lower-binop '% :int args env))
+
+;; Bitwise — emit C operators directly. Same shape as arithmetic.
+;; Both symbol and named forms supported (band == &, etc.).
+(defmethod lower-form ((head (eql '&))    args env) (lower-binop "&"  :int args env))
+(defmethod lower-form ((head (eql '\|))   args env) (lower-binop "|"  :int args env))
+(defmethod lower-form ((head (eql '^))    args env) (lower-binop "^"  :int args env))
+(defmethod lower-form ((head (eql '<<))   args env) (lower-binop "<<" :int args env))
+(defmethod lower-form ((head (eql '>>))   args env) (lower-binop ">>" :int args env))
+(defmethod lower-form ((head (eql 'band)) args env) (lower-binop "&"  :int args env))
+(defmethod lower-form ((head (eql 'bor))  args env) (lower-binop "|"  :int args env))
+(defmethod lower-form ((head (eql 'bxor)) args env) (lower-binop "^"  :int args env))
+(defmethod lower-form ((head (eql 'bshl)) args env) (lower-binop "<<" :int args env))
+(defmethod lower-form ((head (eql 'bshr)) args env) (lower-binop ">>" :int args env))
+(defmethod lower-form ((head (eql 'bnot)) args env)
+  (multiple-value-bind (a _) (lower (first args) env) (declare (ignore _))
+    (let ((d (fresh-tmp)))
+      (emit (make-ir-instr :dst d :type :int :op :unary
+                           :args (list "~" a)))
+      (values d :int))))
+
+(defmethod lower-form ((head (eql '<))  args env) (lower-binop '< :bool args env))
+(defmethod lower-form ((head (eql '>))  args env) (lower-binop '> :bool args env))
+(defmethod lower-form ((head (eql '<=)) args env) (lower-binop "<=" :bool args env))
+(defmethod lower-form ((head (eql '>=)) args env) (lower-binop ">=" :bool args env))
+(defmethod lower-form ((head (eql '=))  args env) (lower-binop '== :bool args env))
+(defmethod lower-form ((head (eql '!=)) args env) (lower-binop "!=" :bool args env))
 
 (defmethod lower-form ((head (eql 'string-concat)) args env)
   (lower-rt-call 'sysp_str_concat :string args env))

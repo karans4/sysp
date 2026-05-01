@@ -35,6 +35,8 @@
       ((equal r1 r2) t)
       ((tvar-p r1) (setf (gethash (second r1) *subst*) r2))
       ((tvar-p r2) (setf (gethash (second r2) *subst*) r1))
+      ;; int-to-int: silently accept; C narrowing/promotion handles it.
+      ((and (int-type-p r1) (int-type-p r2)) t)
       ((and (consp r1) (consp r2)
             (eq (first r1) :fn) (eq (first r2) :fn))
        (unless (= (length (second r1)) (length (second r2)))
@@ -60,21 +62,60 @@
 
 (defgeneric infer-form (head args env))
 
-(defmethod infer-form ((head (eql '+)) args env) (infer-binop :int :int args env))
-(defmethod infer-form ((head (eql '-)) args env) (infer-binop :int :int args env))
-(defmethod infer-form ((head (eql '*)) args env) (infer-binop :int :int args env))
-(defmethod infer-form ((head (eql '/)) args env) (infer-binop :int :int args env))
-(defmethod infer-form ((head (eql '<)) args env) (infer-binop :int :bool args env))
-(defmethod infer-form ((head (eql '>)) args env) (infer-binop :int :bool args env))
+(defparameter *int-types* '(:int :u8 :u16 :u32 :u64 :i8 :i16 :i32 :i64 :size))
+(defun int-type-p (ty) (member (if (consp ty) ty ty) *int-types*))
 
-(defmethod infer-form ((head (eql '=)) args env)
-  ;; = polymorphic-ish: same type both sides, returns :bool.
+(defmethod infer-form ((head (eql '+)) args env) (infer-int-arith args env))
+(defmethod infer-form ((head (eql '-)) args env) (infer-int-arith args env))
+(defmethod infer-form ((head (eql '*)) args env) (infer-int-arith args env))
+(defmethod infer-form ((head (eql '/)) args env) (infer-int-arith args env))
+(defmethod infer-form ((head (eql '%)) args env) (infer-int-arith args env))
+
+(defmethod infer-form ((head (eql '&))    args env) (infer-int-arith args env))
+(defmethod infer-form ((head (eql '\|))   args env) (infer-int-arith args env))
+(defmethod infer-form ((head (eql '^))    args env) (infer-int-arith args env))
+(defmethod infer-form ((head (eql '<<))   args env) (infer-int-arith args env))
+(defmethod infer-form ((head (eql '>>))   args env) (infer-int-arith args env))
+(defmethod infer-form ((head (eql 'band)) args env) (infer-int-arith args env))
+(defmethod infer-form ((head (eql 'bor))  args env) (infer-int-arith args env))
+(defmethod infer-form ((head (eql 'bxor)) args env) (infer-int-arith args env))
+(defmethod infer-form ((head (eql 'bshl)) args env) (infer-int-arith args env))
+(defmethod infer-form ((head (eql 'bshr)) args env) (infer-int-arith args env))
+(defmethod infer-form ((head (eql 'bnot)) args env)
+  (let ((ty (resolve-type (infer (first args) env))))
+    (cond ((int-type-p ty) ty)
+          ((tvar-p ty) (unify ty :int) :int)
+          (t (error "bnot expects int, got ~A" ty)))))
+
+(defmethod infer-form ((head (eql '<))  args env) (infer-int-cmp args env))
+(defmethod infer-form ((head (eql '>))  args env) (infer-int-cmp args env))
+(defmethod infer-form ((head (eql '<=)) args env) (infer-int-cmp args env))
+(defmethod infer-form ((head (eql '>=)) args env) (infer-int-cmp args env))
+
+(defmethod infer-form ((head (eql '=))  args env)
+  (unify (infer (first args) env) (infer (second args) env))
+  :bool)
+(defmethod infer-form ((head (eql '!=)) args env)
   (unify (infer (first args) env) (infer (second args) env))
   :bool)
 
-(defun infer-binop (arg-ty ret-ty args env)
-  (dolist (a args) (unify arg-ty (infer a env)))
-  ret-ty)
+(defun ensure-int-typed (a env)
+  (let ((ty (resolve-type (infer a env))))
+    (cond
+      ((int-type-p ty) ty)
+      ((tvar-p ty) (unify ty :int) :int)
+      (t (error "expected int type, got ~A" ty)))))
+
+(defun infer-int-arith (args env)
+  "Each arg must be an int type; result widens to :int (C semantics handle
+   narrowing on assign). For homogeneous u8 args we still report :int — the
+   user can cast back if needed; matches old sysp idiom."
+  (dolist (a args) (ensure-int-typed a env))
+  :int)
+
+(defun infer-int-cmp (args env)
+  (dolist (a args) (ensure-int-typed a env))
+  :bool)
 
 (defmethod infer-form ((head (eql 'string-concat)) args env)
   (dolist (a args) (unify :string (infer a env)))
@@ -134,9 +175,16 @@
 
 (defun type-annotation-p (x)
   "Heuristic: distinguish a type form from a body form. Types are keywords
-   like :int, :string, or a (:fn ...) form."
-  (or (and (keywordp x) (member x '(:int :bool :unit :string)))
-      (and (consp x) (eq (first x) :fn))))
+   like :int, :string, :u8, :ptr-void, or a compound (:fn ...) / (:ptr T) form."
+  (cond
+    ((keywordp x)
+     (or (member x '(:int :bool :unit :string :cstr :size
+                     :u8 :u16 :u32 :u64 :i8 :i16 :i32 :i64
+                     :ptr-void))
+         ;; :ptr-T family
+         (let ((s (symbol-name x)))
+           (and (> (length s) 4) (string= s "PTR-" :end1 4)))))
+    ((consp x) (member (first x) '(:fn :ptr)))))
 
 (defun split-defn-shape (rest-of-form)
   "Given the part after 'name' in (defn name PARAMS [ret] BODY...), return
