@@ -49,6 +49,16 @@ typedef struct Cons {
     int   rc;
 } Cons;
 
+/* Closure: an interpreted-lambda value. Holds the lambda's params,
+ * body, and captured env — all as Values. The interpreter creates
+ * Closures when it sees (lambda ...) during eval. */
+typedef struct Closure {
+    Value params;    /* a list of param symbols */
+    Value body;      /* a list of body forms */
+    Value env;       /* assoc list of (sym-id . value) */
+    int   rc;
+} Closure;
+
 /* Fn: universal callable. Compiled lambdas and interpreted closures
  * both wrap into this struct; the call site dispatches via invoke. */
 typedef struct Fn {
@@ -119,5 +129,23 @@ void  write_sexp(FILE* f, Value v);
 
 /* Convenience: print to stdout with trailing newline. */
 void val_println(Value v);
+
+/* Stdin/stdout as FILE* for use from sysp via extern calls.
+ * (sysp can't reference C macros like stdin directly.) */
+FILE* runtime_stdin(void);
+FILE* runtime_stdout(void);
+FILE* runtime_stderr(void);
+
+/* ---------- Closure / Fn helpers ----------
+ * Used by the interpreter to model (lambda ...) forms encountered during
+ * eval. These don't require compile-time lambda support in sysp — the
+ * interpreter constructs Closures via these helpers, returning a Value
+ * with VAL_FN tag.
+ */
+
+Value val_closure(Value params, Value body, Value env);
+Value closure_params(Value v);
+Value closure_body(Value v);
+Value closure_env(Value v);
 
 #endif

@@ -50,13 +50,19 @@
 
 (defun c-name (s)
   ;; Preserve case if the symbol name is mixed-case (CamelCase from parser
-  ;; preservation). Otherwise downcase like CL convention. Hyphens always
-  ;; become underscores.
+  ;; preservation). Otherwise downcase like CL convention.
+  ;; Mangle Lisp-y chars to valid C: - → _, ? → _p, ! → _bang.
   (let* ((name (symbol-name s))
          (mixed (and (some #'upper-case-p name)
                      (some #'lower-case-p name)))
          (str (if mixed name (string-downcase name))))
-    (substitute #\_ #\- str)))
+    (with-output-to-string (out)
+      (loop for ch across str do
+        (case ch
+          (#\- (write-char #\_ out))
+          (#\? (write-string "_p" out))
+          (#\! (write-string "_bang" out))
+          (t   (write-char ch out)))))))
 
 ;;; --- emitter state ---
 

@@ -90,9 +90,20 @@ void val_release(Value v) {
             break;
         case VAL_FN:
             if (--v.as.fn->rc == 0) {
-                /* state is opaque; user sets a release callback if needed.
-                 * For interp closures, state points to a Closure managed by interp. */
-                free(v.as.fn);
+                /* If state is a Closure (interp's lambda value), recurse
+                 * into its fields. Compiled-lambda Fns set invoke != NULL
+                 * and state to an env pointer (caller responsible). */
+                Fn* fn = v.as.fn;
+                if (fn->invoke == NULL && fn->state) {
+                    Closure* c = (Closure*)fn->state;
+                    if (--c->rc == 0) {
+                        val_release(c->params);
+                        val_release(c->body);
+                        val_release(c->env);
+                        free(c);
+                    }
+                }
+                free(fn);
             }
             break;
         default: break;
@@ -301,6 +312,52 @@ static void write_string_lit(FILE* f, const char* s) {
 }
 
 void val_println(Value v) { write_sexp(stdout, v); fputc('\n', stdout); }
+
+FILE* runtime_stdin(void)  { return stdin; }
+FILE* runtime_stdout(void) { return stdout; }
+FILE* runtime_stderr(void) { return stderr; }
+
+/* ---------- Closure helpers ----------
+ * A Value with VAL_FN tag whose state is a Closure*. The Fn's invoke
+ * pointer is set by the interpreter at startup (interp_call trampoline).
+ * For now, helpers don't set invoke — the interpreter does so before
+ * the closure is ever called. */
+
+Value val_closure(Value params, Value body, Value env) {
+    Closure* c = malloc(sizeof(Closure));
+    c->params = params; val_retain(params);
+    c->body   = body;   val_retain(body);
+    c->env    = env;    val_retain(env);
+    c->rc = 1;
+
+    Fn* fn = malloc(sizeof(Fn));
+    fn->invoke = NULL;     /* interpreter sets this */
+    fn->state  = c;
+    fn->rc = 1;
+
+    Value v = {0};
+    v.tag = VAL_FN;
+    v.as.fn = fn;
+    return v;
+}
+
+Value closure_params(Value v) {
+    Closure* c = (Closure*)v.as.fn->state;
+    val_retain(c->params);
+    return c->params;
+}
+
+Value closure_body(Value v) {
+    Closure* c = (Closure*)v.as.fn->state;
+    val_retain(c->body);
+    return c->body;
+}
+
+Value closure_env(Value v) {
+    Closure* c = (Closure*)v.as.fn->state;
+    val_retain(c->env);
+    return c->env;
+}
 
 void write_sexp(FILE* f, Value v) {
     switch (v.tag) {

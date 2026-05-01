@@ -365,15 +365,22 @@
   (let ((arms args))
     (lower (cond-expand arms) env)))
 
+(defun cond-arm-body (arm)
+  "An arm is (test body...). Wrap body in `do` if more than one form."
+  (let ((body (rest arm)))
+    (if (null (rest body))
+        (first body)
+        (cons 'do body))))
+
 (defun cond-expand (arms)
   (cond
     ((null arms) 0)
     ((let ((c (first (first arms))))
        (or (eq c (intern "ELSE" :sysp-ir))
            (eq c 'else)))
-     (second (first arms)))
+     (cond-arm-body (first arms)))
     (t `(if ,(first (first arms))
-            ,(second (first arms))
+            ,(cond-arm-body (first arms))
             ,(cond-expand (rest arms))))))
 
 (defmethod lower-form ((head (eql 'and)) args env)

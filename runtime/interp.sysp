@@ -1,0 +1,167 @@
+; interp.sysp — the tree-walking interpreter for sysp's macro-expansion
+; subset and runtime eval.
+;
+; Read-eval-print loop over s-expressions. Each form is either:
+;   - (defmacro name [params] body)   — register a macro, no output
+;   - (defn name [params] body)       — register an interp-only fn, no output
+;   - (anything else)                 — evaluate, print result
+;
+; The compile-time macro pipeline spawns this binary, sends it macro
+; defs, then sends macro-call forms one by one and reads back the
+; expanded forms from stdout.
+
+(include "<stdio.h>")
+(include "<string.h>")
+(include "value.h")
+
+; ---- Value runtime FFI ----
+(extern-struct Value ((tag :u8) (rest :ptr-void)))
+
+(extern is_nil   ((v :Value)) :int)
+(extern is_int   ((v :Value)) :int)
+(extern is_sym   ((v :Value)) :int)
+(extern is_cons  ((v :Value)) :int)
+(extern is_str   ((v :Value)) :int)
+
+(extern val_int_of  ((v :Value)) :int)
+(extern val_sym_of  ((v :Value)) :u32)
+(extern val_car     ((v :Value)) :Value)
+(extern val_cdr     ((v :Value)) :Value)
+
+(extern val_int    ((i :int))                 :Value)
+(extern val_sym    ((s :u32))                 :Value)
+(extern val_cons   ((a :Value) (d :Value))    :Value)
+(extern val_nil    ()                         :Value)
+
+(extern val_eq     ((a :Value) (b :Value))    :int)
+(extern sym_eq     ((a :Value) (b :Value))    :int)
+
+(extern val_retain  ((v :Value)) :unit)
+(extern val_release ((v :Value)) :unit)
+
+(extern intern_sym ((name :cstr)) :u32)
+(extern sym_name   ((id :u32))    :cstr)
+
+(extern read_sexp     ((f :ptr-void))             :Value)
+(extern write_sexp    ((f :ptr-void) (v :Value))  :unit)
+(extern val_println   ((v :Value))                :unit)
+(extern runtime_stdin  () :ptr-void)
+(extern runtime_stdout () :ptr-void)
+(extern runtime_stderr () :ptr-void)
+
+(extern fputc  ((c :int) (f :ptr-void)) :int)
+(extern feof   ((f :ptr-void)) :int)
+
+; ---- env: assoc list of (sym-id . value) cons cells ----
+
+; (env-lookup env id) — find value for sym-id, or val-nil if not found.
+(defn env-lookup ((env :Value) (id :u32)) :Value
+  (if (!= (is_nil env) 0)
+      (val_nil)
+      (let ((pair (val_car env)))
+        (if (= (val_sym_of (val_car pair)) id)
+            (val_cdr pair)
+            (env-lookup (val_cdr env) id)))))
+
+; (env-bind env id val) — extend env with a new binding.
+(defn env-bind ((env :Value) (id :u32) (v :Value)) :Value
+  (val_cons (val_cons (val_sym id) v) env))
+
+; ---- eval ----
+; Evaluate a form in env. Returns a Value (caller owns).
+
+(defn eval-form ((form :Value) (env :Value)) :Value
+  (cond
+    ((!= (is_int form)  0) form)
+    ((!= (is_str form)  0) form)
+    ((!= (is_nil form)  0) form)
+    ((!= (is_sym form)  0)
+     (let ((found (env-lookup env (val_sym_of form))))
+       ;; If unbound, return the symbol as data (lets interp work as a
+       ;; "symbol-evaluator" for static defs; lookup resolves bindings).
+       (if (!= (is_nil found) 0)
+           form
+           found)))
+    ((!= (is_cons form) 0) (eval-call form env))
+    (else form)))
+
+; (eval-args args env) — eval each element of a list, return new list.
+(defn eval-args ((args :Value) (env :Value)) :Value
+  (if (!= (is_nil args) 0)
+      (val_nil)
+      (val_cons (eval-form (val_car args) env)
+                (eval-args (val_cdr args) env))))
+
+; ---- special forms + primitives ----
+; The eval-call dispatches on the head symbol's name.
+
+(defn eval-call ((form :Value) (env :Value)) :Value
+  (let ((head (val_car form))
+        (args (val_cdr form)))
+    (if (!= (is_sym head) 0)
+        (dispatch (val_sym_of head) args env form)
+        (val_nil))))
+
+; Primitive symbols are interned at startup so we compare by id.
+; For now, do a string comparison via sym_name + a runtime compare to
+; avoid having to thread a lazy-init through. Slow but simple.
+(extern strcmp ((a :cstr) (b :cstr)) :int)
+
+(defn name-is? ((id :u32) (s :cstr)) :int
+  (= (strcmp (sym_name id) s) 0))
+
+(defn dispatch ((id :u32) (args :Value) (env :Value) (form :Value)) :Value
+  (cond
+    ((!= (name-is? id (cstr "quote")) 0)
+       (val_car args))
+    ((!= (name-is? id (cstr "if")) 0)
+       (eval-if args env))
+    ((!= (name-is? id (cstr "+")) 0)
+       (val_int (+ (val_int_of (eval-form (val_car args) env))
+                   (val_int_of (eval-form (val_car (val_cdr args)) env)))))
+    ((!= (name-is? id (cstr "-")) 0)
+       (val_int (- (val_int_of (eval-form (val_car args) env))
+                   (val_int_of (eval-form (val_car (val_cdr args)) env)))))
+    ((!= (name-is? id (cstr "*")) 0)
+       (val_int (* (val_int_of (eval-form (val_car args) env))
+                   (val_int_of (eval-form (val_car (val_cdr args)) env)))))
+    ((!= (name-is? id (cstr "=")) 0)
+       (let ((a (eval-form (val_car args) env))
+             (b (eval-form (val_car (val_cdr args)) env)))
+         (val_int (val_eq a b))))
+    ((!= (name-is? id (cstr "cons")) 0)
+       (val_cons (eval-form (val_car args) env)
+                 (eval-form (val_car (val_cdr args)) env)))
+    ((!= (name-is? id (cstr "car")) 0)
+       (val_car (eval-form (val_car args) env)))
+    ((!= (name-is? id (cstr "cdr")) 0)
+       (val_cdr (eval-form (val_car args) env)))
+    ((!= (name-is? id (cstr "nil?")) 0)
+       (val_int (is_nil (eval-form (val_car args) env))))
+    ((!= (name-is? id (cstr "println")) 0)
+       (val_println (eval-form (val_car args) env))
+       (val_nil))
+    (else
+      ;; Unknown call: leave it as data. This makes interp behave like a
+      ;; partial-evaluator for unbound names, useful for macro output.
+      form)))
+
+(defn eval-if ((args :Value) (env :Value)) :Value
+  (let ((c (eval-form (val_car args) env)))
+    (if (= (is_nil c) 1)
+        (eval-form (val_car (val_cdr (val_cdr args))) env)
+        (eval-form (val_car (val_cdr args)) env))))
+
+; ---- main loop ----
+
+(defn main () :int
+  (let ((in  (runtime_stdin))
+        (out (runtime_stdout))
+        (env (val_nil)))
+    (while (= (feof in) 0)
+      (let ((form (read_sexp in)))
+        (when (= (is_nil form) 0)
+          (let ((result (eval-form form env)))
+            (write_sexp out result)
+            (fputc 10 out))))))
+  0)
