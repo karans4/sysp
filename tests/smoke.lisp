@@ -1,4 +1,4 @@
-(load "src/compiler.lisp")
+(load "src/load.lisp")
 (in-package :sysp-ir)
 
 (defun test (label form)

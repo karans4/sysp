@@ -1,4 +1,4 @@
-(load "src/compiler.lisp")
+(load "src/load.lisp")
 (in-package :sysp-ir)
 
 (defvar *ok* 0) (defvar *fail* 0)
