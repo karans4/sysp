@@ -174,9 +174,12 @@
             (declare (ignore ty))
             (setf last-n n)))
         (finish-block (list :ret last-n)))
-      (insert-releases
-       (make-ir-fn :name name :params params :ret-type ret-type
-                   :blocks (nreverse *blocks*))))))
+      (let ((fn (insert-releases
+                 (make-ir-fn :name name :params params :ret-type ret-type
+                             :blocks (nreverse *blocks*)))))
+        (rewrite-jump-to-ret fn)
+        (prune-unreachable fn)
+        fn))))
 
 ;;; ---------- ownership / release-insertion pass ----------
 ;;; Cross-block CFG liveness over ref-typed bindings.
@@ -418,12 +421,117 @@
 
 (defvar *block-by-name*)
 (defvar *indent*)
+(defvar *inlinable*)   ; sym → C-expression-string (for fold-into-uses)
+
+;;; ---------- peephole: collapse ret-only joins ----------
+;;; If block J has 1 block-param p, no instrs, terminator (:ret p), then for
+;;; each predecessor B with terminator (:jump J (a)), rewrite B's terminator
+;;; to (:ret a). Iterate to fixpoint, then prune unreachable blocks.
+;;; Net effect: each branch of an `if` returns directly instead of writing a
+;;; phi-sink and then returning the sink.
+
+(defun ret-only-join-p (b)
+  (let ((params (ir-block-params b))
+        (term (ir-block-term b)))
+    (and (= (length params) 1)
+         (null (ir-block-instrs b))
+         (eq (first term) :ret)
+         (eq (second term) (first (first params))))))
+
+(defun rewrite-jump-to-ret (fn)
+  (let ((by-name (make-hash-table))
+        (changed t))
+    (loop while changed do
+      (setf changed nil)
+      (clrhash by-name)
+      (dolist (b (ir-fn-blocks fn))
+        (setf (gethash (ir-block-name b) by-name) b))
+      (dolist (b (ir-fn-blocks fn))
+        (let ((term (ir-block-term b)))
+          (when (eq (first term) :jump)
+            (let* ((tgt-name (second term))
+                   (args (third term))
+                   (tgt (gethash tgt-name by-name)))
+              (when (and tgt (ret-only-join-p tgt))
+                (setf (ir-block-term b) (list :ret (first args)))
+                (setf changed t)))))))))
+
+(defun reachable-block-names (fn)
+  (let ((seen (make-hash-table))
+        (by-name (make-hash-table))
+        (q (list 'entry)))
+    (dolist (b (ir-fn-blocks fn))
+      (setf (gethash (ir-block-name b) by-name) b))
+    (loop while q do
+      (let ((n (pop q)))
+        (unless (gethash n seen)
+          (setf (gethash n seen) t)
+          (let ((b (gethash n by-name)))
+            (when b
+              (dolist (s (term-successors (ir-block-term b)))
+                (push s q)))))))
+    seen))
+
+(defun prune-unreachable (fn)
+  (let ((reachable (reachable-block-names fn)))
+    (setf (ir-fn-blocks fn)
+          (remove-if-not (lambda (b) (gethash (ir-block-name b) reachable))
+                         (ir-fn-blocks fn))))
+  fn)
+
+;;; ---------- inline-on-emit (cosmetic peephole) ----------
+;;; For tmps with exactly one use, fold their definition into the use site.
+;;; Safe for :const, :prim, :copy. Not for :call or :str-lit (allocations
+;;; or side-effects). Block-params and fn-params are never inlined.
+
+(defun count-uses (fn)
+  "Use counts. Excludes :release/:retain (they consume the binding by name
+   for ARC purposes, not as a value)."
+  (let ((uc (make-hash-table)))
+    (dolist (b (ir-fn-blocks fn))
+      (dolist (i (ir-block-instrs b))
+        (unless (member (ir-instr-op i) '(:release :retain))
+          (dolist (u (instr-uses i)) (incf (gethash u uc 0)))))
+      (dolist (u (term-uses (ir-block-term b))) (incf (gethash u uc 0))))
+    uc))
+
+(defun nameref (sym)
+  "Render sym as C, substituting from *inlinable* if available."
+  (or (gethash sym *inlinable*) (c-name sym)))
+
+(defun build-inlinable (fn)
+  (let ((uc (count-uses fn))
+        (m (make-hash-table))
+        (block-param-syms (make-hash-table)))
+    (dolist (b (ir-fn-blocks fn))
+      (dolist (p (ir-block-params b))
+        (setf (gethash (first p) block-param-syms) t)))
+    (let ((*inlinable* m))
+      (dolist (b (ir-fn-blocks fn))
+        (dolist (i (ir-block-instrs b))
+          (let ((dst (ir-instr-dst i)))
+            (when (and dst
+                       (not (gethash dst block-param-syms))
+                       (= (gethash dst uc 0) 1))
+              (case (ir-instr-op i)
+                (:const (setf (gethash dst m)
+                              (format nil "~a" (first (ir-instr-args i)))))
+                (:copy  (setf (gethash dst m)
+                              (nameref (first (ir-instr-args i)))))
+                (:prim  (let ((a (ir-instr-args i)))
+                          (setf (gethash dst m)
+                                (format nil "(~a ~a ~a)"
+                                        (nameref (second a))
+                                        (first a)
+                                        (nameref (third a))))))))))))
+    m))
 
 (defun ind (out) (loop repeat *indent* do (write-string "  " out)))
 
 (defun emit-c-fn (fn &optional (out t))
   (let ((*block-by-name* (make-hash-table))
-        (*indent* 1))
+        (*indent* 1)
+        (*inlinable* (build-inlinable fn)))
     (dolist (b (ir-fn-blocks fn))
       (setf (gethash (ir-block-name b) *block-by-name*) b))
     (format out "~a ~a(" (c-type (ir-fn-ret-type fn)) (c-name (ir-fn-name fn)))
@@ -446,13 +554,15 @@
    :jump assigns block-params and recurses into the dest (unless dest == until)."
   (when (and blk (not (eq (ir-block-name blk) until)))
     (dolist (i (ir-block-instrs blk))
-      (emit-c-instr-indented i out))
+      ;; Skip instrs that have been folded into their use sites.
+      (unless (and (ir-instr-dst i) (gethash (ir-instr-dst i) *inlinable*))
+        (emit-c-instr-indented i out)))
     (emit-c-term-structured (ir-block-term blk) until out)))
 
 (defun emit-c-term-structured (term until out)
   (case (first term)
     (:ret      (ind out)
-               (format out "return ~a;~%" (c-name (second term))))
+               (format out "return ~a;~%" (nameref (second term))))
     (:ret-unit (ind out) (format out "return;~%"))
     (:jump     (let* ((dest-name (second term))
                       (args (third term))
@@ -460,7 +570,7 @@
                  (loop for p in (ir-block-params dest)
                        for a in args do
                        (ind out)
-                       (format out "~a = ~a;~%" (c-name (first p)) (c-name a)))
+                       (format out "~a = ~a;~%" (c-name (first p)) (nameref a)))
                  (unless (eq dest-name until)
                    (emit-structured dest until out))))
     (:br       (let ((c (second term))
@@ -470,7 +580,7 @@
                      (t-d  (br-then-deaths term))
                      (e-d  (br-else-deaths term)))
                  (ind out)
-                 (format out "if (~a) {~%" (c-name c))
+                 (format out "if (~a) {~%" (nameref c))
                  (let ((*indent* (1+ *indent*)))
                    (dolist (v t-d)
                      (ind out) (format out "sysp_str_release(~a);~%" (c-name v)))
@@ -481,7 +591,6 @@
                      (ind out) (format out "sysp_str_release(~a);~%" (c-name v)))
                    (emit-structured (gethash eblk *block-by-name*) jblk out))
                  (ind out) (format out "}~%")
-                 ;; Continue past the join.
                  (emit-structured (gethash jblk *block-by-name*) until out)))))
 
 (defun emit-c-instr-indented (i out)
@@ -492,17 +601,17 @@
         (ty (c-type (ir-instr-type i))))
     (case (ir-instr-op i)
       (:const (format out "~a ~a = ~a;~%" ty dst (first (ir-instr-args i))))
-      (:copy  (format out "~a ~a = ~a;~%" ty dst (c-name (first (ir-instr-args i)))))
+      (:copy  (format out "~a ~a = ~a;~%" ty dst (nameref (first (ir-instr-args i)))))
       (:prim  (let ((a (ir-instr-args i)))
                 (format out "~a ~a = ~a ~a ~a;~%"
-                        ty dst (c-name (second a)) (first a) (c-name (third a)))))
+                        ty dst (nameref (second a)) (first a) (nameref (third a)))))
       (:call  (if (eq (ir-instr-type i) :unit)
                   (format out "~a(~{~a~^, ~});~%"
                           (c-name (first (ir-instr-args i)))
-                          (mapcar #'c-name (rest (ir-instr-args i))))
+                          (mapcar #'nameref (rest (ir-instr-args i))))
                   (format out "~a ~a = ~a(~{~a~^, ~});~%"
                           ty dst (c-name (first (ir-instr-args i)))
-                          (mapcar #'c-name (rest (ir-instr-args i))))))
+                          (mapcar #'nameref (rest (ir-instr-args i))))))
       (:str-lit (let ((s (first (ir-instr-args i))))
                   (format out "String ~a = sysp_str_lit(\"~a\", ~d);~%"
                           dst (c-escape-string s) (length s))))
