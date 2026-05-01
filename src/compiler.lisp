@@ -268,7 +268,7 @@
         (when (ref-type-p (second p))
           (setf (gethash (first p) tm) (second p))))
       (dolist (i (ir-block-instrs b))
-        (when (ref-type-p (ir-instr-type i))
+        (when (and (ir-instr-dst i) (ref-type-p (ir-instr-type i)))
           (setf (gethash (ir-instr-dst i) tm) (ir-instr-type i)))))
     tm))
 
@@ -292,7 +292,7 @@
       (dolist (u (ref-filter (instr-uses i) type-map))
         (unless (or (member u defined) (member u gen))
           (push u gen)))
-      (when (ref-type-p (ir-instr-type i))
+      (when (and (ir-instr-dst i) (ref-type-p (ir-instr-type i)))
         (push (ir-instr-dst i) defined)
         (pushnew (ir-instr-dst i) kill)))
     (dolist (u (ref-filter (term-uses (ir-block-term blk)) type-map))
@@ -329,48 +329,70 @@
                       changed t)))))
     (values live-in live-out)))
 
+(defun borrowed-params (fn)
+  (loop for p in (ir-fn-params fn)
+        when (ref-type-p (second p)) collect (first p)))
+
+(defun insert-borrow-retains (fn)
+  "Wherever a borrowed fn-param is transferred (via :ret or :jump-args),
+   insert a retain before the term so the destination receives a fresh +1.
+   Callees borrow params and must produce their own +1 to transfer out."
+  (let ((borrowed (borrowed-params fn)))
+    (when borrowed
+      (dolist (b (ir-fn-blocks fn))
+        (let* ((term (ir-block-term b))
+               (transferred (term-transfers term))
+               (borrowed-transferred (intersection transferred borrowed))
+               (new-instrs nil))
+          (dolist (v borrowed-transferred)
+            (push (make-ir-instr :dst nil :type :string :op :retain :args (list v))
+                  new-instrs))
+          (when new-instrs
+            (setf (ir-block-instrs b)
+                  (append (ir-block-instrs b) (nreverse new-instrs)))))))))
+
 (defun insert-releases (fn)
-  (let* ((type-map (build-type-map fn)))
+  (insert-borrow-retains fn)
+  (let* ((type-map (build-type-map fn))
+         (borrowed (borrowed-params fn)))
     (multiple-value-bind (live-in live-out) (liveness fn type-map)
       (dolist (b (ir-fn-blocks fn))
         (let ((bname (ir-block-name b)))
           (insert-releases-block b fn type-map
                                  (gethash bname live-in)
-                                 (gethash bname live-out))))
+                                 (gethash bname live-out)
+                                 borrowed)))
       (dolist (b (ir-fn-blocks fn))
         (let ((term (ir-block-term b)))
           (when (eq (first term) :br)
             (let* ((c (second term)) (tblk (third term))
                    (eblk (fourth term)) (jblk (fifth term))
                    (lo (gethash (ir-block-name b) live-out))
-                   (then-deaths (set-difference lo (gethash tblk live-in)))
-                   (else-deaths (set-difference lo (gethash eblk live-in))))
+                   (then-deaths (set-difference (set-difference lo (gethash tblk live-in)) borrowed))
+                   (else-deaths (set-difference (set-difference lo (gethash eblk live-in)) borrowed)))
               (setf (ir-block-term b)
                     (list :br c tblk eblk jblk then-deaths else-deaths))))))))
   fn)
 
-(defun insert-releases-block (blk fn type-map live-in live-out)
-  "Universe of owned vars in this block = live-in ∪ block-defs.
-   Of those, anything in live-out or in :ret/:jump-arg transfers is kept.
-   Everything else must be released after its last use in this block (or at
-   block top if never used)."
+(defun insert-releases-block (blk fn type-map live-in live-out borrowed)
+  "Universe of owned vars in this block = (live-in ∪ block-defs) - borrowed.
+   Borrowed fn-params are caller-managed. Of the rest, anything in live-out
+   or transferred is kept; everything else releases at last use."
   (let* ((instrs (ir-block-instrs blk))
          (term   (ir-block-term blk))
          (transferred (ref-filter (term-transfers term) type-map))
          (defined nil)
          (last-use (make-hash-table)))
-    (when (eq (ir-block-name blk) 'entry)
-      (dolist (p (ir-fn-params fn))
-        (when (ref-type-p (second p))
-          (push (first p) defined))))
+    (declare (ignore fn))
     (dolist (p (ir-block-params blk))
       (when (ref-type-p (second p))
         (push (first p) defined)))
     (dolist (i instrs)
-      (when (ref-type-p (ir-instr-type i))
+      (when (and (ir-instr-dst i) (ref-type-p (ir-instr-type i)))
         (push (ir-instr-dst i) defined)))
     (let ((tracking (set-difference (union live-in defined) live-out)))
       (setf tracking (set-difference tracking transferred))
+      (setf tracking (set-difference tracking borrowed))
       (loop for idx from 0
             for i in instrs
             do (dolist (u (ref-filter (instr-uses i) type-map))
@@ -550,8 +572,9 @@
               (case (ir-instr-op i)
                 (:const (setf (gethash dst m)
                               (format nil "~a" (first (ir-instr-args i)))))
-                (:copy  (setf (gethash dst m)
-                              (nameref (first (ir-instr-args i)))))
+                (:copy  (unless (ref-type-p (ir-instr-type i))
+                          (setf (gethash dst m)
+                                (nameref (first (ir-instr-args i))))))
                 (:prim  (let ((a (ir-instr-args i)))
                           (setf (gethash dst m)
                                 (format nil "(~a ~a ~a)"
@@ -642,7 +665,10 @@
         (ty (c-type (ir-instr-type i))))
     (case (ir-instr-op i)
       (:const (format out "~a ~a = ~a;~%" ty dst (first (ir-instr-args i))))
-      (:copy  (format out "~a ~a = ~a;~%" ty dst (nameref (first (ir-instr-args i)))))
+      (:copy  (format out "~a ~a = ~a;~%" ty dst (nameref (first (ir-instr-args i))))
+              (when (ref-type-p (ir-instr-type i))
+                (ind out)
+                (format out "sysp_str_retain(~a);~%" dst)))
       (:prim  (let ((a (ir-instr-args i)))
                 (format out "~a ~a = ~a ~a ~a;~%"
                         ty dst (nameref (second a)) (first a) (nameref (third a)))))
@@ -667,3 +693,28 @@
 
 (defun compile-and-emit (form &optional (out t))
   (emit-c-fn (compile-defn form) out))
+
+(defun compile-program (forms &optional (out t))
+  "Compile a list of (defn ...) forms together. Pre-registers each fn's
+   return type so cross-references resolve, then emits prototypes + bodies."
+  ;; Pre-register so any defn can call any other.
+  (dolist (f forms)
+    (destructuring-bind (_d name _params ret-type &rest _body) f
+      (declare (ignore _d _params _body))
+      (setf (get name 'ret-type) ret-type)))
+  (let ((fns (mapcar #'compile-defn forms)))
+    ;; Prototypes.
+    (dolist (fn fns)
+      (emit-c-proto fn out))
+    (terpri out)
+    ;; Bodies.
+    (dolist (fn fns)
+      (emit-c-fn fn out)
+      (terpri out))))
+
+(defun emit-c-proto (fn out)
+  (format out "~a ~a(~{~a~^, ~});~%"
+          (c-type (ir-fn-ret-type fn))
+          (c-name (ir-fn-name fn))
+          (loop for p in (ir-fn-params fn)
+                collect (format nil "~a ~a" (c-type (second p)) (c-name (first p))))))

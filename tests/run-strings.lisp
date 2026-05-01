@@ -72,23 +72,35 @@
 
 (check "echo-transfer"
        (list '(defn echo ((s :string)) :string s))
-       "int main(){ String a = sysp_str_lit(\"ping\", 4); String b = echo(a); sysp_str_print(b); sysp_str_release(b); return 0; }"
-       "ping"
-       :valgrind t)
+       "int main(){ String a = sysp_str_lit(\"ping\", 4); String b = echo(a);
+   sysp_str_print(b); sysp_str_release(b); sysp_str_release(a); return 0; }"
+       "ping" :valgrind t)
 
 (check "use-and-drop-param"
-       (list '(defn shout ((s :string)) :string
-                (string-concat s "!")))
-       "int main(){ String a = sysp_str_lit(\"hi\", 2); String b = shout(a); sysp_str_print(b); sysp_str_release(b); return 0; }"
-       "hi!"
-       :valgrind t)
+       (list '(defn shout ((s :string)) :string (string-concat s "!")))
+       "int main(){ String a = sysp_str_lit(\"hi\", 2); String b = shout(a);
+   sysp_str_print(b); sysp_str_release(b); sysp_str_release(a); return 0; }"
+       "hi!" :valgrind t)
 
 (check "param-len-only"
        (list '(defn lenfn ((s :string)) :int (string-len s)))
        "#include <stdio.h>
-int main(){ String a = sysp_str_lit(\"abcd\", 4); int n = lenfn(a); printf(\"%d\\n\", n); return 0; }"
-       "4"
-       :valgrind t)
+int main(){ String a = sysp_str_lit(\"abcd\", 4); int n = lenfn(a);
+   printf(\"%d\\n\", n); sysp_str_release(a); return 0; }"
+       "4" :valgrind t)
+
+(check "alias-via-let"
+       (list '(defn id ((s :string)) :string (let ((x s)) x)))
+       "int main(){ String a=sysp_str_lit(\"hi\",2); String b=id(a);
+   sysp_str_print(b); sysp_str_release(b); sysp_str_release(a); return 0; }"
+       "hi" :valgrind t)
+
+(check "alias-then-concat"
+       (list '(defn dup-greet ((name :string)) :string
+                (let ((copy name)) (string-concat copy "!"))))
+       "int main(){ String n=sysp_str_lit(\"karan\",5); String r=dup_greet(n);
+   sysp_str_print(r); sysp_str_release(r); sysp_str_release(n); return 0; }"
+       "karan!" :valgrind t)
 
 (format t "~%~a passed, ~a failed~%" *ok* *fail*)
 (unless (zerop *fail*) (sb-ext:exit :code 1))
