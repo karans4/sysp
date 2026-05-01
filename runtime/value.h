@@ -16,6 +16,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <stdio.h>
 
 typedef enum {
@@ -146,6 +147,11 @@ FILE* runtime_stderr(void);
  * interpreter constructs Closures via these helpers, returning a Value
  * with VAL_FN tag.
  */
+
+/* Compiled lambda: just a thin Fn wrapper around a function pointer +
+ * heap env struct. The runtime frees state when Fn's rc → 0 (assumes
+ * env contains no rc'd captures for v1). */
+struct Fn* make_fn(void* invoke, void* state);
 
 Value val_closure(Value params, Value body, Value env);
 Value closure_params(Value v);

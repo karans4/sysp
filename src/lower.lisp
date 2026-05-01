@@ -11,6 +11,16 @@
 (defvar *cur-block-name*)
 (defvar *cur-block-params*)
 
+;;; Synthesized at lambda lower time, drained by compile-program.
+(defvar *lambda-fns* nil)      ; list of synthesized ir-fns
+(defvar *lambda-structs* nil)  ; list of (defstruct ...) forms
+
+(defvar *lambda-counter* 0)
+(defun fresh-lambda-name ()
+  (intern (format nil "_LAMBDA_~D" (incf *lambda-counter*))))
+(defun fresh-env-struct-name ()
+  (intern (format nil "_ENV_~D" *lambda-counter*)))
+
 (defun fresh-tmp ()
   (intern (format nil "T~D" (incf *tmp-counter*))))
 
@@ -108,6 +118,172 @@
   (lower-rt-call 'sysp_str_len :int args env))
 (defmethod lower-form ((head (eql 'string-print)) args env)
   (lower-rt-call 'sysp_str_print :unit args env))
+
+;;; --- closures: free-var analysis + lambda lowering ---
+
+(defun walk-free-vars (form bound)
+  "Return list of symbols in form not in bound. Doesn't recurse into
+   quoted forms. Special-cases let, lambda, set!, for, while."
+  (cond
+    ((symbolp form)
+     (if (or (eq form 'nil) (eq form 't) (member form bound))
+         nil (list form)))
+    ((not (consp form)) nil)
+    ((eq (first form) 'quote) nil)
+    ((eq (first form) 'cstr)  nil)
+    ((eq (first form) 'sym)   nil)
+    ((eq (first form) 'let)
+     (let* ((bindings (second form))
+            (body (cddr form))
+            (free nil)
+            (new-bound bound))
+       (dolist (b bindings)
+         (setf free (append free (walk-free-vars (second b) new-bound)))
+         (push (first b) new-bound))
+       (dolist (e body)
+         (setf free (append free (walk-free-vars e new-bound))))
+       free))
+    ((eq (first form) 'lambda)
+     (let* ((params (second form))
+            (param-names (mapcar (lambda (p) (if (consp p) (first p) p)) params))
+            (rest (cddr form))
+            (body (if (and rest (keywordp (first rest))) (cdr rest) rest)))
+       (let ((free nil))
+         (dolist (e body)
+           (setf free (append free (walk-free-vars e (append param-names bound)))))
+         free)))
+    ((eq (first form) 'set!)
+     (let ((tgt (second form)) (val (third form)))
+       (append (if (member tgt bound) nil (list tgt))
+               (walk-free-vars val bound))))
+    ((eq (first form) 'for)
+     (let* ((spec (second form))
+            (var (first spec)) (lo (second spec)) (hi (third spec))
+            (body (cddr form)))
+       (append (walk-free-vars lo bound)
+               (walk-free-vars hi bound)
+               (apply #'append
+                      (mapcar (lambda (e) (walk-free-vars e (cons var bound))) body)))))
+    (t
+     ;; Default: recurse into args. Head is typically a fn name (global)
+     ;; — we filter out globals at the end.
+     (apply #'append (mapcar (lambda (a) (walk-free-vars a bound)) (cdr form))))))
+
+(defun unique-symbols (syms)
+  (remove-duplicates syms :test #'eq))
+
+(defun lambda-split-args (args)
+  "Args is (params [ret-type] body...). Returns (values params ret-type body)."
+  (let* ((params (first args))
+         (after  (rest args))
+         (has-ret (and after (keywordp (first after)))))
+    (values params (if has-ret (first after) nil) (if has-ret (rest after) after))))
+
+(defun parse-lambda-param (p)
+  "(name :type) → (name type), or naked symbol → (name nil)."
+  (cond
+    ((symbolp p) (list p nil))
+    ((and (consp p) (= (length p) 2)) (list (first p) (second p)))
+    (t (error "bad lambda param: ~A" p))))
+
+(defmethod lower-form ((head (eql 'lambda)) args env)
+  (multiple-value-bind (raw-params ret-annot body) (lambda-split-args args)
+    (let* ((typed-params (mapcar #'parse-lambda-param raw-params))
+           (param-names (mapcar #'first typed-params))
+           (param-types (mapcar #'second typed-params))
+           (env-names (mapcar #'first env))
+           (raw-free (apply #'append
+                            (mapcar (lambda (e) (walk-free-vars e param-names)) body)))
+           ;; Keep only names that exist in current env (skip globals/top-level fns).
+           (free-vars (unique-symbols
+                       (remove-if-not (lambda (v) (member v env-names)) raw-free)))
+           (free-types (mapcar (lambda (v) (cdr (assoc v env))) free-vars))
+           (env-name (fresh-env-struct-name))
+           (fn-name  (fresh-lambda-name))
+           (env-ptr-type (intern (format nil "PTR-~A" (symbol-name env-name)) :keyword))
+           (ret-type (or ret-annot :int)))
+      ;; Synthesize env struct (only if there are captures).
+      (when free-vars
+        (let ((sf (mapcar (lambda (n ty) (list n ty)) free-vars free-types)))
+          (push (list 'defstruct env-name sf) *lambda-structs*)
+          (setf (gethash env-name *struct-fields*) sf)))
+      ;; Synthesize the lambda fn body. Inside it, free vars come via env->field.
+      (let ((body-with-unpack
+             (if free-vars
+                 ;; Wrap body in (let ((var (get-field _env var)) ...) body...)
+                 `((let ,(mapcar (lambda (v)
+                                   `(,v (get-field _ENV ,v)))
+                                 free-vars)
+                     ,@body))
+                 body)))
+        (push (lower-defn `(defn ,fn-name
+                             ((_ENV ,(if free-vars env-ptr-type :ptr-void))
+                              ,@(mapcar (lambda (n ty) (list n (or ty :int)))
+                                        param-names param-types))
+                             ,ret-type
+                             ,@body-with-unpack))
+              *lambda-fns*))
+      ;; At the use site: build env, malloc + fill if captures, make Fn.
+      (emit-lambda-site env-name fn-name free-vars param-types ret-type env))))
+
+(defun emit-lambda-site (env-name fn-name free-vars param-types ret-type env)
+  ;; Allocate env (if captures), fill from current scope, make_fn.
+  (declare (ignore param-types ret-type env))
+  (let ((env-ptr (fresh-tmp))
+        (state-arg (fresh-tmp))
+        (fn-tmp (fresh-tmp)))
+    (cond
+      (free-vars
+       ;; Allocate the env struct.
+       (let ((sz-tmp (fresh-tmp)))
+         (emit (make-ir-instr :dst sz-tmp :type :size :op :sizeof
+                              :args (list env-name)))
+         (let ((mp (fresh-tmp)))
+           (emit (make-ir-instr :dst mp :type :ptr-void :op :call
+                                :args (list 'malloc sz-tmp)))
+           ;; Cast to ptr-EnvName
+           (emit (make-ir-instr :dst env-ptr
+                                :type (intern (format nil "PTR-~A"
+                                                      (symbol-name env-name))
+                                              :keyword)
+                                :op :cast
+                                :args (list (intern (format nil "PTR-~A"
+                                                            (symbol-name env-name))
+                                                    :keyword)
+                                            mp))))
+         ;; Fill captured fields
+         (dolist (v free-vars)
+           (emit (make-ir-instr :dst nil :type :unit :op :field-set-ptr
+                                :args (list env-ptr v v))))
+         ;; Cast env-ptr to void* for make_fn
+         (emit (make-ir-instr :dst state-arg :type :ptr-void :op :cast
+                              :args (list :ptr-void env-ptr))))
+       )
+      (t
+       ;; No captures: state = NULL via (cast :ptr-void 0)
+       (let ((zt (fresh-tmp)))
+         (emit (make-ir-instr :dst zt :type :int :op :const :args (list 0)))
+         (emit (make-ir-instr :dst state-arg :type :ptr-void :op :cast
+                              :args (list :ptr-void zt))))))
+    (let ((fn-ptr-tmp (fresh-tmp)))
+      (emit (make-ir-instr :dst fn-ptr-tmp :type :ptr-void :op :fn-addr
+                           :args (list fn-name)))
+      (emit (make-ir-instr :dst fn-tmp :type :Fn :op :call
+                           :args (list 'make_fn fn-ptr-tmp state-arg))))
+    (values fn-tmp :Fn)))
+
+(defmethod lower-form ((head (eql 'call)) args env)
+  ;; (call f args...) — invoke an Fn value via the trampoline cast.
+  (multiple-value-bind (fn-name fn-ty) (lower (first args) env)
+    (declare (ignore fn-ty))
+    (let ((arg-names nil))
+      (dolist (a (rest args))
+        (multiple-value-bind (n _) (lower a env) (declare (ignore _))
+          (push n arg-names)))
+      (let ((d (fresh-tmp)))
+        (emit (make-ir-instr :dst d :type :int :op :fn-call
+                             :args (cons fn-name (nreverse arg-names))))
+        (values d :int)))))
 
 ;;; --- Lisp data: cons / Value / symbols ---
 

@@ -12,7 +12,9 @@
 
 (defun ref-type-p (ty)
   ;; Types that participate in ARC: :string (sysp String) and :Value (cons cells).
-  (or (eq ty :string) (eq ty :Value)))
+  ;; Case-insensitive for :Value to bridge parser-preserved vs CL-upcased.
+  (or (eq ty :string)
+      (and (keywordp ty) (string-equal (symbol-name ty) "Value"))))
 
 ;;; Struct registry: name (symbol) → list of (field-name field-type) pairs.
 (defvar *struct-fields* (make-hash-table))

@@ -35,6 +35,11 @@
       ((equal r1 r2) t)
       ((tvar-p r1) (setf (gethash (second r1) *subst*) r2))
       ((tvar-p r2) (setf (gethash (second r2) *subst*) r1))
+      ;; Case-insensitive keyword equality — bridges parser-preserved case
+      ;; (:Fn, :Value) with CL-reader-upcased (:FN, :VALUE).
+      ((and (keywordp r1) (keywordp r2)
+            (string-equal (symbol-name r1) (symbol-name r2)))
+       t)
       ;; numeric ↔ numeric: silently accept; C handles all width/float
       ;; promotions and narrowing implicitly.
       ((and (numeric-type-p r1) (numeric-type-p r2)) t)
@@ -171,6 +176,28 @@
   (declare (ignore args env)) :Value)
 (defmethod infer-form ((head (eql 'val-print)) args env)
   (infer (first args) env) :unit)
+
+;; Closures
+(defmethod infer-form ((head (eql 'lambda)) args env)
+  ;; v1: all lambdas are typed as :Fn (no signature tracked through HM yet).
+  (multiple-value-bind (params _ret-annot body) (lambda-split-args args)
+    (declare (ignore _ret-annot))
+    (let ((env2 env))
+      (dolist (p params)
+        (let ((np (parse-lambda-param p)))
+          (push (cons (first np) (or (second np) :int)) env2)))
+      (dolist (b body) (infer b env2)))
+    :Fn))
+
+(defmethod infer-form ((head (eql 'call)) args env)
+  ;; (call f arg...) — f must be :Fn; result is :int (v1).
+  (let ((fty (resolve-type (infer (first args) env))))
+    (unless (or (and (keywordp fty)
+                     (string-equal (symbol-name fty) "FN"))
+                (tvar-p fty))
+      (error "call: expected :Fn, got ~A" fty)))
+  (dolist (a (rest args)) (infer a env))
+  :int)
 
 (defmethod infer-form ((head (eql 'addr-of)) args env)
   (let* ((sym (first args))
@@ -369,7 +396,7 @@
                      :u8 :u16 :u32 :u64 :i8 :i16 :i32 :i64
                      :float :double
                      :ptr-void
-                     :Value :symbol))
+                     :Value :symbol :Fn))
          (let ((s (symbol-name x)))
            (and (> (length s) 4) (string= s "PTR-" :end1 4)))
          (struct-type-p x)))

@@ -95,6 +95,7 @@ void val_release(Value v) {
                  * and state to an env pointer (caller responsible). */
                 Fn* fn = v.as.fn;
                 if (fn->invoke == NULL && fn->state) {
+                    /* Interpreted closure */
                     Closure* c = (Closure*)fn->state;
                     if (--c->rc == 0) {
                         val_release(c->params);
@@ -102,6 +103,10 @@ void val_release(Value v) {
                         val_release(c->env);
                         free(c);
                     }
+                } else if (fn->state) {
+                    /* Compiled lambda env: plain malloc'd, free directly.
+                     * (v1: assumes no rc'd captures inside.) */
+                    free(fn->state);
                 }
                 free(fn);
             }
@@ -332,6 +337,14 @@ FILE* runtime_stderr(void) { return stderr; }
  * pointer is set by the interpreter at startup (interp_call trampoline).
  * For now, helpers don't set invoke — the interpreter does so before
  * the closure is ever called. */
+
+struct Fn* make_fn(void* invoke, void* state) {
+    Fn* fn = malloc(sizeof(Fn));
+    fn->invoke = invoke;
+    fn->state  = state;
+    fn->rc     = 1;
+    return fn;
+}
 
 Value val_closure(Value params, Value body, Value env) {
     Closure* c = malloc(sizeof(Closure));

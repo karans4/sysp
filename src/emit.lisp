@@ -4,6 +4,11 @@
 
 ;;; --- name / type formatting ---
 
+(defun kw-name= (ty name)
+  "Case-insensitive keyword-name compare. Bridges 'parser-preserved
+   case' (Fn, Value) and 'CL-reader-upcased' (FN, VALUE)."
+  (and (keywordp ty) (string-equal (symbol-name ty) name)))
+
 (defun c-type (ty)
   (cond
     ((eq ty :int)    "int")
@@ -23,8 +28,9 @@
     ((eq ty :float)  "float")
     ((eq ty :double) "double")
     ((eq ty :ptr-void) "void*")
-    ((eq ty :Value)  "Value")
-    ((eq ty :symbol) "uint32_t")
+    ((kw-name= ty "Value")  "Value")
+    ((kw-name= ty "symbol") "uint32_t")
+    ((kw-name= ty "Fn")     "Fn*")
     ;; :ptr-T → "T*"
     ((and (keywordp ty)
           (let ((s (symbol-name ty)))
@@ -145,16 +151,16 @@
                 collect (format nil "~a ~a" (c-type (second p)) (c-name (first p))))))
 
 (defun mark-uses-value-if-needed (fn)
-  "Inspect the IR for any :Value-typed binding; set *uses-value* if so."
-  (when (boundp '*uses-value*)
-    (dolist (p (ir-fn-params fn))
-      (when (eq (second p) :Value) (setf *uses-value* t)))
-    (when (eq (ir-fn-ret-type fn) :Value) (setf *uses-value* t))
-    (dolist (b (ir-fn-blocks fn))
-      (dolist (p (ir-block-params b))
-        (when (eq (second p) :Value) (setf *uses-value* t)))
-      (dolist (i (ir-block-instrs b))
-        (when (eq (ir-instr-type i) :Value) (setf *uses-value* t))))))
+  "Set *uses-value* if the IR touches :Value or :Fn (both live in value.h)."
+  (flet ((flag (ty)
+           (when (or (kw-name= ty "Value") (kw-name= ty "Fn"))
+             (setf *uses-value* t))))
+    (when (boundp '*uses-value*)
+      (dolist (p (ir-fn-params fn)) (flag (second p)))
+      (flag (ir-fn-ret-type fn))
+      (dolist (b (ir-fn-blocks fn))
+        (dolist (p (ir-block-params b)) (flag (second p)))
+        (dolist (i (ir-block-instrs b)) (flag (ir-instr-type i)))))))
 
 (defun emit-c-fn (fn &optional (out t))
   (mark-uses-value-if-needed fn)
@@ -340,4 +346,22 @@
                         (format out "~a->~a = ~a;~%"
                                 (nameref (first args))
                                 (string-downcase (symbol-name (second args)))
-                                (nameref (third args))))))))
+                                (nameref (third args)))))
+      (:sizeof   (format out "~a ~a = sizeof(~a);~%"
+                         ty dst (symbol-name (first (ir-instr-args i)))))
+      (:fn-addr  (format out "~a ~a = (void*)&~a;~%"
+                         ty dst (c-name (first (ir-instr-args i)))))
+      (:fn-call  (let* ((args (ir-instr-args i))
+                        (f (first args))
+                        (call-args (rest args))
+                        (n-args (length call-args))
+                        (cast-type (with-output-to-string (s)
+                                     (write-string "int(*)(void*" s)
+                                     (dotimes (k n-args)
+                                       (declare (ignore k))
+                                       (write-string ", int" s))
+                                     (write-string ")" s))))
+                   (format out "int ~a = ((~a)~a->invoke)(~a->state~{, ~a~});~%"
+                           dst cast-type
+                           (c-name f) (c-name f)
+                           (mapcar #'nameref call-args)))))))
