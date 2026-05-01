@@ -127,6 +127,11 @@
   (unify :string (infer (first args) env))
   :unit)
 
+(defmethod infer-form ((head (eql 'cstr)) args env)
+  (declare (ignore env))
+  (unless (stringp (first args)) (error "cstr expects a string literal"))
+  :cstr)
+
 (defmethod infer-form ((head (eql 'let)) args env)
   (let* ((bindings (first args))
          (body (rest args))
@@ -238,12 +243,29 @@
                 (resolved-ret (defaulting ret-type)))
             (list* 'defn name resolved-params resolved-ret body)))))))
 
-(defun infer-program (forms)
-  "Annotate all defns in a program. Handles mutual recursion."
+(defun normalize-extern-params (params)
+  "Accept either flat (name1 :ty1 name2 :ty2 ...) or pairs ((n1 :ty1)
+   (n2 :ty2) ...). Returns list of (name type) pairs."
+  (cond
+    ((null params) nil)
+    ((consp (first params))
+     (mapcar (lambda (p) (list (first p) (second p))) params))
+    (t (loop for (name ty) on params by #'cddr collect (list name ty)))))
+
+(defun infer-program (forms &key externs)
+  "Annotate all defns in a program. Handles mutual recursion. Externs are
+   pre-registered so defns can call them."
   (let ((*subst* (make-hash-table))
         (*tvar-counter* 0)
         (*fn-sigs* (make-hash-table))
         (info nil))
+    ;; Pre-register externs.
+    (dolist (e externs)
+      (let* ((name (second e))
+             (params (normalize-extern-params (third e)))
+             (param-types (mapcar #'second params))
+             (ret-type (fourth e)))
+        (setf (gethash name *fn-sigs*) (list :fn param-types ret-type))))
     ;; Pass 1: register each fn's signature with tvars where unannotated.
     (dolist (f forms)
       (destructuring-bind (defn-sym name &rest rest) f

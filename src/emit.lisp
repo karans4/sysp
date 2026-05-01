@@ -55,6 +55,30 @@
 
 ;;; --- top-level fn / proto emit ---
 
+(defun emit-include (form out)
+  "(include \"foo.h\") → #include \"foo.h\"
+   (include \"<stdio.h>\") → #include <stdio.h>"
+  (let ((path (second form)))
+    (if (and (>= (length path) 2)
+             (char= (char path 0) #\<)
+             (char= (char path (1- (length path))) #\>))
+        (format out "#include ~a~%" path)
+        (format out "#include \"~a\"~%" path))))
+
+(defun emit-extern-proto (form out)
+  "(extern name params ret-type) → extern Type name(Type a, Type b);"
+  (let* ((name (second form))
+         (params (normalize-extern-params (third form)))
+         (ret-type (fourth form)))
+    (format out "extern ~a ~a(~{~a~^, ~});~%"
+            (c-type ret-type)
+            (c-name name)
+            (or (loop for p in params
+                      collect (format nil "~a ~a"
+                                      (c-type (second p))
+                                      (c-name (first p))))
+                '("void")))))
+
 (defun emit-c-proto (fn out)
   (format out "~a ~a(~{~a~^, ~});~%"
           (c-type (ir-fn-ret-type fn))
@@ -161,6 +185,9 @@
       (:str-lit (let ((s (first (ir-instr-args i))))
                   (format out "String ~a = sysp_str_lit(\"~a\", ~d);~%"
                           dst (c-escape-string s) (length s))))
+      (:cstr-lit (let ((s (first (ir-instr-args i))))
+                   (format out "const char* ~a = \"~a\";~%"
+                           dst (c-escape-string s))))
       (:release (format out "sysp_str_release(~a);~%"
                         (c-name (first (ir-instr-args i)))))
       (:retain  (format out "sysp_str_retain(~a);~%"

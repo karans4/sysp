@@ -102,6 +102,15 @@
 (defmethod lower-form ((head (eql 'string-print)) args env)
   (lower-rt-call 'sysp_str_print :unit args env))
 
+(defmethod lower-form ((head (eql 'cstr)) args env)
+  ;; (cstr "literal") → const char*. No allocation, no rc.
+  (declare (ignore env))
+  (let ((s (first args)))
+    (unless (stringp s) (error "cstr expects a string literal, got ~A" s))
+    (let ((d (fresh-tmp)))
+      (emit (make-ir-instr :dst d :type :cstr :op :cstr-lit :args (list s)))
+      (values d :cstr))))
+
 (defmethod lower-form ((head (eql 'set!)) args env)
   ;; (set! target expr) — re-assign. Currently int-only.
   (let ((target (first args)))
