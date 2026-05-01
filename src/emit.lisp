@@ -164,9 +164,10 @@
 
 (defun emit-c-fn (fn &optional (out t))
   (mark-uses-value-if-needed fn)
-  (let ((*block-by-name* (make-hash-table))
-        (*indent* 1)
-        (*inlinable* (build-inlinable fn)))
+  (let* ((*block-by-name* (make-hash-table))
+         (*indent* 1)
+         (*no-inline* (ir-fn-no-inline fn))
+         (*inlinable* (build-inlinable fn)))
     (dolist (b (ir-fn-blocks fn))
       (setf (gethash (ir-block-name b) *block-by-name*) b))
     (format out "~a ~a(" (c-type (ir-fn-ret-type fn)) (c-name (ir-fn-name fn)))
@@ -174,12 +175,14 @@
           do (unless first (format out ", "))
              (format out "~a ~a" (c-type (second p)) (c-name (first p))))
     (format out ") {~%")
-    ;; Pre-declare block-params (phi sinks; assigned from each :jump source).
-    ;; Skip :unit (would emit 'void name;' which is invalid).
     (dolist (b (ir-fn-blocks fn))
       (dolist (p (ir-block-params b))
         (unless (eq (second p) :unit)
           (format out "  ~a ~a;~%" (c-type (second p)) (c-name (first p))))))
+    ;; If any block ends in :recur, emit label so the goto target exists.
+    (when (loop for b in (ir-fn-blocks fn)
+                thereis (eq (first (ir-block-term b)) :recur))
+      (format out "  _recur_top: ;~%"))
     (emit-structured (gethash 'entry *block-by-name*) nil out)
     (format out "}~%")))
 
@@ -202,6 +205,7 @@
     (:ret      (ind out)
                (format out "return ~a;~%" (nameref (second term))))
     (:ret-unit (ind out) (format out "return;~%"))
+    (:recur    (ind out) (format out "goto _recur_top;~%"))
     (:loop     (let ((c (second term))
                      (body-blk (third term))
                      (exit-blk (fourth term))

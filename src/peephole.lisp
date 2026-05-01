@@ -66,6 +66,7 @@
 ;;; are never inlined.
 
 (defvar *inlinable*)   ; sym → C-expression-string
+(defvar *no-inline*)   ; symbol set: tmps that must remain real C vars
 
 (defun count-uses (fn)
   "Use counts. :release/:retain don't count — they consume by name for ARC,
@@ -86,7 +87,8 @@
   (let ((uc (count-uses fn))
         (m (make-hash-table))
         (block-param-syms (make-hash-table))
-        (set-targets (make-hash-table)))
+        (set-targets (make-hash-table))
+        (no-inline (and (boundp '*no-inline*) *no-inline*)))
     (dolist (b (ir-fn-blocks fn))
       (dolist (p (ir-block-params b))
         (setf (gethash (first p) block-param-syms) t))
@@ -100,6 +102,7 @@
             (when (and dst
                        (not (gethash dst block-param-syms))
                        (not (gethash dst set-targets))
+                       (not (and no-inline (member dst no-inline)))
                        (= (gethash dst uc 0) 1))
               (case (ir-instr-op i)
                 (:const (setf (gethash dst m)

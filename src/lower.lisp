@@ -10,6 +10,8 @@
 (defvar *cur-instrs*)          ; list, reverse order
 (defvar *cur-block-name*)
 (defvar *cur-block-params*)
+(defvar *recur-params* nil)   ; symbols for (recur ...) to assign back to
+(defvar *no-inline* nil)      ; tmps marked as must-stay-real-vars (esp. for recur)
 
 ;;; Synthesized at lambda lower time, drained by compile-program.
 (defvar *lambda-fns* nil)      ; list of synthesized ir-fns
@@ -512,6 +514,32 @@
     (start-block cont-blk nil)
     (values nil :unit)))
 
+(defmethod lower-form ((head (eql 'recur)) args env)
+  ;; (recur arg1 arg2 ...) — tail-call to current fn. Compute new values
+  ;; into FRESH tmps (each marked non-inlinable so the inliner doesn't
+  ;; fold them into the :set sites — which would let later assignments
+  ;; see already-mutated param values), then assign all params at once.
+  (unless *recur-params*
+    (error "recur: no enclosing function"))
+  (unless (= (length *recur-params*) (length args))
+    (error "recur: wrong arg count"))
+  (let ((arg-tmps nil))
+    (dolist (a args)
+      (multiple-value-bind (n _ty) (lower a env) (declare (ignore _ty))
+        ;; Force a fresh temp so the value can't be inlined-and-reused.
+        (let ((forced (fresh-tmp)))
+          (emit (make-ir-instr :dst forced :type :int :op :copy
+                               :args (list n)))
+          (push forced *no-inline*)
+          (push forced arg-tmps))))
+    (setf arg-tmps (nreverse arg-tmps))
+    (loop for p in *recur-params* for tmp in arg-tmps do
+      (emit (make-ir-instr :dst nil :type :int :op :set
+                           :args (list p tmp))))
+    (finish-block (list :recur))
+    (start-block (fresh-blk "AFTER-RECUR") nil)
+    (values nil :unit)))
+
 (defmethod lower-form ((head (eql 'return)) args env)
   ;; Early return. Finishes current block with :ret; subsequent code in
   ;; the same lexical position continues in a fresh (likely-dead) block.
@@ -730,6 +758,8 @@
           (*cur-instrs* nil)
           (*cur-block-name* 'entry)
           (*cur-block-params* nil)
+          (*recur-params* (mapcar #'first params))
+          (*no-inline* nil)
           (env (mapcar (lambda (p) (cons (first p) (second p))) params)))
       (setf (get name 'ret-type) ret-type)
       (let (last-n)
@@ -741,4 +771,5 @@
             (finish-block (list :ret-unit))
             (finish-block (list :ret last-n))))
       (make-ir-fn :name name :params params :ret-type ret-type
-                  :blocks (nreverse *blocks*)))))
+                  :blocks (nreverse *blocks*)
+                  :no-inline *no-inline*))))

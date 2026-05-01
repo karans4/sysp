@@ -31,10 +31,11 @@
 (defun term-uses (term)
   "Variables the terminator reads (including transferred-out)."
   (case (first term)
-    (:ret  (list (second term)))
-    (:br   (list (second term)))
-    (:loop (list (second term)))
-    (:jump (third term))))
+    (:ret   (list (second term)))
+    (:br    (list (second term)))
+    (:loop  (list (second term)))
+    (:jump  (third term))
+    (:recur nil)))
 
 (defun term-transfers (term)
   "Variables whose ownership leaves this block via the terminator."
@@ -44,9 +45,10 @@
 
 (defun term-successors (term)
   (case (first term)
-    (:br   (list (third term) (fourth term)))
-    (:loop (list (third term) (fourth term)))    ; body-blk exit-blk
-    (:jump (list (second term)))))
+    (:br    (list (third term) (fourth term)))
+    (:loop  (list (third term) (fourth term)))    ; body-blk exit-blk
+    (:jump  (list (second term)))
+    (:recur (list 'entry))))   ; back-edge to fn entry
 
 (defun br-then-blk    (term) (third term))
 (defun br-else-blk    (term) (fourth term))

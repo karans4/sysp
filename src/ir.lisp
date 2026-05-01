@@ -1,7 +1,7 @@
 ;;;; IR datatypes.
 (in-package :sysp-ir)
 
-(defstruct ir-fn   name params ret-type blocks)
+(defstruct ir-fn   name params ret-type blocks (no-inline nil))
 
 ;; term ∈ (:ret v) | (:ret-unit) | (:br c then-blk else-blk join-blk t-deaths e-deaths)
 ;;      | (:jump blk args) | (:loop cond body-blk exit-blk)

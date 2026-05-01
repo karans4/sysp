@@ -276,6 +276,12 @@
   (dolist (b (rest args)) (infer b env))
   :unit)
 
+(defmethod infer-form ((head (eql 'recur)) args env)
+  ;; recur returns :unit (control flow); each arg is type-checked but
+  ;; we don't have current-fn signature here, so just walk args.
+  (dolist (a args) (infer a env))
+  :unit)
+
 (defmethod infer-form ((head (eql 'return)) args env)
   ;; Treat return as :unit-typed; the inferred type of the body up to the
   ;; return is what the fn signature must match. We don't have full sig
