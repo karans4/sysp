@@ -150,6 +150,13 @@ const char* sym_name(uint32_t id) {
     return "<bad-sym>";
 }
 
+Value gensym(void) {
+    static uint32_t counter = 0;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "_g%u", counter++);
+    return val_sym(intern_sym(buf));
+}
+
 void runtime_shutdown(void) {
     for (size_t i = 0; i < g_symtab.count; i++) free(g_symtab.names[i]);
     free(g_symtab.names);

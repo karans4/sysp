@@ -114,6 +114,10 @@ void val_release(Value v);
 uint32_t    intern_sym(const char* name);
 const char* sym_name(uint32_t id);
 
+/* Fresh symbol, name '_gN' for N a process-global counter. Each call
+ * returns a new ID, suitable for unhygienic-macro alpha-renaming. */
+Value gensym(void);
+
 /* Free interned-symbol and read-string-literal pools. Optional: call at
  * end-of-process for valgrind cleanliness. */
 void runtime_shutdown(void);

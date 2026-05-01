@@ -41,6 +41,7 @@
 
 (extern intern_sym ((name :cstr)) :u32)
 (extern sym_name   ((id :u32))    :cstr)
+(extern gensym     ()             :Value)
 
 (extern read_sexp     ((f :ptr-void))             :Value)
 (extern write_sexp    ((f :ptr-void) (v :Value))  :unit)
@@ -161,6 +162,8 @@
                         (eval-form (val_car (val_cdr args)) env mac))))
     ((!= (name-is? id (cstr "list")) 0)
        (eval-args args env mac))
+    ((!= (name-is? id (cstr "gensym")) 0)
+       (gensym))
     ((!= (name-is? id (cstr "println")) 0)
        (val_println (eval-form (val_car args) env mac))
        (val_nil))

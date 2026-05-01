@@ -323,40 +323,47 @@ Value dispatch(uint32_t id, Value args, Value env, Value mac, Value form) {
                                     Value t232 = eval_args(args, env, mac);
                                     return t232;
                                   } else {
-                                    const char* t233 = "println";
+                                    const char* t233 = "gensym";
                                     int t234 = name_is_p(id, t233);
                                     if ((t234 != 0)) {
-                                      Value t241 = val_car(args);
-                                      Value t242 = eval_form(t241, env, mac);
-                                      val_println(t242);
-                                      Value t244 = val_nil();
-                                      return t244;
+                                      Value t241 = gensym();
+                                      return t241;
                                     } else {
-                                      const char* t245 = "macroexpand";
-                                      int t246 = name_is_p(id, t245);
-                                      if ((t246 != 0)) {
-                                        Value t253 = val_car(args);
-                                        Value t254 = eval_form(t253, env, mac);
-                                        Value t255 = macro_expand_all(t254, env, mac);
-                                        return t255;
+                                      const char* t242 = "println";
+                                      int t243 = name_is_p(id, t242);
+                                      if ((t243 != 0)) {
+                                        Value t250 = val_car(args);
+                                        Value t251 = eval_form(t250, env, mac);
+                                        val_println(t251);
+                                        Value t253 = val_nil();
+                                        return t253;
                                       } else {
-                                        Value t256 = env_lookup(mac, id);
-                                        Value mfn = t256;
-                                        int t257 = is_nil(mfn);
-                                        if ((t257 == 0)) {
-                                          Value t264 = apply_fn(mfn, args, env, mac);
-                                          Value t265 = eval_form(t264, env, mac);
-                                          return t265;
+                                        const char* t254 = "macroexpand";
+                                        int t255 = name_is_p(id, t254);
+                                        if ((t255 != 0)) {
+                                          Value t262 = val_car(args);
+                                          Value t263 = eval_form(t262, env, mac);
+                                          Value t264 = macro_expand_all(t263, env, mac);
+                                          return t264;
                                         } else {
-                                          Value t266 = env_lookup(env, id);
-                                          Value fn = t266;
-                                          int t267 = is_nil(fn);
-                                          if ((t267 == 0)) {
-                                            Value t274 = eval_args(args, env, mac);
-                                            Value t275 = apply_fn(fn, t274, env, mac);
-                                            return t275;
+                                          Value t265 = env_lookup(mac, id);
+                                          Value mfn = t265;
+                                          int t266 = is_nil(mfn);
+                                          if ((t266 == 0)) {
+                                            Value t273 = apply_fn(mfn, args, env, mac);
+                                            Value t274 = eval_form(t273, env, mac);
+                                            return t274;
                                           } else {
-                                            return form;
+                                            Value t275 = env_lookup(env, id);
+                                            Value fn = t275;
+                                            int t276 = is_nil(fn);
+                                            if ((t276 == 0)) {
+                                              Value t283 = eval_args(args, env, mac);
+                                              Value t284 = apply_fn(fn, t283, env, mac);
+                                              return t284;
+                                            } else {
+                                              return form;
+                                            }
                                           }
                                         }
                                       }
