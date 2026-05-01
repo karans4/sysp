@@ -30,6 +30,8 @@
     ;; (:ptr T)
     ((and (consp ty) (eq (first ty) :ptr))
      (concatenate 'string (c-type (second ty)) "*"))
+    ;; struct types: keyword name like :CPU → "CPU"
+    ((struct-type-p ty) (symbol-name (struct-keyword-name ty)))
     (t "int")))   ; fallback
 
 (defun c-escape-string (s)
@@ -54,6 +56,34 @@
 (defun ind (out) (loop repeat *indent* do (write-string "  " out)))
 
 ;;; --- top-level fn / proto emit ---
+
+(defun normalize-struct-fields (raw)
+  "Accept several shapes for fields:
+     ((f :t) (g :t))                  — list of pairs (preferred)
+     (f :t g :t)                      — flat
+     (((f :t) (g :t)))                — wrapped list of pairs
+   Normalize to list of (name type) pairs."
+  (cond
+    ((null raw) nil)
+    ;; wrapped: a single list-of-pairs
+    ((and (= (length raw) 1) (consp (car raw)) (consp (caar raw)))
+     (mapcar (lambda (p) (list (first p) (second p))) (car raw)))
+    ;; list of pairs
+    ((consp (car raw))
+     (mapcar (lambda (p) (list (first p) (second p))) raw))
+    ;; flat name/type
+    (t (loop for (n ty) on raw by #'cddr collect (list n ty)))))
+
+(defun emit-struct-decl (form out)
+  "(defstruct Name (f :t) (g :t) ...) → typedef struct { ... } Name;"
+  (let* ((name (second form))
+         (fields (normalize-struct-fields (cddr form))))
+    (format out "typedef struct {~%")
+    (dolist (f fields)
+      (format out "  ~a ~a;~%"
+              (c-type (second f))
+              (string-downcase (symbol-name (first f)))))
+    (format out "} ~a;~%" (symbol-name name))))
 
 (defun emit-include (form out)
   "(include \"foo.h\") → #include \"foo.h\"
@@ -214,4 +244,20 @@
       (:ptr-set-at (let ((args (ir-instr-args i)))
                      (format out "~a[~a] = ~a;~%"
                              (nameref (first args)) (nameref (second args))
-                             (nameref (third args))))))))
+                             (nameref (third args)))))
+      (:struct-init (let* ((args (ir-instr-args i))
+                           (struct-name (first args))
+                           (vals (rest args)))
+                      (format out "~a ~a = (~a){~{~a~^, ~}};~%"
+                              (symbol-name struct-name) dst
+                              (symbol-name struct-name)
+                              (mapcar #'nameref vals))))
+      (:field-get (let ((args (ir-instr-args i)))
+                    (format out "~a ~a = ~a.~a;~%"
+                            ty dst (nameref (first args))
+                            (string-downcase (symbol-name (second args))))))
+      (:field-set (let ((args (ir-instr-args i)))
+                    (format out "~a.~a = ~a;~%"
+                            (nameref (first args))
+                            (string-downcase (symbol-name (second args)))
+                            (nameref (third args))))))))

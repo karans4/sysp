@@ -17,21 +17,28 @@
   (emit-c-fn (compile-defn form) out))
 
 (defun compile-program (forms &optional (out t))
-  "Compile a top-level program: (include ...), (extern ...), (defn ...).
-   Order in source doesn't matter; output is includes → extern protos →
-   defn protos → defn bodies."
-  (let (includes externs defns)
+  "Compile a top-level program: (include ...), (defstruct ...), (extern ...),
+   (defn ...). Output: includes → struct typedefs → extern protos → defn
+   protos → defn bodies."
+  (let (includes structs externs defns)
     (dolist (f forms)
       (case (first f)
-        (include (push f includes))
-        (extern  (push f externs))
-        (defn    (push f defns))
+        (include   (push f includes))
+        (defstruct (push f structs))
+        (extern    (push f externs))
+        (defn      (push f defns))
         (t (error "compile-program: unknown top-level form ~A" (first f)))))
     (setf includes (nreverse includes)
+          structs  (nreverse structs)
           externs  (nreverse externs)
           defns    (nreverse defns))
+    ;; Register all structs first so types resolve.
+    (dolist (s structs)
+      (setf (gethash (second s) *struct-fields*)
+            (normalize-struct-fields (cddr s))))
     (dolist (i includes) (emit-include i out))
-    (when (and includes (or externs defns)) (terpri out))
+    (when (and includes (or structs externs defns)) (terpri out))
+    (dolist (s structs) (emit-struct-decl s out) (terpri out))
     (dolist (e externs) (emit-extern-proto e out))
     (when (and externs defns) (terpri out))
     ;; Pre-register extern ret-types for the user-fn dispatch in lower-form.

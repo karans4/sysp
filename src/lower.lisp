@@ -286,18 +286,50 @@
             (start-block join-blk (list (list result tty)))
             (values result tty)))))))
 
+(defmethod lower-form ((head (eql 'get-field)) args env)
+  (multiple-value-bind (obj-name obj-ty) (lower (first args) env)
+    (let* ((field-sym (second args))
+           (field-ty (struct-field-type obj-ty field-sym))
+           (d (fresh-tmp)))
+      (emit (make-ir-instr :dst d :type field-ty :op :field-get
+                           :args (list obj-name field-sym)))
+      (values d field-ty))))
+
+(defmethod lower-form ((head (eql 'set-field!)) args env)
+  (multiple-value-bind (obj-name _obj-ty) (lower (first args) env)
+    (declare (ignore _obj-ty))
+    (multiple-value-bind (val-name _vt) (lower (third args) env) (declare (ignore _vt))
+      (let ((field-sym (second args)))
+        (emit (make-ir-instr :dst nil :type :unit :op :field-set
+                             :args (list obj-name field-sym val-name)))
+        (values nil :unit)))))
+
 (defmethod lower-form (head args env)
-  ;; default: call to user-defined fn (or unknown — uses (get head 'ret-type)).
-  (let ((arg-names nil))
-    (dolist (a args)
-      (multiple-value-bind (n _ty) (lower a env)
-        (declare (ignore _ty))
-        (push n arg-names)))
-    (let ((d (fresh-tmp))
-          (rty (or (get head 'ret-type) :int)))
-      (emit (make-ir-instr :dst d :type rty :op :call
-                           :args (cons head (nreverse arg-names))))
-      (values d rty))))
+  ;; default: struct constructor OR call to user/extern fn.
+  (cond
+    ((struct-name-p head)
+     ;; Struct constructor: (Name v1 v2 ...) → struct literal.
+     (let ((arg-names nil))
+       (dolist (a args)
+         (multiple-value-bind (n _ty) (lower a env)
+           (declare (ignore _ty))
+           (push n arg-names)))
+       (let ((d (fresh-tmp))
+             (sty (struct-type-keyword head)))
+         (emit (make-ir-instr :dst d :type sty :op :struct-init
+                              :args (cons head (nreverse arg-names))))
+         (values d sty))))
+    (t
+     (let ((arg-names nil))
+       (dolist (a args)
+         (multiple-value-bind (n _ty) (lower a env)
+           (declare (ignore _ty))
+           (push n arg-names)))
+       (let ((d (fresh-tmp))
+             (rty (or (get head 'ret-type) :int)))
+         (emit (make-ir-instr :dst d :type rty :op :call
+                              :args (cons head (nreverse arg-names))))
+         (values d rty))))))
 
 (defun lower-defn (form)
   "Build the raw IR for one (defn ...) form. No optimization passes — those

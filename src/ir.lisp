@@ -11,3 +11,26 @@
 (defstruct ir-instr dst type op args)
 
 (defun ref-type-p (ty) (eq ty :string))   ; extend as more ref types arrive
+
+;;; Struct registry: name (symbol) → list of (field-name field-type) pairs.
+(defvar *struct-fields* (make-hash-table))
+
+(defun struct-name-p (sym)
+  (and (symbolp sym) (gethash sym *struct-fields*)))
+
+(defun struct-type-keyword (sym)
+  "Convert struct name symbol to its type keyword: CPU → :CPU."
+  (intern (symbol-name sym) :keyword))
+
+(defun struct-keyword-name (kw)
+  "Inverse: :CPU → CPU symbol (interned in sysp-ir for *struct-fields* lookup)."
+  (intern (symbol-name kw) :sysp-ir))
+
+(defun struct-type-p (ty)
+  (and (keywordp ty)
+       (gethash (struct-keyword-name ty) *struct-fields*)))
+
+(defun struct-field-type (struct-ty field-name)
+  (let ((fields (gethash (struct-keyword-name struct-ty) *struct-fields*)))
+    (or (second (assoc field-name fields))
+        (error "struct ~A has no field ~A" struct-ty field-name))))

@@ -221,33 +221,62 @@
   (dolist (b (rest args)) (infer b env))
   :unit)
 
+(defmethod infer-form ((head (eql 'get-field)) args env)
+  (let* ((obj-ty (resolve-type (infer (first args) env)))
+         (field-sym (second args)))
+    (unless (struct-type-p obj-ty)
+      (error "get-field: ~A is not a struct, got ~A" (first args) obj-ty))
+    (struct-field-type obj-ty field-sym)))
+
+(defmethod infer-form ((head (eql 'set-field!)) args env)
+  (let* ((obj-ty (resolve-type (infer (first args) env)))
+         (field-sym (second args))
+         (val-ty (infer (third args) env)))
+    (unless (struct-type-p obj-ty)
+      (error "set-field!: ~A is not a struct, got ~A" (first args) obj-ty))
+    (let ((field-ty (struct-field-type obj-ty field-sym)))
+      (unify field-ty val-ty)
+      :unit)))
+
 (defmethod infer-form (head args env)
-  ;; Default: function call to a registered fn (or runtime fn known by name).
-  (let ((sig (and *fn-sigs* (gethash head *fn-sigs*))))
-    (unless sig
-      (error "infer: unknown function ~A. Either declare it via defn or add to runtime."
-             head))
-    (let ((arg-tys (second sig))
-          (ret-ty  (third sig)))
-      (unless (= (length arg-tys) (length args))
-        (error "infer: ~A expects ~D args, got ~D" head (length arg-tys) (length args)))
-      (loop for a in args for at in arg-tys
-            do (unify at (infer a env)))
-      ret-ty)))
+  ;; Default: struct constructor OR function call.
+  (cond
+    ((struct-name-p head)
+     ;; Struct constructor: types must match field types.
+     (let ((fields (gethash head *struct-fields*)))
+       (unless (= (length fields) (length args))
+         (error "struct ~A: expected ~D fields, got ~D"
+                head (length fields) (length args)))
+       (loop for a in args for f in fields
+             do (unify (second f) (infer a env)))
+       (struct-type-keyword head)))
+    (t
+     (let ((sig (and *fn-sigs* (gethash head *fn-sigs*))))
+       (unless sig
+         (error "infer: unknown function ~A" head))
+       (let ((arg-tys (second sig))
+             (ret-ty  (third sig)))
+         (unless (= (length arg-tys) (length args))
+           (error "infer: ~A expects ~D args, got ~D"
+                  head (length arg-tys) (length args)))
+         (loop for a in args for at in arg-tys
+               do (unify at (infer a env)))
+         ret-ty)))))
 
 ;;; --- defn / program drivers ---
 
 (defun type-annotation-p (x)
   "Heuristic: distinguish a type form from a body form. Types are keywords
-   like :int, :string, :u8, :ptr-void, or a compound (:fn ...) / (:ptr T) form."
+   like :int, :string, :u8, :ptr-void, :CPU (struct), or compound (:fn ...)
+   / (:ptr T) forms."
   (cond
     ((keywordp x)
      (or (member x '(:int :bool :unit :string :cstr :size
                      :u8 :u16 :u32 :u64 :i8 :i16 :i32 :i64
                      :ptr-void))
-         ;; :ptr-T family
          (let ((s (symbol-name x)))
-           (and (> (length s) 4) (string= s "PTR-" :end1 4)))))
+           (and (> (length s) 4) (string= s "PTR-" :end1 4)))
+         (struct-type-p x)))
     ((consp x) (member (first x) '(:fn :ptr)))))
 
 (defun split-defn-shape (rest-of-form)
