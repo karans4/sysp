@@ -86,9 +86,7 @@ int main(){ printf(\"%d\\n\", rect_sum(4, 5)); return 0; }"
                 (let ((count 0)
                       (i 0))
                   (while (< i n)
-                    (if (= (- i (* (/ i 2) 2)) 0)
-                        (set! count (+ count 1))
-                        0)
+                    (set! count (+ count (if (= (- i (* (/ i 2) 2)) 0) 1 0)))
                     (set! i (+ i 1)))
                   count)))
        "#include <stdio.h>
