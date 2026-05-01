@@ -46,50 +46,52 @@
           defines         (nreverse defines)
           externs         (nreverse externs)
           defns           (nreverse defns))
-    ;; extern-structs register fields but emit no typedef (the C header has it).
     (dolist (s extern-structs)
       (setf (gethash (second s) *struct-fields*)
             (normalize-struct-fields (cddr s))))
-    ;; Register defines as globals.
     (dolist (d defines)
       (let* ((name (second d)) (val (third d))
              (ty (cond ((integerp val) :int)
                        ((stringp val)  :cstr)
                        (t :int))))
         (setf (gethash name *globals*) (list ty val))))
-    ;; Register all structs first so types resolve.
     (dolist (s structs)
       (setf (gethash (second s) *struct-fields*)
             (normalize-struct-fields (cddr s))))
-    (dolist (i includes) (emit-include i out))
-    (when (and includes (or structs defines externs defns)) (terpri out))
-    (dolist (s structs) (emit-struct-decl s out) (terpri out))
-    (dolist (d defines)
-      (let ((name (second d)) (val (third d)))
-        (format out "static const ~a ~a = ~a;~%"
-                (c-type (first (gethash name *globals*)))
-                (c-name name)
-                (if (stringp val) (format nil "\"~a\"" val) val))))
-    (when (and defines (or externs defns)) (terpri out))
-    ;; Externs: signatures are registered for type-checking; the C
-    ;; prototype comes from the user's (include ...) header. We don't
-    ;; emit our own extern proto because it would conflict on subtle
-    ;; types (e.g., raylib uses `bool` not `int` for predicates).
-    ;; Pre-register extern ret-types for the user-fn dispatch in lower-form.
     (dolist (e externs)
       (setf (get (second e) 'ret-type) (fourth e)))
-    (let ((annotated (infer-program defns :externs externs)))
+    ;; Lower defns first so we can detect Value usage before emitting headers.
+    (let* ((annotated (infer-program defns :externs externs)))
       (dolist (f annotated)
         (destructuring-bind (_d name _params ret-type &rest _body) f
           (declare (ignore _d _params _body))
           (setf (get name 'ret-type) ret-type)))
-      (let ((fns (mapcar (lambda (f)
-                           (let ((fn (lower-defn f)))
-                             (insert-releases fn)
-                             (rewrite-jump-to-ret fn)
-                             (prune-unreachable fn)
-                             fn))
-                         annotated)))
-        (dolist (fn fns) (emit-c-proto fn out))
+      (let* ((*uses-value* nil)
+             (fns (mapcar (lambda (f)
+                            (let ((fn (lower-defn f)))
+                              (insert-releases fn)
+                              (rewrite-jump-to-ret fn)
+                              (prune-unreachable fn)
+                              fn))
+                          annotated))
+             (body-buf (make-string-output-stream))
+             (proto-buf (make-string-output-stream)))
+        ;; Render bodies + protos to buffers (this also updates *uses-value*).
+        (dolist (fn fns) (emit-c-proto fn proto-buf))
+        (dolist (fn fns) (emit-c-fn fn body-buf) (terpri body-buf))
+        ;; Now emit the final output: includes (incl. value.h if needed),
+        ;; structs, defines, then the buffered protos + bodies.
+        (dolist (i includes) (emit-include i out))
+        (when (or *uses-value*) (format out "#include \"value.h\"~%"))
+        (when (or includes *uses-value*) (terpri out))
+        (dolist (s structs) (emit-struct-decl s out) (terpri out))
+        (dolist (d defines)
+          (let ((name (second d)) (val (third d)))
+            (format out "static const ~a ~a = ~a;~%"
+                    (c-type (first (gethash name *globals*)))
+                    (c-name name)
+                    (if (stringp val) (format nil "\"~a\"" val) val))))
+        (when defines (terpri out))
+        (write-string (get-output-stream-string proto-buf) out)
         (when fns (terpri out))
-        (dolist (fn fns) (emit-c-fn fn out) (terpri out))))))
+        (write-string (get-output-stream-string body-buf) out)))))

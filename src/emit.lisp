@@ -23,6 +23,8 @@
     ((eq ty :float)  "float")
     ((eq ty :double) "double")
     ((eq ty :ptr-void) "void*")
+    ((eq ty :Value)  "Value")
+    ((eq ty :symbol) "uint32_t")
     ;; :ptr-T → "T*"
     ((and (keywordp ty)
           (let ((s (symbol-name ty)))
@@ -62,6 +64,18 @@
 (defvar *indent*)
 
 (defun ind (out) (loop repeat *indent* do (write-string "  " out)))
+
+(defun rc-fn-name (ty op-name)
+  "Dispatch retain/release to the right runtime fn based on type.
+   op-name is \"retain\" or \"release\"."
+  (cond
+    ((eq ty :string) (format nil "sysp_str_~a" op-name))
+    ((eq ty :Value)  (format nil "val_~a" op-name))
+    (t (error "rc-fn-name: no rc fn for type ~A" ty))))
+
+;; Track whether the current program uses Value/cons. If so, we need to
+;; emit the runtime header and link runtime/value.c.
+(defvar *uses-value*)
 
 ;;; --- top-level fn / proto emit ---
 
@@ -124,7 +138,20 @@
           (loop for p in (ir-fn-params fn)
                 collect (format nil "~a ~a" (c-type (second p)) (c-name (first p))))))
 
+(defun mark-uses-value-if-needed (fn)
+  "Inspect the IR for any :Value-typed binding; set *uses-value* if so."
+  (when (boundp '*uses-value*)
+    (dolist (p (ir-fn-params fn))
+      (when (eq (second p) :Value) (setf *uses-value* t)))
+    (when (eq (ir-fn-ret-type fn) :Value) (setf *uses-value* t))
+    (dolist (b (ir-fn-blocks fn))
+      (dolist (p (ir-block-params b))
+        (when (eq (second p) :Value) (setf *uses-value* t)))
+      (dolist (i (ir-block-instrs b))
+        (when (eq (ir-instr-type i) :Value) (setf *uses-value* t))))))
+
 (defun emit-c-fn (fn &optional (out t))
+  (mark-uses-value-if-needed fn)
   (let ((*block-by-name* (make-hash-table))
         (*indent* 1)
         (*inlinable* (build-inlinable fn)))
@@ -225,7 +252,8 @@
       (:copy  (format out "~a ~a = ~a;~%" ty dst (nameref (first (ir-instr-args i))))
               (when (ref-type-p (ir-instr-type i))
                 (ind out)
-                (format out "sysp_str_retain(~a);~%" dst)))
+                (format out "~a(~a);~%"
+                        (rc-fn-name (ir-instr-type i) "retain") dst)))
       (:prim  (let ((a (ir-instr-args i)))
                 (format out "~a ~a = ~a ~a ~a;~%"
                         ty dst (nameref (second a)) (first a) (nameref (third a)))))
@@ -242,9 +270,11 @@
       (:cstr-lit (let ((s (first (ir-instr-args i))))
                    (format out "const char* ~a = \"~a\";~%"
                            dst (c-escape-string s))))
-      (:release (format out "sysp_str_release(~a);~%"
+      (:release (format out "~a(~a);~%"
+                        (rc-fn-name (ir-instr-type i) "release")
                         (c-name (first (ir-instr-args i)))))
-      (:retain  (format out "sysp_str_retain(~a);~%"
+      (:retain  (format out "~a(~a);~%"
+                        (rc-fn-name (ir-instr-type i) "retain")
                         (c-name (first (ir-instr-args i)))))
       (:set     (let ((args (ir-instr-args i)))
                   (format out "~a = ~a;~%"

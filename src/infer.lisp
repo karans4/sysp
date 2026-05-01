@@ -148,6 +148,30 @@
   (unless (stringp (first args)) (error "cstr expects a string literal"))
   :cstr)
 
+;; Lisp data: cons / car / cdr / nil? / list / sym / sym-eq? / val-nil / val-print
+(defmethod infer-form ((head (eql 'cons)) args env)
+  (infer (first args) env)
+  (infer (second args) env)
+  :Value)
+(defmethod infer-form ((head (eql 'car)) args env)
+  (infer (first args) env) :Value)
+(defmethod infer-form ((head (eql 'cdr)) args env)
+  (infer (first args) env) :Value)
+(defmethod infer-form ((head (eql 'nil?)) args env)
+  (infer (first args) env) :bool)
+(defmethod infer-form ((head (eql 'list)) args env)
+  (dolist (a args) (infer a env)) :Value)
+(defmethod infer-form ((head (eql 'sym)) args env)
+  (declare (ignore env))
+  (unless (stringp (first args)) (error "sym expects a string literal")) :Value)
+(defmethod infer-form ((head (eql 'sym-eq?)) args env)
+  (infer (first args) env)
+  (infer (second args) env) :bool)
+(defmethod infer-form ((head (eql 'val-nil)) args env)
+  (declare (ignore args env)) :Value)
+(defmethod infer-form ((head (eql 'val-print)) args env)
+  (infer (first args) env) :unit)
+
 (defmethod infer-form ((head (eql 'addr-of)) args env)
   (let* ((sym (first args))
          (b (assoc sym env)))
@@ -344,7 +368,8 @@
      (or (member x '(:int :bool :unit :string :cstr :size
                      :u8 :u16 :u32 :u64 :i8 :i16 :i32 :i64
                      :float :double
-                     :ptr-void))
+                     :ptr-void
+                     :Value :symbol))
          (let ((s (symbol-name x)))
            (and (> (length s) 4) (string= s "PTR-" :end1 4)))
          (struct-type-p x)))

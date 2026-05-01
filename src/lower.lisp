@@ -109,6 +109,126 @@
 (defmethod lower-form ((head (eql 'string-print)) args env)
   (lower-rt-call 'sysp_str_print :unit args env))
 
+;;; --- Lisp data: cons / Value / symbols ---
+
+(defun box-as-value (name ty)
+  "Emit IR that converts (name, ty) to a :Value tmp. Returns the new dst.
+   Pass-through if already :Value. nil/false → val_nil()."
+  (cond
+    ((eq ty :Value) name)
+    ((eq ty :symbol)
+     (let ((d (fresh-tmp)))
+       (emit (make-ir-instr :dst d :type :Value :op :call
+                            :args (list 'val_sym name)))
+       d))
+    ((eq ty :int)
+     (let ((d (fresh-tmp)))
+       (emit (make-ir-instr :dst d :type :Value :op :call
+                            :args (list 'val_int name)))
+       d))
+    ((eq ty :float)
+     (let ((d (fresh-tmp)))
+       (emit (make-ir-instr :dst d :type :Value :op :call
+                            :args (list 'val_float name)))
+       d))
+    ((eq ty :bool)
+     ;; bool nil (false) → val_nil(); true → val_int(1).
+     (let ((d (fresh-tmp)))
+       (emit (make-ir-instr :dst d :type :Value :op :call
+                            :args (list 'val_int name)))
+       d))
+    (t (error "cannot box type ~A as Value" ty))))
+
+(defun lower-and-box (expr env)
+  "Lower expr, then box the result to :Value. Returns the boxed name."
+  (multiple-value-bind (n ty) (lower expr env)
+    (box-as-value n ty)))
+
+(defun lower-value-arg (expr env)
+  "Lower an arg that must end up as :Value. Special-cases:
+   - literal nil → val_nil()  (CL's nil is also our empty list)
+   - everything else: lower then auto-box."
+  (cond
+    ((null expr)
+     (let ((d (fresh-tmp)))
+       (emit (make-ir-instr :dst d :type :Value :op :call
+                            :args (list 'val_nil)))
+       d))
+    (t (lower-and-box expr env))))
+
+(defmethod lower-form ((head (eql 'cons)) args env)
+  (let ((a (lower-value-arg (first args) env))
+        (b (lower-value-arg (second args) env))
+        (d (fresh-tmp)))
+    (emit (make-ir-instr :dst d :type :Value :op :call
+                         :args (list 'val_cons a b)))
+    (values d :Value)))
+
+(defmethod lower-form ((head (eql 'car)) args env)
+  (multiple-value-bind (n _) (lower (first args) env) (declare (ignore _))
+    (let ((d (fresh-tmp)))
+      (emit (make-ir-instr :dst d :type :Value :op :call
+                           :args (list 'val_car n)))
+      (values d :Value))))
+
+(defmethod lower-form ((head (eql 'cdr)) args env)
+  (multiple-value-bind (n _) (lower (first args) env) (declare (ignore _))
+    (let ((d (fresh-tmp)))
+      (emit (make-ir-instr :dst d :type :Value :op :call
+                           :args (list 'val_cdr n)))
+      (values d :Value))))
+
+(defmethod lower-form ((head (eql 'nil?)) args env)
+  (multiple-value-bind (n _) (lower (first args) env) (declare (ignore _))
+    (let ((d (fresh-tmp)))
+      (emit (make-ir-instr :dst d :type :bool :op :call
+                           :args (list 'is_nil n)))
+      (values d :bool))))
+
+(defmethod lower-form ((head (eql 'list)) args env)
+  ;; (list a b c) → (cons a (cons b (cons c nil)))
+  (lower (build-list-form args) env))
+
+(defun build-list-form (args)
+  (if (null args)
+      'nil
+      (list 'cons (first args) (build-list-form (rest args)))))
+
+(defmethod lower-form ((head (eql 'sym)) args env)
+  (declare (ignore env))
+  ;; (sym name-string) → val_sym(intern_sym("name"))
+  (let ((s (first args)))
+    (unless (stringp s) (error "sym expects a string literal, got ~A" s))
+    (let ((cs (fresh-tmp)) (id (fresh-tmp)) (d (fresh-tmp)))
+      (emit (make-ir-instr :dst cs :type :cstr :op :cstr-lit :args (list s)))
+      (emit (make-ir-instr :dst id :type :symbol :op :call
+                           :args (list 'intern_sym cs)))
+      (emit (make-ir-instr :dst d :type :Value :op :call
+                           :args (list 'val_sym id)))
+      (values d :Value))))
+
+(defmethod lower-form ((head (eql 'sym-eq?)) args env)
+  (let ((a (lower-and-box (first args) env))
+        (b (lower-and-box (second args) env))
+        (d (fresh-tmp)))
+    (emit (make-ir-instr :dst d :type :bool :op :call
+                         :args (list 'sym_eq a b)))
+    (values d :bool)))
+
+(defmethod lower-form ((head (eql 'val-nil)) args env)
+  (declare (ignore args env))
+  (let ((d (fresh-tmp)))
+    (emit (make-ir-instr :dst d :type :Value :op :call
+                         :args (list 'val_nil)))
+    (values d :Value)))
+
+(defmethod lower-form ((head (eql 'val-print)) args env)
+  ;; Print a Value as s-expr followed by newline.
+  (let ((n (lower-value-arg (first args) env)))
+    (emit (make-ir-instr :dst nil :type :unit :op :call
+                         :args (list 'val_println n)))
+    (values nil :unit)))
+
 (defmethod lower-form ((head (eql 'cstr)) args env)
   ;; (cstr "literal") → const char*. No allocation, no rc.
   (declare (ignore env))

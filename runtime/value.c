@@ -42,8 +42,10 @@ int32_t     val_int_of(Value v)   { return v.as.i; }
 double      val_float_of(Value v) { return v.as.f; }
 const char* val_str_of(Value v)   { return v.as.s; }
 uint32_t    val_sym_of(Value v)   { return v.as.sym; }
-Value       val_car(Value v)      { return v.as.cons->car; }
-Value       val_cdr(Value v)      { return v.as.cons->cdr; }
+/* car/cdr retain the inner Value: caller becomes a +1 owner so ARC's
+ * release-at-last-use balances. The cons cell itself is unaffected. */
+Value       val_car(Value v)      { Value r = v.as.cons->car; val_retain(r); return r; }
+Value       val_cdr(Value v)      { Value r = v.as.cons->cdr; val_retain(r); return r; }
 Fn*         val_fn_of(Value v)    { return v.as.fn; }
 
 /* ---------- Equality ---------- */
@@ -297,6 +299,8 @@ static void write_string_lit(FILE* f, const char* s) {
     }
     fputc('"', f);
 }
+
+void val_println(Value v) { write_sexp(stdout, v); fputc('\n', stdout); }
 
 void write_sexp(FILE* f, Value v) {
     switch (v.tag) {

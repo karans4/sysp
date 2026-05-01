@@ -10,7 +10,9 @@
 ;; op ∈ :const :prim :copy :call :str-lit :release :retain :set
 (defstruct ir-instr dst type op args)
 
-(defun ref-type-p (ty) (eq ty :string))   ; extend as more ref types arrive
+(defun ref-type-p (ty)
+  ;; Types that participate in ARC: :string (sysp String) and :Value (cons cells).
+  (or (eq ty :string) (eq ty :Value)))
 
 ;;; Struct registry: name (symbol) → list of (field-name field-type) pairs.
 (defvar *struct-fields* (make-hash-table))

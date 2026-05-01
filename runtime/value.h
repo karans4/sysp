@@ -117,4 +117,7 @@ Value read_sexp(FILE* f);
 /* Print v to f. No trailing newline. */
 void  write_sexp(FILE* f, Value v);
 
+/* Convenience: print to stdout with trailing newline. */
+void val_println(Value v);
+
 #endif
