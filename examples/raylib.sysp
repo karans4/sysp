@@ -1,0 +1,40 @@
+; raylib bindings — talks to raylib.h directly. No C shim.
+; Vector2 / Color are declared as extern-struct so we don't redefine
+; raylib's typedefs but can still construct them and read fields.
+
+(include "<raylib.h>")
+
+(extern-struct Vector2 ((x :float) (y :float)))
+(extern-struct Color   ((r :u8) (g :u8) (b :u8) (a :u8)))
+
+;; Window / loop
+(extern InitWindow         ((w :int) (h :int) (title :cstr)) :unit)
+(extern CloseWindow        () :unit)
+(extern WindowShouldClose  () :int)
+(extern SetTargetFPS       ((n :int)) :unit)
+(extern SetConfigFlags     ((flags :u32)) :unit)
+
+;; Input
+(extern IsMouseButtonPressed ((b :int)) :int)
+(extern GetMousePosition     () :Vector2)
+
+;; Drawing
+(extern BeginDrawing     () :unit)
+(extern EndDrawing       () :unit)
+(extern ClearBackground  ((c :Color)) :unit)
+(extern DrawLineEx       ((p1 :Vector2) (p2 :Vector2)
+                          (thick :float) (c :Color)) :unit)
+(extern DrawRing         ((center :Vector2) (inner :float) (outer :float)
+                          (a1 :float) (a2 :float) (segs :int) (c :Color)) :unit)
+(extern DrawText         ((s :cstr) (x :int) (y :int) (sz :int)
+                          (c :Color)) :unit)
+(extern DrawRectangle    ((x :int) (y :int) (w :int) (h :int)
+                          (c :Color)) :unit)
+
+;; libc
+(extern malloc ((n :size)) :ptr-void)
+(extern free   ((p :ptr-void)) :unit)
+
+;; raylib enum values used as ints
+(define MOUSE-LEFT       0)
+(define FLAG-MSAA-4X     32)

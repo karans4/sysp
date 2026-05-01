@@ -43,6 +43,10 @@
      (let ((d (fresh-tmp)))
        (emit (make-ir-instr :dst d :type :int :op :const :args (list e)))
        (values d :int)))
+    ((floatp e)
+     (let ((d (fresh-tmp)))
+       (emit (make-ir-instr :dst d :type :float :op :const :args (list e)))
+       (values d :float)))
     ((eq e t)   (let ((d (fresh-tmp)))
                   (emit (make-ir-instr :dst d :type :bool :op :const :args (list 1)))
                   (values d :bool)))
@@ -55,8 +59,11 @@
        (values d :string)))
     ((symbolp e)
      (let ((b (assoc e env)))
-       (unless b (error "unbound symbol: ~A" e))
-       (values e (cdr b))))
+       (cond
+         (b (values e (cdr b)))
+         ((gethash e *globals*)
+          (values e (first (gethash e *globals*))))
+         (t (error "unbound symbol: ~A" e)))))
     ((consp e)
      (lower-form (car e) (cdr e) env))
     (t (error "cannot lower: ~A" e))))
@@ -216,6 +223,67 @@
     (finish-block (list :ret vn))
     (start-block (fresh-blk "AFTER-RET") nil)
     (values vn :unit)))
+
+;;; --- syntactic sugar lowered as macros (re-call lower) ---
+
+(defmethod lower-form ((head (eql 'for)) args env)
+  ;; (for (var lo hi) body...) — bracket form (var lo hi) after parser collapse.
+  (let* ((spec (first args))
+         (var (first spec))
+         (lo  (second spec))
+         (hi  (third spec))
+         (body (rest args)))
+    (lower `(let ((,var ,lo))
+              (while (< ,var ,hi)
+                ,@body
+                (set! ,var (+ ,var 1))))
+           env)))
+
+(defmethod lower-form ((head (eql 'cond)) args env)
+  ;; (cond [c1 b1] [c2 b2] [else b]) — each arm parses as (c b).
+  ;; Expand to nested if.
+  (let ((arms args))
+    (lower (cond-expand arms) env)))
+
+(defun cond-expand (arms)
+  (cond
+    ((null arms) 0)
+    ((let ((c (first (first arms))))
+       (or (eq c (intern "ELSE" :sysp-ir))
+           (eq c 'else)))
+     (second (first arms)))
+    (t `(if ,(first (first arms))
+            ,(second (first arms))
+            ,(cond-expand (rest arms))))))
+
+(defmethod lower-form ((head (eql 'and)) args env)
+  (cond
+    ((null args)         (lower 1 env))
+    ((null (rest args))  (lower (first args) env))
+    (t (lower `(if ,(first args)
+                   (and ,@(rest args))
+                   0)
+              env))))
+
+(defmethod lower-form ((head (eql 'or)) args env)
+  (cond
+    ((null args)         (lower 0 env))
+    ((null (rest args))  (lower (first args) env))
+    (t (let ((tmp (gensym "ORTMP")))
+         (lower `(let ((,tmp ,(first args)))
+                   (if ,tmp ,tmp (or ,@(rest args))))
+                env)))))
+
+(defmethod lower-form ((head (eql 'not)) args env)
+  (lower `(if ,(first args) 0 1) env))
+
+;;; --- array sugar: alias to ptr ops ---
+
+(defmethod lower-form ((head (eql 'nth)) args env)
+  (lower `(ptr-ref ,(first args) ,(second args)) env))
+
+(defmethod lower-form ((head (eql 'array-set!)) args env)
+  (lower `(ptr-set-at! ,(first args) ,(second args) ,(third args)) env))
 
 (defmethod lower-form ((head (eql 'while)) args env)
   ;; (while cond body...) — body is a sequence; while returns unit.

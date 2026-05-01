@@ -35,8 +35,11 @@
       ((equal r1 r2) t)
       ((tvar-p r1) (setf (gethash (second r1) *subst*) r2))
       ((tvar-p r2) (setf (gethash (second r2) *subst*) r1))
-      ;; int-to-int: silently accept; C narrowing/promotion handles it.
-      ((and (int-type-p r1) (int-type-p r2)) t)
+      ;; numeric ↔ numeric: silently accept; C handles all width/float
+      ;; promotions and narrowing implicitly.
+      ((and (numeric-type-p r1) (numeric-type-p r2)) t)
+      ;; :unit unifies with anything — value is discarded at C level.
+      ((or (eq r1 :unit) (eq r2 :unit)) t)
       ((and (consp r1) (consp r2)
             (eq (first r1) :fn) (eq (first r2) :fn))
        (unless (= (length (second r1)) (length (second r2)))
@@ -50,20 +53,25 @@
 (defun infer (e env)
   (cond
     ((integerp e) :int)
+    ((floatp e)   :float)
     ((stringp e)  :string)
     ((eq e t)     :bool)
     ((null e)     :bool)
     ((symbolp e)
      (let ((b (assoc e env)))
-       (unless b (error "infer: unbound symbol ~A" e))
-       (cdr b)))
+       (cond
+         (b (cdr b))
+         ((gethash e *globals*) (first (gethash e *globals*)))
+         (t (error "infer: unbound symbol ~A" e)))))
     ((consp e) (infer-form (car e) (cdr e) env))
     (t (error "infer: cannot type ~A" e))))
 
 (defgeneric infer-form (head args env))
 
-(defparameter *int-types* '(:int :u8 :u16 :u32 :u64 :i8 :i16 :i32 :i64 :size))
+(defparameter *int-types* '(:int :bool :u8 :u16 :u32 :u64 :i8 :i16 :i32 :i64 :size))
 (defun int-type-p (ty) (member (if (consp ty) ty ty) *int-types*))
+(defun float-type-p (ty) (member ty '(:float :double)))
+(defun numeric-type-p (ty) (or (int-type-p ty) (float-type-p ty)))
 
 (defmethod infer-form ((head (eql '+)) args env) (infer-int-arith args env))
 (defmethod infer-form ((head (eql '-)) args env) (infer-int-arith args env))
@@ -99,6 +107,13 @@
   (unify (infer (first args) env) (infer (second args) env))
   :bool)
 
+(defun ensure-numeric-typed (a env)
+  (let ((ty (resolve-type (infer a env))))
+    (cond
+      ((numeric-type-p ty) ty)
+      ((tvar-p ty) (unify ty :int) :int)
+      (t (error "expected number, got ~A" ty)))))
+
 (defun ensure-int-typed (a env)
   (let ((ty (resolve-type (infer a env))))
     (cond
@@ -107,14 +122,15 @@
       (t (error "expected int type, got ~A" ty)))))
 
 (defun infer-int-arith (args env)
-  "Each arg must be an int type; result widens to :int (C semantics handle
-   narrowing on assign). For homogeneous u8 args we still report :int — the
-   user can cast back if needed; matches old sysp idiom."
-  (dolist (a args) (ensure-int-typed a env))
-  :int)
+  "Args may be any number; result is :float if any arg is float, else :int."
+  (let ((any-float nil))
+    (dolist (a args)
+      (let ((ty (ensure-numeric-typed a env)))
+        (when (float-type-p ty) (setf any-float t))))
+    (if any-float :float :int)))
 
 (defun infer-int-cmp (args env)
-  (dolist (a args) (ensure-int-typed a env))
+  (dolist (a args) (ensure-numeric-typed a env))
   :bool)
 
 (defmethod infer-form ((head (eql 'string-concat)) args env)
@@ -216,6 +232,45 @@
   (infer (first args) env)
   :unit)
 
+;;; --- sugar passes (mirror lower's macros so types resolve) ---
+
+(defmethod infer-form ((head (eql 'for)) args env)
+  (let* ((spec (first args))
+         (var (first spec)) (lo (second spec)) (hi (third spec))
+         (body (rest args)))
+    (infer `(let ((,var ,lo))
+              (while (< ,var ,hi)
+                ,@body
+                (set! ,var (+ ,var 1))))
+           env)))
+
+(defmethod infer-form ((head (eql 'cond)) args env)
+  (infer (cond-expand args) env))
+
+(defmethod infer-form ((head (eql 'and)) args env)
+  (cond
+    ((null args)        :int)
+    ((null (rest args)) (infer (first args) env))
+    (t (infer `(if ,(first args) (and ,@(rest args)) 0) env))))
+
+(defmethod infer-form ((head (eql 'or)) args env)
+  (cond
+    ((null args)        :int)
+    ((null (rest args)) (infer (first args) env))
+    (t (let ((tmp (gensym "ORTMP")))
+         (infer `(let ((,tmp ,(first args)))
+                   (if ,tmp ,tmp (or ,@(rest args))))
+                env)))))
+
+(defmethod infer-form ((head (eql 'not)) args env)
+  (infer `(if ,(first args) 0 1) env))
+
+(defmethod infer-form ((head (eql 'nth)) args env)
+  (infer `(ptr-ref ,(first args) ,(second args)) env))
+
+(defmethod infer-form ((head (eql 'array-set!)) args env)
+  (infer `(ptr-set-at! ,(first args) ,(second args) ,(third args)) env))
+
 (defmethod infer-form ((head (eql 'while)) args env)
   (unify (infer (first args) env) :bool)
   (dolist (b (rest args)) (infer b env))
@@ -288,6 +343,7 @@
     ((keywordp x)
      (or (member x '(:int :bool :unit :string :cstr :size
                      :u8 :u16 :u32 :u64 :i8 :i16 :i32 :i64
+                     :float :double
                      :ptr-void))
          (let ((s (symbol-name x)))
            (and (> (length s) 4) (string= s "PTR-" :end1 4)))

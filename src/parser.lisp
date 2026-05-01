@@ -76,19 +76,55 @@
           (t nil))
       (error () nil))))
 
+(defun split-on-dot (s)
+  (loop with parts = nil
+        with start = 0
+        for i from 0 below (length s)
+        when (char= (char s i) #\.) do
+          (push (subseq s start i) parts)
+          (setf start (1+ i))
+        finally (push (subseq s start) parts)
+                (return (nreverse parts))))
+
+(defun dotted-access-p (s)
+  "True if s looks like obj.field or obj.field1.field2 (each part starts
+   alpha). Excludes numbers like 1.5 since they fail the leading-alpha test."
+  (let ((parts (split-on-dot s)))
+    (and (> (length parts) 1)
+         (every (lambda (p)
+                  (and (> (length p) 0) (alpha-char-p (char p 0))))
+                parts))))
+
+(defun build-dotted (parts)
+  (let ((expr (intern (maybe-upcase (first parts)))))
+    (dolist (p (rest parts) expr)
+      (setf expr (list (intern "GET-FIELD")
+                       expr
+                       (intern (maybe-upcase p)))))))
+
+(defun mixed-case-p (s)
+  "True if s contains BOTH a lowercase and an uppercase letter — heuristic
+   for CamelCase identifiers that should preserve case (e.g., raylib's
+   Vector2, Color). Plain 'defn' / 'foo-bar' upcases like CL reader."
+  (and (some #'upper-case-p s) (some #'lower-case-p s)))
+
+(defun maybe-upcase (s)
+  (if (mixed-case-p s) s (string-upcase s)))
+
 (defun parse-atom (s)
   ;; Match CL reader convention: identifiers (symbols + keywords) are
-  ;; case-folded to upper. Numbers are case-insensitive but kept literal.
-  ;; Use vertical bars in the future if case-preservation is wanted.
+  ;; case-folded to upper. CamelCase identifiers (mixed case) preserved
+  ;; so C interop names like Vector2 stay readable.
   (cond
     ((zerop (length s)) (error "sysp: empty atom"))
-    ;; Try number first (handles negative leading sign too).
     ((try-parse-number s))
     ((string-equal s "t")   cl:t)
     ((string-equal s "nil") cl:nil)
     ((char= (char s 0) #\:)
-     (intern (string-upcase (subseq s 1)) :keyword))
-    (t (intern (string-upcase s)))))
+     (intern (maybe-upcase (subseq s 1)) :keyword))
+    ((dotted-access-p s)
+     (build-dotted (split-on-dot s)))
+    (t (intern (maybe-upcase s)))))
 
 ;;; --- string literal ---
 

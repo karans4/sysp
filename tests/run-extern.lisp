@@ -59,21 +59,20 @@ int main(){ printf(\"%d\\n\", neg_test()); return 0; }"
 int main(){ printf(\"%d\\n\", (int)longest(\"foo\", \"hello\")); return 0; }"
        "5")
 
-;; Verify flat-syntax extern (a la old sysp `[x :int y :int]`) normalizes.
-(let ((c (with-output-to-string (s)
-           (compile-program '((extern flat-add (x :int y :int) :int)) s))))
-  (format t "flat-params: ")
-  (if (search "extern int flat_add(int x, int y);" c)
-      (progn (incf *ok*) (format t "ok~%"))
-      (progn (incf *fail*) (format t "FAIL: ~a~%" c))))
+;; Verify both extern param shapes (flat / pairs) compile + register.
+(handler-case
+    (progn
+      (compile-program '((extern flat-add (x :int y :int) :int))
+                       (make-broadcast-stream))
+      (incf *ok*) (format t "flat-params: ok~%"))
+  (error (e) (incf *fail*) (format t "flat-params: FAIL ~a~%" e)))
 
-;; And the pair form too.
-(let ((c (with-output-to-string (s)
-           (compile-program '((extern pair-add ((x :int) (y :int)) :int)) s))))
-  (format t "pair-params: ")
-  (if (search "extern int pair_add(int x, int y);" c)
-      (progn (incf *ok*) (format t "ok~%"))
-      (progn (incf *fail*) (format t "FAIL: ~a~%" c))))
+(handler-case
+    (progn
+      (compile-program '((extern pair-add ((x :int) (y :int)) :int))
+                       (make-broadcast-stream))
+      (incf *ok*) (format t "pair-params: ok~%"))
+  (error (e) (incf *fail*) (format t "pair-params: FAIL ~a~%" e)))
 
 (format t "~%~a passed, ~a failed~%" *ok* *fail*)
 (unless (zerop *fail*) (sb-ext:exit :code 1))

@@ -20,6 +20,8 @@
     ((eq ty :i32)    "int32_t")
     ((eq ty :i64)    "int64_t")
     ((eq ty :size)   "size_t")
+    ((eq ty :float)  "float")
+    ((eq ty :double) "double")
     ((eq ty :ptr-void) "void*")
     ;; :ptr-T → "T*"
     ((and (keywordp ty)
@@ -45,7 +47,13 @@
         (t (write-char ch out))))))
 
 (defun c-name (s)
-  (let ((str (string-downcase (symbol-name s))))
+  ;; Preserve case if the symbol name is mixed-case (CamelCase from parser
+  ;; preservation). Otherwise downcase like CL convention. Hyphens always
+  ;; become underscores.
+  (let* ((name (symbol-name s))
+         (mixed (and (some #'upper-case-p name)
+                     (some #'lower-case-p name)))
+         (str (if mixed name (string-downcase name))))
     (substitute #\_ #\- str)))
 
 ;;; --- emitter state ---
@@ -128,21 +136,27 @@
              (format out "~a ~a" (c-type (second p)) (c-name (first p))))
     (format out ") {~%")
     ;; Pre-declare block-params (phi sinks; assigned from each :jump source).
+    ;; Skip :unit (would emit 'void name;' which is invalid).
     (dolist (b (ir-fn-blocks fn))
       (dolist (p (ir-block-params b))
-        (format out "  ~a ~a;~%" (c-type (second p)) (c-name (first p)))))
+        (unless (eq (second p) :unit)
+          (format out "  ~a ~a;~%" (c-type (second p)) (c-name (first p))))))
     (emit-structured (gethash 'entry *block-by-name*) nil out)
     (format out "}~%")))
 
 ;;; --- structured emit: walk CFG as if/else/while ---
 
 (defun emit-structured (blk until out)
-  "Emit blk's instrs then walk its terminator. Stop when blk == until."
+  "Emit blk's instrs then walk its terminator. Stop when blk == until.
+   Special case for :loop: don't emit the header's instrs here — the loop
+   re-emits them inside its body so the cond re-evaluates each iteration."
   (when (and blk (not (eq (ir-block-name blk) until)))
-    (dolist (i (ir-block-instrs blk))
-      (unless (and (ir-instr-dst i) (gethash (ir-instr-dst i) *inlinable*))
-        (emit-c-instr-indented i out)))
-    (emit-c-term-structured blk (ir-block-term blk) until out)))
+    (let ((term (ir-block-term blk)))
+      (unless (eq (first term) :loop)
+        (dolist (i (ir-block-instrs blk))
+          (unless (and (ir-instr-dst i) (gethash (ir-instr-dst i) *inlinable*))
+            (emit-c-instr-indented i out))))
+      (emit-c-term-structured blk term until out))))
 
 (defun emit-c-term-structured (blk term until out)
   (case (first term)
@@ -151,10 +165,19 @@
     (:ret-unit (ind out) (format out "return;~%"))
     (:loop     (let ((c (second term))
                      (body-blk (third term))
-                     (exit-blk (fourth term)))
+                     (exit-blk (fourth term))
+                     (header-instrs (ir-block-instrs blk)))
                  (ind out)
-                 (format out "while (~a) {~%" (nameref c))
+                 (format out "for (;;) {~%")
                  (let ((*indent* (1+ *indent*)))
+                   ;; Re-evaluate cond each iteration: emit the header's
+                   ;; instrs INSIDE the loop, then check.
+                   (dolist (i header-instrs)
+                     (unless (and (ir-instr-dst i)
+                                  (gethash (ir-instr-dst i) *inlinable*))
+                       (emit-c-instr-indented i out)))
+                   (ind out)
+                   (format out "if (!(~a)) break;~%" (nameref c))
                    (emit-structured (gethash body-blk *block-by-name*)
                                     (ir-block-name blk) out))
                  (ind out) (format out "}~%")
@@ -164,8 +187,9 @@
                       (dest (gethash dest-name *block-by-name*)))
                  (loop for p in (ir-block-params dest)
                        for a in args do
-                       (ind out)
-                       (format out "~a = ~a;~%" (c-name (first p)) (nameref a)))
+                       (unless (eq (second p) :unit)
+                         (ind out)
+                         (format out "~a = ~a;~%" (c-name (first p)) (nameref a))))
                  (unless (eq dest-name until)
                    (emit-structured dest until out))))
     (:br       (let ((c (second term))

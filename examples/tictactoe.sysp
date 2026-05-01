@@ -1,0 +1,159 @@
+; Tic Tac Toe in sysp-ir, calling raylib directly.
+; Click cells to play. Click again on game-over screen to reset.
+
+(use "examples/raylib.sysp")
+(include "<stdint.h>")
+
+(enum Square (EMPTY 0) (X-PIECE 1) (O-PIECE 2))
+(enum State  (PLAYING 0) (WON 1) (DRAW 2))
+(enum Player (PLAYER-X 1) (PLAYER-O 2))
+
+(define WINDOW-SIZE 600)
+(define CELL-SIZE   200)
+(define LINE-THICK  4)
+(define PAD         30)
+
+;; ----- Board helpers (board is malloc'd 9-byte array) -----
+
+(defn make-board () :ptr-u8
+  (let ((p (cast :ptr-u8 (malloc (cast :size 9)))))
+    (for (i 0 9) (ptr-set-at! p i 0))
+    p))
+
+(defn board-line ((b :ptr-u8) (i :int) (j :int) (k :int)) :int
+  (let ((a (ptr-ref b i)))
+    (if (and (!= a 0) (= a (ptr-ref b j)) (= a (ptr-ref b k)))
+        (cast :int a)
+        0)))
+
+(defn check-winner ((b :ptr-u8)) :int
+  (for (r 0 3)
+    (let ((wr (board-line b (* r 3) (+ (* r 3) 1) (+ (* r 3) 2))))
+      (when (!= wr 0) (return wr))))
+  (for (c 0 3)
+    (let ((wc (board-line b c (+ c 3) (+ c 6))))
+      (when (!= wc 0) (return wc))))
+  (let ((wd1 (board-line b 0 4 8))) (when (!= wd1 0) (return wd1)))
+  (let ((wd2 (board-line b 2 4 6))) (when (!= wd2 0) (return wd2)))
+  0)
+
+(defn board-full ((b :ptr-u8)) :int
+  (for (i 0 9)
+    (when (= (ptr-ref b i) 0) (return 0)))
+  1)
+
+;; ----- Drawing -----
+
+(defn draw-x ((col :int) (row :int) (c :Color)) :unit
+  (let ((x1 (+ (* col CELL-SIZE) PAD))
+        (y1 (+ (* row CELL-SIZE) PAD))
+        (x2 (- (* (+ col 1) CELL-SIZE) PAD))
+        (y2 (- (* (+ row 1) CELL-SIZE) PAD)))
+    (DrawLineEx (Vector2 (cast :float x1) (cast :float y1))
+                (Vector2 (cast :float x2) (cast :float y2))
+                (cast :float LINE-THICK) c)
+    (DrawLineEx (Vector2 (cast :float x2) (cast :float y1))
+                (Vector2 (cast :float x1) (cast :float y2))
+                (cast :float LINE-THICK) c)))
+
+(defn draw-o ((col :int) (row :int) (c :Color)) :unit
+  (let ((cx     (+ (* col CELL-SIZE) (/ CELL-SIZE 2)))
+        (cy     (+ (* row CELL-SIZE) (/ CELL-SIZE 2)))
+        (radius (- (/ CELL-SIZE 2) PAD))
+        (half   (/ LINE-THICK 2)))
+    (DrawRing (Vector2 (cast :float cx) (cast :float cy))
+              (cast :float (- radius half))
+              (cast :float (+ radius half))
+              0.0 360.0 36 c)))
+
+(defn draw-grid ((c :Color)) :unit
+  (let ((c1 CELL-SIZE) (c2 (* CELL-SIZE 2)))
+    (DrawLineEx (Vector2 (cast :float c1) 0.0)
+                (Vector2 (cast :float c1) (cast :float WINDOW-SIZE))
+                (cast :float LINE-THICK) c)
+    (DrawLineEx (Vector2 (cast :float c2) 0.0)
+                (Vector2 (cast :float c2) (cast :float WINDOW-SIZE))
+                (cast :float LINE-THICK) c)
+    (DrawLineEx (Vector2 0.0 (cast :float c1))
+                (Vector2 (cast :float WINDOW-SIZE) (cast :float c1))
+                (cast :float LINE-THICK) c)
+    (DrawLineEx (Vector2 0.0 (cast :float c2))
+                (Vector2 (cast :float WINDOW-SIZE) (cast :float c2))
+                (cast :float LINE-THICK) c)))
+
+(defn draw-pieces ((board :ptr-u8) (red :Color) (blue :Color)) :unit
+  (for (i 0 9)
+    (let ((col (% i 3))
+          (row (/ i 3))
+          (p   (ptr-ref board i)))
+      (cond
+        ((= p X-PIECE) (draw-x col row red))
+        ((= p O-PIECE) (draw-o col row blue))))))
+
+;; ----- Main -----
+
+(defn main () :int
+  (SetConfigFlags (cast :u32 FLAG-MSAA-4X))
+  (InitWindow WINDOW-SIZE WINDOW-SIZE (cstr "sysp-ir — Tic Tac Toe"))
+  (SetTargetFPS 60)
+
+  (let ((board   (make-board))
+        (turn    PLAYER-X)
+        (state   PLAYING)
+        (winner  EMPTY)
+        (white   (Color 245 245 245 255))
+        (dark-bg (Color 0 0 0 255))
+        (red     (Color 230 41 55 255))
+        (blue    (Color 0 121 241 255))
+        (overlay (Color 0 0 0 200)))
+
+    (while (= (WindowShouldClose) 0)
+      ;; Input
+      (when (= state PLAYING)
+        (when (!= (IsMouseButtonPressed MOUSE-LEFT) 0)
+          (let ((mouse (GetMousePosition)))
+            (let ((col (cast :int (/ mouse.x (cast :float CELL-SIZE))))
+                  (row (cast :int (/ mouse.y (cast :float CELL-SIZE)))))
+              (when (and (>= col 0) (< col 3) (>= row 0) (< row 3))
+                (let ((idx (+ (* row 3) col)))
+                  (when (= (ptr-ref board idx) 0)
+                    (ptr-set-at! board idx (cast :u8 turn))
+                    (set! winner (check-winner board))
+                    (cond
+                      ((!= winner 0)             (set! state WON))
+                      ((!= (board-full board) 0) (set! state DRAW))
+                      (else (set! turn (if (= turn PLAYER-X) PLAYER-O PLAYER-X)))))))))))
+
+      ;; Game-over click resets.
+      (when (!= state PLAYING)
+        (when (!= (IsMouseButtonPressed MOUSE-LEFT) 0)
+          (for (i 0 9) (ptr-set-at! board i 0))
+          (set! turn PLAYER-X)
+          (set! state PLAYING)
+          (set! winner 0)))
+
+      ;; Draw
+      (BeginDrawing)
+      (ClearBackground dark-bg)
+      (draw-grid white)
+      (draw-pieces board red blue)
+
+      (when (= state PLAYING)
+        (cond
+          ((= turn PLAYER-X) (DrawText (cstr "X's turn") 10 570 20 red))
+          (else              (DrawText (cstr "O's turn") 10 570 20 blue))))
+
+      (when (!= state PLAYING)
+        (DrawRectangle 0 0 WINDOW-SIZE WINDOW-SIZE overlay)
+        (cond
+          ((= winner X-PIECE) (DrawText (cstr "X Wins!") 180 250 60 red))
+          ((= winner O-PIECE) (DrawText (cstr "O Wins!") 180 250 60 blue))
+          (else               (DrawText (cstr "Draw!")   210 250 60 white)))
+        (DrawText (cstr "Click to play again") 150 350 30 white))
+
+      (EndDrawing))
+
+    (free (cast :ptr-void board)))
+
+  (CloseWindow)
+  0)

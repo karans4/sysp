@@ -15,6 +15,9 @@
 ;;; Struct registry: name (symbol) → list of (field-name field-type) pairs.
 (defvar *struct-fields* (make-hash-table))
 
+;;; Top-level constants: name → (type literal-value).
+(defvar *globals* (make-hash-table))
+
 (defun struct-name-p (sym)
   (and (symbolp sym) (gethash sym *struct-fields*)))
 
