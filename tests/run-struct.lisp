@@ -43,13 +43,12 @@
 (check "mutate-via-ptr"
        '((defstruct CELL ((v :int)))
          (defn bump ((c :ptr-CELL)) :unit
-            (set-field! (deref c) v (+ (get-field (deref c) v) 1))))
+            (set-field! c v (+ (get-field c v) 1))))
        "int main(){
   CELL c = (CELL){10};
-  /* sysp's set-field on (deref c) won't write back through ptr in C.
-     Test the C output compiles cleanly. */
+  bump(&c); bump(&c); bump(&c);
   printf(\"%d\\n\", c.v); return 0; }"
-       "10")
+       "13")
 
 ;; The 6502-flavored test: build a register file struct, read fields
 (check "cpu-style"

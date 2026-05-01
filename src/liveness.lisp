@@ -23,9 +23,10 @@
     (:ptr-set   (ir-instr-args i))
     (:ptr-set-at (ir-instr-args i))
     (:struct-init (rest (ir-instr-args i)))   ; first arg is struct name (literal)
-    (:field-get   (list (first (ir-instr-args i))))   ; reads obj only
-    (:field-set   (list (first (ir-instr-args i))     ; obj
-                        (third (ir-instr-args i))))))   ; val
+    (:field-get     (list (first (ir-instr-args i))))
+    (:field-set     (list (first (ir-instr-args i)) (third (ir-instr-args i))))
+    (:field-get-ptr (list (first (ir-instr-args i))))
+    (:field-set-ptr (list (first (ir-instr-args i)) (third (ir-instr-args i))))))
 
 (defun term-uses (term)
   "Variables the terminator reads (including transferred-out)."

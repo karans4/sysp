@@ -197,8 +197,11 @@
 
 (defun parse-file (path)
   (with-open-file (s path :direction :input)
-    (let ((src (make-string (file-length s))))
-      (read-sequence src s)
+    (let ((src (with-output-to-string (out)
+                 (let ((buf (make-array 4096 :element-type 'character)))
+                   (loop for n = (read-sequence buf s)
+                         while (> n 0)
+                         do (write-sequence buf out :end n))))))
       (parse-string src (namestring path)))))
 
 ;;; --- source-aware errors ---

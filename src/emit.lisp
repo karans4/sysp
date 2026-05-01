@@ -260,4 +260,13 @@
                     (format out "~a.~a = ~a;~%"
                             (nameref (first args))
                             (string-downcase (symbol-name (second args)))
-                            (nameref (third args))))))))
+                            (nameref (third args)))))
+      (:field-get-ptr (let ((args (ir-instr-args i)))
+                        (format out "~a ~a = ~a->~a;~%"
+                                ty dst (nameref (first args))
+                                (string-downcase (symbol-name (second args))))))
+      (:field-set-ptr (let ((args (ir-instr-args i)))
+                        (format out "~a->~a = ~a;~%"
+                                (nameref (first args))
+                                (string-downcase (symbol-name (second args)))
+                                (nameref (third args))))))))

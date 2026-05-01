@@ -221,20 +221,35 @@
   (dolist (b (rest args)) (infer b env))
   :unit)
 
+(defun resolve-struct-or-ptr (obj-ty)
+  "Strip one level of pointer if present and the inner is a struct.
+   Returns the struct type."
+  (cond
+    ((struct-type-p obj-ty) obj-ty)
+    ((and (keywordp obj-ty)
+          (let ((s (symbol-name obj-ty)))
+            (and (> (length s) 4) (string-equal s "PTR-" :end1 4))))
+     (let ((inner (intern (subseq (symbol-name obj-ty) 4) :keyword)))
+       (when (struct-type-p inner) inner)))))
+
 (defmethod infer-form ((head (eql 'get-field)) args env)
   (let* ((obj-ty (resolve-type (infer (first args) env)))
-         (field-sym (second args)))
-    (unless (struct-type-p obj-ty)
-      (error "get-field: ~A is not a struct, got ~A" (first args) obj-ty))
-    (struct-field-type obj-ty field-sym)))
+         (field-sym (second args))
+         (struct-ty (resolve-struct-or-ptr obj-ty)))
+    (unless struct-ty
+      (error "get-field: ~A is not a struct or struct pointer, got ~A"
+             (first args) obj-ty))
+    (struct-field-type struct-ty field-sym)))
 
 (defmethod infer-form ((head (eql 'set-field!)) args env)
   (let* ((obj-ty (resolve-type (infer (first args) env)))
          (field-sym (second args))
-         (val-ty (infer (third args) env)))
-    (unless (struct-type-p obj-ty)
-      (error "set-field!: ~A is not a struct, got ~A" (first args) obj-ty))
-    (let ((field-ty (struct-field-type obj-ty field-sym)))
+         (val-ty (infer (third args) env))
+         (struct-ty (resolve-struct-or-ptr obj-ty)))
+    (unless struct-ty
+      (error "set-field!: ~A is not a struct or struct pointer, got ~A"
+             (first args) obj-ty))
+    (let ((field-ty (struct-field-type struct-ty field-sym)))
       (unify field-ty val-ty)
       :unit)))
 

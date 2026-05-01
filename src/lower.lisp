@@ -286,23 +286,41 @@
             (start-block join-blk (list (list result tty)))
             (values result tty)))))))
 
+(defun struct-or-ptr-target (ty)
+  "If ty is a struct or pointer-to-struct, return (values struct-ty is-ptr-p).
+   Else error."
+  (cond
+    ((struct-type-p ty) (values ty nil))
+    ((and (keywordp ty)
+          (let ((s (symbol-name ty)))
+            (and (> (length s) 4) (string-equal s "PTR-" :end1 4))))
+     (let ((inner (intern (subseq (symbol-name ty) 4) :keyword)))
+       (if (struct-type-p inner)
+           (values inner t)
+           (error "field access on non-struct pointer ~A" ty))))
+    (t (error "field access on non-struct type ~A" ty))))
+
 (defmethod lower-form ((head (eql 'get-field)) args env)
   (multiple-value-bind (obj-name obj-ty) (lower (first args) env)
-    (let* ((field-sym (second args))
-           (field-ty (struct-field-type obj-ty field-sym))
-           (d (fresh-tmp)))
-      (emit (make-ir-instr :dst d :type field-ty :op :field-get
-                           :args (list obj-name field-sym)))
-      (values d field-ty))))
+    (multiple-value-bind (struct-ty is-ptr) (struct-or-ptr-target obj-ty)
+      (let* ((field-sym (second args))
+             (field-ty (struct-field-type struct-ty field-sym))
+             (d (fresh-tmp)))
+        (emit (make-ir-instr :dst d :type field-ty
+                             :op (if is-ptr :field-get-ptr :field-get)
+                             :args (list obj-name field-sym)))
+        (values d field-ty)))))
 
 (defmethod lower-form ((head (eql 'set-field!)) args env)
-  (multiple-value-bind (obj-name _obj-ty) (lower (first args) env)
-    (declare (ignore _obj-ty))
-    (multiple-value-bind (val-name _vt) (lower (third args) env) (declare (ignore _vt))
-      (let ((field-sym (second args)))
-        (emit (make-ir-instr :dst nil :type :unit :op :field-set
-                             :args (list obj-name field-sym val-name)))
-        (values nil :unit)))))
+  (multiple-value-bind (obj-name obj-ty) (lower (first args) env)
+    (multiple-value-bind (_struct-ty is-ptr) (struct-or-ptr-target obj-ty)
+      (declare (ignore _struct-ty))
+      (multiple-value-bind (val-name _vt) (lower (third args) env) (declare (ignore _vt))
+        (let ((field-sym (second args)))
+          (emit (make-ir-instr :dst nil :type :unit
+                               :op (if is-ptr :field-set-ptr :field-set)
+                               :args (list obj-name field-sym val-name)))
+          (values nil :unit))))))
 
 (defmethod lower-form (head args env)
   ;; default: struct constructor OR call to user/extern fn.

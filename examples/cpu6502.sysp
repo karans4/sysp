@@ -1,0 +1,37 @@
+; A tiny 6502-flavored register file + a few instruction handlers.
+; Demonstrates: defstruct with mixed-width fields, ptr-to-struct mutation,
+; bitwise arithmetic with masking, and naked-arg type inference.
+
+(include "<stdint.h>")
+
+(defstruct CPU
+  ((a      :u8)
+   (x      :u8)
+   (y      :u8)
+   (sp     :u8)
+   (pc     :int)
+   (status :u8)))
+
+;; LDA #imm - load immediate into A. Sets Z and N flags.
+(defn lda-imm ((cpu :ptr-CPU) (val :u8)) :unit
+  (set-field! cpu a val)
+  (set-field! cpu pc (+ (get-field cpu pc) 2)))
+
+;; INX - increment X (wrapping at 8 bits).
+(defn inx ((cpu :ptr-CPU)) :unit
+  (set-field! cpu x (band (+ (get-field cpu x) 1) 0xff))
+  (set-field! cpu pc (+ (get-field cpu pc) 1)))
+
+;; CLC - clear carry flag (bit 0 of status).
+(defn clc ((cpu :ptr-CPU)) :unit
+  (set-field! cpu status (band (get-field cpu status) 0xfe))
+  (set-field! cpu pc (+ (get-field cpu pc) 1)))
+
+;; SEC - set carry flag.
+(defn sec ((cpu :ptr-CPU)) :unit
+  (set-field! cpu status (bor (get-field cpu status) 0x01))
+  (set-field! cpu pc (+ (get-field cpu pc) 1)))
+
+;; Read carry flag (returns 0 or 1).
+(defn carry ((cpu :ptr-CPU)) :int
+  (band (get-field cpu status) 0x01))
