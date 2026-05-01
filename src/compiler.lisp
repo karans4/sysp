@@ -10,7 +10,7 @@
 
 (defstruct ir-fn   name params ret-type blocks)
 (defstruct ir-block name params instrs term)  ; term = (:ret v) | (:ret-unit) | (:br c then-blk else-blk then-args else-args) | (:jump blk args)
-(defstruct ir-instr dst type op args)         ; op ∈ :const :prim :copy :call :str-lit :release :retain
+(defstruct ir-instr dst type op args)         ; op ∈ :const :prim :copy :call :str-lit :release :retain :set
 
 ;; Reference-counted types. Extend as we add more.
 (defun ref-type-p (ty) (eq ty :string))
@@ -90,6 +90,32 @@
   (lower-rt-call 'sysp_str_len :int args env))
 (defmethod lower-form ((head (eql 'string-print)) args env)
   (lower-rt-call 'sysp_str_print :unit args env))
+
+(defmethod lower-form ((head (eql 'set!)) args env)
+  ;; (set! target expr) — re-assign an existing name. Currently int-only.
+  (let ((target (first args)))
+    (multiple-value-bind (vn vty) (lower (second args) env)
+      (emit (make-ir-instr :dst nil :type vty :op :set
+                           :args (list target vn)))
+      (values target vty))))
+
+(defmethod lower-form ((head (eql 'while)) args env)
+  ;; (while cond body...) — body is a sequence; while returns unit.
+  (let* ((cond-expr (first args))
+         (body-forms (rest args))
+         (header-blk (fresh-blk "WHILE"))
+         (body-blk   (fresh-blk "BODY"))
+         (exit-blk   (fresh-blk "EXIT")))
+    (finish-block (list :jump header-blk nil))
+    (start-block header-blk nil)
+    (multiple-value-bind (cn _) (lower cond-expr env)
+      (declare (ignore _))
+      (finish-block (list :loop cn body-blk exit-blk)))
+    (start-block body-blk nil)
+    (dolist (s body-forms) (lower s env))
+    (finish-block (list :jump header-blk nil))
+    (start-block exit-blk nil)
+    (values nil :unit)))
 
 (defun lower-rt-call (cfn rty args env)
   (let ((arg-names nil))
@@ -198,13 +224,15 @@
     (:prim    (rest (ir-instr-args i)))
     (:call    (rest (ir-instr-args i)))
     (:release (ir-instr-args i))
-    (:retain  (ir-instr-args i))))
+    (:retain  (ir-instr-args i))
+    (:set     (list (second (ir-instr-args i))))))   ; src only, target is a write
 
 (defun term-uses (term)
   "Variables the terminator reads (including transferred-out)."
   (case (first term)
     (:ret  (list (second term)))
     (:br   (list (second term)))
+    (:loop (list (second term)))
     (:jump (third term))
     (t     nil)))
 
@@ -218,7 +246,8 @@
 
 (defun term-successors (term)
   (case (first term)
-    (:br   (list (third term) (fourth term)))   ; then-blk else-blk
+    (:br   (list (third term) (fourth term)))
+    (:loop (list (third term) (fourth term)))    ; body-blk exit-blk
     (:jump (list (second term)))
     (t     nil)))
 
@@ -502,16 +531,21 @@
 (defun build-inlinable (fn)
   (let ((uc (count-uses fn))
         (m (make-hash-table))
-        (block-param-syms (make-hash-table)))
+        (block-param-syms (make-hash-table))
+        (set-targets (make-hash-table)))
     (dolist (b (ir-fn-blocks fn))
       (dolist (p (ir-block-params b))
-        (setf (gethash (first p) block-param-syms) t)))
+        (setf (gethash (first p) block-param-syms) t))
+      (dolist (i (ir-block-instrs b))
+        (when (eq (ir-instr-op i) :set)
+          (setf (gethash (first (ir-instr-args i)) set-targets) t))))
     (let ((*inlinable* m))
       (dolist (b (ir-fn-blocks fn))
         (dolist (i (ir-block-instrs b))
           (let ((dst (ir-instr-dst i)))
             (when (and dst
                        (not (gethash dst block-param-syms))
+                       (not (gethash dst set-targets))   ; mutable bindings stay declared
                        (= (gethash dst uc 0) 1))
               (case (ir-instr-op i)
                 (:const (setf (gethash dst m)
@@ -549,21 +583,28 @@
     (format out "}~%")))
 
 (defun emit-structured (blk until out)
-  "Emit blk's instrs then walk its terminator. Stop when blk == until.
-   :br produces structured if/else recursing into both arms up to the join.
-   :jump assigns block-params and recurses into the dest (unless dest == until)."
+  "Emit blk's instrs then walk its terminator. Stop when blk == until."
   (when (and blk (not (eq (ir-block-name blk) until)))
     (dolist (i (ir-block-instrs blk))
-      ;; Skip instrs that have been folded into their use sites.
       (unless (and (ir-instr-dst i) (gethash (ir-instr-dst i) *inlinable*))
         (emit-c-instr-indented i out)))
-    (emit-c-term-structured (ir-block-term blk) until out)))
+    (emit-c-term-structured blk (ir-block-term blk) until out)))
 
-(defun emit-c-term-structured (term until out)
+(defun emit-c-term-structured (blk term until out)
   (case (first term)
     (:ret      (ind out)
                (format out "return ~a;~%" (nameref (second term))))
     (:ret-unit (ind out) (format out "return;~%"))
+    (:loop     (let ((c (second term))
+                     (body-blk (third term))
+                     (exit-blk (fourth term)))
+                 (ind out)
+                 (format out "while (~a) {~%" (nameref c))
+                 (let ((*indent* (1+ *indent*)))
+                   (emit-structured (gethash body-blk *block-by-name*)
+                                    (ir-block-name blk) out))
+                 (ind out) (format out "}~%")
+                 (emit-structured (gethash exit-blk *block-by-name*) until out)))
     (:jump     (let* ((dest-name (second term))
                       (args (third term))
                       (dest (gethash dest-name *block-by-name*)))
@@ -618,7 +659,11 @@
       (:release (format out "sysp_str_release(~a);~%"
                         (c-name (first (ir-instr-args i)))))
       (:retain  (format out "sysp_str_retain(~a);~%"
-                        (c-name (first (ir-instr-args i))))))))
+                        (c-name (first (ir-instr-args i)))))
+      (:set     (let ((args (ir-instr-args i)))
+                  (format out "~a = ~a;~%"
+                          (c-name (first args))
+                          (nameref (second args))))))))
 
 (defun compile-and-emit (form &optional (out t))
   (emit-c-fn (compile-defn form) out))
