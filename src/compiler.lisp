@@ -124,24 +124,22 @@
       (values last-n last-ty))))
 
 (defmethod lower-form ((head (eql 'if)) args env)
-  ;; (if c then else)
+  ;; (if c then else) — :br carries the join block name so the structured
+  ;; emitter can drive `if`/`else` directly without CFG analysis.
+  ;; :br shape: (:br cond then-blk else-blk join-blk then-deaths else-deaths)
   (destructuring-bind (c-expr t-expr e-expr) args
     (multiple-value-bind (cn _ct) (lower c-expr env) (declare (ignore _ct))
       (let* ((then-blk (fresh-blk "THEN"))
              (else-blk (fresh-blk "ELSE"))
              (join-blk (fresh-blk "JOIN"))
              (result   (fresh-tmp)))
-        ;; finish current with branch
-        (finish-block (list :br cn then-blk else-blk nil nil))
-        ;; then
+        (finish-block (list :br cn then-blk else-blk join-blk nil nil))
         (start-block then-blk nil)
         (multiple-value-bind (tn tty) (lower t-expr env)
           (finish-block (list :jump join-blk (list tn)))
-          ;; else
           (start-block else-blk nil)
           (multiple-value-bind (en _ety) (lower e-expr env) (declare (ignore _ety))
             (finish-block (list :jump join-blk (list en)))
-            ;; join
             (start-block join-blk (list (list result tty)))
             (values result tty)))))))
 
@@ -217,9 +215,15 @@
 
 (defun term-successors (term)
   (case (first term)
-    (:br   (list (third term) (fourth term)))
+    (:br   (list (third term) (fourth term)))   ; then-blk else-blk
     (:jump (list (second term)))
     (t     nil)))
+
+(defun br-then-blk (term) (third term))
+(defun br-else-blk (term) (fourth term))
+(defun br-join-blk (term) (fifth term))
+(defun br-then-deaths (term) (sixth term))
+(defun br-else-deaths (term) (seventh term))
 
 (defun build-type-map (fn)
   "All ref-typed bindings of the fn → type."
@@ -301,18 +305,16 @@
           (insert-releases-block b fn type-map
                                  (gethash bname live-in)
                                  (gethash bname live-out))))
-      ;; Edge-deaths for :br: vars in P's live-out not in successor's live-in.
-      ;; Stored in the :br term as (then-releases) (else-releases) tail.
       (dolist (b (ir-fn-blocks fn))
         (let ((term (ir-block-term b)))
           (when (eq (first term) :br)
-            (destructuring-bind (_ c tblk eblk &rest _rest) term
-              (declare (ignore _ _rest))
-              (let* ((lo (gethash (ir-block-name b) live-out))
-                     (then-deaths (set-difference lo (gethash tblk live-in)))
-                     (else-deaths (set-difference lo (gethash eblk live-in))))
-                (setf (ir-block-term b)
-                      (list :br c tblk eblk then-deaths else-deaths)))))))))
+            (let* ((c (second term)) (tblk (third term))
+                   (eblk (fourth term)) (jblk (fifth term))
+                   (lo (gethash (ir-block-name b) live-out))
+                   (then-deaths (set-difference lo (gethash tblk live-in)))
+                   (else-deaths (set-difference lo (gethash eblk live-in))))
+              (setf (ir-block-term b)
+                    (list :br c tblk eblk jblk then-deaths else-deaths))))))))
   fn)
 
 (defun insert-releases-block (blk fn type-map live-in live-out)
@@ -415,9 +417,13 @@
     (substitute #\_ #\- str)))
 
 (defvar *block-by-name*)
+(defvar *indent*)
+
+(defun ind (out) (loop repeat *indent* do (write-string "  " out)))
 
 (defun emit-c-fn (fn &optional (out t))
-  (let ((*block-by-name* (make-hash-table)))
+  (let ((*block-by-name* (make-hash-table))
+        (*indent* 1))
     (dolist (b (ir-fn-blocks fn))
       (setf (gethash (ir-block-name b) *block-by-name*) b))
     (format out "~a ~a(" (c-type (ir-fn-ret-type fn)) (c-name (ir-fn-name fn)))
@@ -425,62 +431,85 @@
           do (unless first (format out ", "))
              (format out "~a ~a" (c-type (second p)) (c-name (first p))))
     (format out ") {~%")
+    ;; Pre-declare all block-params (needed because block-params are assigned
+    ;; from each :jump source — equivalent to phi sinks).
     (dolist (b (ir-fn-blocks fn))
       (dolist (p (ir-block-params b))
         (format out "  ~a ~a;~%" (c-type (second p)) (c-name (first p)))))
-    (dolist (b (ir-fn-blocks fn))
-      (format out "~a:; ~%" (c-name (ir-block-name b)))
-      (dolist (i (ir-block-instrs b))
-        (emit-c-instr i out))
-      (emit-c-term (ir-block-term b) out))
+    ;; Structured emit starting at entry.
+    (emit-structured (gethash 'entry *block-by-name*) nil out)
     (format out "}~%")))
 
-(defun emit-c-instr (i out)
-  (let ((dst (c-name (ir-instr-dst i)))
+(defun emit-structured (blk until out)
+  "Emit blk's instrs then walk its terminator. Stop when blk == until.
+   :br produces structured if/else recursing into both arms up to the join.
+   :jump assigns block-params and recurses into the dest (unless dest == until)."
+  (when (and blk (not (eq (ir-block-name blk) until)))
+    (dolist (i (ir-block-instrs blk))
+      (emit-c-instr-indented i out))
+    (emit-c-term-structured (ir-block-term blk) until out)))
+
+(defun emit-c-term-structured (term until out)
+  (case (first term)
+    (:ret      (ind out)
+               (format out "return ~a;~%" (c-name (second term))))
+    (:ret-unit (ind out) (format out "return;~%"))
+    (:jump     (let* ((dest-name (second term))
+                      (args (third term))
+                      (dest (gethash dest-name *block-by-name*)))
+                 (loop for p in (ir-block-params dest)
+                       for a in args do
+                       (ind out)
+                       (format out "~a = ~a;~%" (c-name (first p)) (c-name a)))
+                 (unless (eq dest-name until)
+                   (emit-structured dest until out))))
+    (:br       (let ((c (second term))
+                     (tblk (br-then-blk term))
+                     (eblk (br-else-blk term))
+                     (jblk (br-join-blk term))
+                     (t-d  (br-then-deaths term))
+                     (e-d  (br-else-deaths term)))
+                 (ind out)
+                 (format out "if (~a) {~%" (c-name c))
+                 (let ((*indent* (1+ *indent*)))
+                   (dolist (v t-d)
+                     (ind out) (format out "sysp_str_release(~a);~%" (c-name v)))
+                   (emit-structured (gethash tblk *block-by-name*) jblk out))
+                 (ind out) (format out "} else {~%")
+                 (let ((*indent* (1+ *indent*)))
+                   (dolist (v e-d)
+                     (ind out) (format out "sysp_str_release(~a);~%" (c-name v)))
+                   (emit-structured (gethash eblk *block-by-name*) jblk out))
+                 (ind out) (format out "}~%")
+                 ;; Continue past the join.
+                 (emit-structured (gethash jblk *block-by-name*) until out)))))
+
+(defun emit-c-instr-indented (i out)
+  (ind out) (emit-c-instr-body i out))
+
+(defun emit-c-instr-body (i out)
+  (let ((dst (and (ir-instr-dst i) (c-name (ir-instr-dst i))))
         (ty (c-type (ir-instr-type i))))
     (case (ir-instr-op i)
-      (:const (format out "  ~a ~a = ~a;~%" ty dst (first (ir-instr-args i))))
-      (:copy  (format out "  ~a ~a = ~a;~%" ty dst (c-name (first (ir-instr-args i)))))
+      (:const (format out "~a ~a = ~a;~%" ty dst (first (ir-instr-args i))))
+      (:copy  (format out "~a ~a = ~a;~%" ty dst (c-name (first (ir-instr-args i)))))
       (:prim  (let ((a (ir-instr-args i)))
-                (format out "  ~a ~a = ~a ~a ~a;~%"
+                (format out "~a ~a = ~a ~a ~a;~%"
                         ty dst (c-name (second a)) (first a) (c-name (third a)))))
       (:call  (if (eq (ir-instr-type i) :unit)
-                  (format out "  ~a(~{~a~^, ~});~%"
+                  (format out "~a(~{~a~^, ~});~%"
                           (c-name (first (ir-instr-args i)))
                           (mapcar #'c-name (rest (ir-instr-args i))))
-                  (format out "  ~a ~a = ~a(~{~a~^, ~});~%"
+                  (format out "~a ~a = ~a(~{~a~^, ~});~%"
                           ty dst (c-name (first (ir-instr-args i)))
                           (mapcar #'c-name (rest (ir-instr-args i))))))
       (:str-lit (let ((s (first (ir-instr-args i))))
-                  (format out "  String ~a = sysp_str_lit(\"~a\", ~d);~%"
+                  (format out "String ~a = sysp_str_lit(\"~a\", ~d);~%"
                           dst (c-escape-string s) (length s))))
-      (:release (format out "  sysp_str_release(~a);~%"
+      (:release (format out "sysp_str_release(~a);~%"
                         (c-name (first (ir-instr-args i)))))
-      (:retain  (format out "  sysp_str_retain(~a);~%"
+      (:retain  (format out "sysp_str_retain(~a);~%"
                         (c-name (first (ir-instr-args i))))))))
-
-(defun emit-c-term (term out)
-  (case (first term)
-    (:ret      (format out "  return ~a;~%" (c-name (second term))))
-    (:ret-unit (format out "  return;~%"))
-    (:br       (destructuring-bind (_ c tblk eblk &optional t-deaths e-deaths) term
-                 (declare (ignore _))
-                 (format out "  if (~a) {~%" (c-name c))
-                 (dolist (v t-deaths)
-                   (format out "    sysp_str_release(~a);~%" (c-name v)))
-                 (format out "    goto ~a;~%  } else {~%" (c-name tblk))
-                 (dolist (v e-deaths)
-                   (format out "    sysp_str_release(~a);~%" (c-name v)))
-                 (format out "    goto ~a;~%  }~%" (c-name eblk))))
-    (:jump     (destructuring-bind (_ blk args) term
-                 (declare (ignore _))
-                 (let ((dest (gethash blk *block-by-name*)))
-                   (when dest
-                     (loop for p in (ir-block-params dest)
-                           for a in args
-                           do (format out "  ~a = ~a;~%"
-                                      (c-name (first p)) (c-name a)))))
-                 (format out "  goto ~a;~%" (c-name blk))))))
 
 (defun compile-and-emit (form &optional (out t))
   (emit-c-fn (compile-defn form) out))
