@@ -1,14 +1,14 @@
-; interp.sysp — the tree-walking interpreter for sysp's macro-expansion
-; subset and runtime eval.
+; interp.sysp — sysp-in-sysp interpreter.
 ;
-; Read-eval-print loop over s-expressions. Each form is either:
-;   - (defmacro name [params] body)   — register a macro, no output
-;   - (defn name [params] body)       — register an interp-only fn, no output
-;   - (anything else)                 — evaluate, print result
+; Read s-expressions from stdin, evaluate, print. Maintains a stateful
+; env so (defn) and (defmacro) persist across forms. Used at compile
+; time for macro expansion (compiler spawns this binary, sends macro
+; defs + calls) AND at runtime as an embeddable REPL.
 ;
-; The compile-time macro pipeline spawns this binary, sends it macro
-; defs, then sends macro-call forms one by one and reads back the
-; expanded forms from stdout.
+; The compile-time macro pipeline:
+;   compiler emits all (defmacro ...) and (defn ...) forms first, then
+;   one (macroname args...) form per macro use. Reads the expansion
+;   from stdout.
 
 (include "<stdio.h>")
 (include "<string.h>")
@@ -49,12 +49,17 @@
 (extern runtime_stdout () :ptr-void)
 (extern runtime_stderr () :ptr-void)
 
+(extern val_closure ((p :Value) (b :Value) (e :Value)) :Value)
+(extern closure_params ((v :Value)) :Value)
+(extern closure_body   ((v :Value)) :Value)
+(extern closure_env    ((v :Value)) :Value)
+
 (extern fputc  ((c :int) (f :ptr-void)) :int)
 (extern feof   ((f :ptr-void)) :int)
+(extern strcmp ((a :cstr) (b :cstr)) :int)
 
-; ---- env: assoc list of (sym-id . value) cons cells ----
+; ---- env operations (assoc list of (sym-id . value)) ----
 
-; (env-lookup env id) — find value for sym-id, or val-nil if not found.
 (defn env-lookup ((env :Value) (id :u32)) :Value
   (if (!= (is_nil env) 0)
       (val_nil)
@@ -63,105 +68,242 @@
             (val_cdr pair)
             (env-lookup (val_cdr env) id)))))
 
-; (env-bind env id val) — extend env with a new binding.
 (defn env-bind ((env :Value) (id :u32) (v :Value)) :Value
   (val_cons (val_cons (val_sym id) v) env))
 
-; ---- eval ----
-; Evaluate a form in env. Returns a Value (caller owns).
+; Bind a list of params to a list of arg-values, atop env.
+(defn bind-list ((params :Value) (args :Value) (env :Value)) :Value
+  (if (!= (is_nil params) 0)
+      env
+      (bind-list (val_cdr params)
+                 (val_cdr args)
+                 (env-bind env (val_sym_of (val_car params)) (val_car args)))))
 
-(defn eval-form ((form :Value) (env :Value)) :Value
-  (cond
-    ((!= (is_int form)  0) form)
-    ((!= (is_str form)  0) form)
-    ((!= (is_nil form)  0) form)
-    ((!= (is_sym form)  0)
-     (let ((found (env-lookup env (val_sym_of form))))
-       ;; If unbound, return the symbol as data (lets interp work as a
-       ;; "symbol-evaluator" for static defs; lookup resolves bindings).
-       (if (!= (is_nil found) 0)
-           form
-           found)))
-    ((!= (is_cons form) 0) (eval-call form env))
-    (else form)))
-
-; (eval-args args env) — eval each element of a list, return new list.
-(defn eval-args ((args :Value) (env :Value)) :Value
-  (if (!= (is_nil args) 0)
-      (val_nil)
-      (val_cons (eval-form (val_car args) env)
-                (eval-args (val_cdr args) env))))
-
-; ---- special forms + primitives ----
-; The eval-call dispatches on the head symbol's name.
-
-(defn eval-call ((form :Value) (env :Value)) :Value
-  (let ((head (val_car form))
-        (args (val_cdr form)))
-    (if (!= (is_sym head) 0)
-        (dispatch (val_sym_of head) args env form)
-        (val_nil))))
-
-; Primitive symbols are interned at startup so we compare by id.
-; For now, do a string comparison via sym_name + a runtime compare to
-; avoid having to thread a lazy-init through. Slow but simple.
-(extern strcmp ((a :cstr) (b :cstr)) :int)
+; ---- name comparison ----
 
 (defn name-is? ((id :u32) (s :cstr)) :int
   (= (strcmp (sym_name id) s) 0))
 
-(defn dispatch ((id :u32) (args :Value) (env :Value) (form :Value)) :Value
+; ---- macro env (separate from value env) ----
+; Macros stored as a list of (sym-id . closure-value).
+
+; ---- eval ----
+
+(defn eval-form ((form :Value) (env :Value) (mac :Value)) :Value
+  (cond
+    ((!= (is_int form) 0) form)
+    ((!= (is_str form) 0) form)
+    ((!= (is_nil form) 0) form)
+    ((!= (is_sym form) 0)
+     (let ((found (env-lookup env (val_sym_of form))))
+       (if (!= (is_nil found) 0) form found)))
+    ((!= (is_cons form) 0) (eval-call form env mac))
+    (else form)))
+
+(defn eval-args ((args :Value) (env :Value) (mac :Value)) :Value
+  (if (!= (is_nil args) 0)
+      (val_nil)
+      (val_cons (eval-form (val_car args) env mac)
+                (eval-args (val_cdr args) env mac))))
+
+(defn eval-call ((form :Value) (env :Value) (mac :Value)) :Value
+  (let ((head (val_car form))
+        (args (val_cdr form)))
+    (if (!= (is_sym head) 0)
+        (dispatch (val_sym_of head) args env mac form)
+        (apply-fn (eval-form head env mac)
+                  (eval-args args env mac)
+                  env mac))))
+
+(defn dispatch ((id :u32) (args :Value) (env :Value) (mac :Value) (form :Value)) :Value
   (cond
     ((!= (name-is? id (cstr "quote")) 0)
        (val_car args))
     ((!= (name-is? id (cstr "if")) 0)
-       (eval-if args env))
+       (eval-if args env mac))
+    ((!= (name-is? id (cstr "quasiquote")) 0)
+       (eval-qq (val_car args) env mac))
+    ((!= (name-is? id (cstr "let")) 0)
+       (eval-let args env mac))
+    ((!= (name-is? id (cstr "lambda")) 0)
+       (val_closure (val_car args) (val_cdr args) env))
     ((!= (name-is? id (cstr "+")) 0)
-       (val_int (+ (val_int_of (eval-form (val_car args) env))
-                   (val_int_of (eval-form (val_car (val_cdr args)) env)))))
+       (val_int (+ (val_int_of (eval-form (val_car args) env mac))
+                   (val_int_of (eval-form (val_car (val_cdr args)) env mac)))))
     ((!= (name-is? id (cstr "-")) 0)
-       (val_int (- (val_int_of (eval-form (val_car args) env))
-                   (val_int_of (eval-form (val_car (val_cdr args)) env)))))
+       (val_int (- (val_int_of (eval-form (val_car args) env mac))
+                   (val_int_of (eval-form (val_car (val_cdr args)) env mac)))))
     ((!= (name-is? id (cstr "*")) 0)
-       (val_int (* (val_int_of (eval-form (val_car args) env))
-                   (val_int_of (eval-form (val_car (val_cdr args)) env)))))
+       (val_int (* (val_int_of (eval-form (val_car args) env mac))
+                   (val_int_of (eval-form (val_car (val_cdr args)) env mac)))))
     ((!= (name-is? id (cstr "=")) 0)
-       (let ((a (eval-form (val_car args) env))
-             (b (eval-form (val_car (val_cdr args)) env)))
-         (val_int (val_eq a b))))
+       (val_int (val_eq (eval-form (val_car args) env mac)
+                        (eval-form (val_car (val_cdr args)) env mac))))
+    ((!= (name-is? id (cstr "<")) 0)
+       (val_int (if (< (val_int_of (eval-form (val_car args) env mac))
+                       (val_int_of (eval-form (val_car (val_cdr args)) env mac))) 1 0)))
+    ((!= (name-is? id (cstr ">")) 0)
+       (val_int (if (> (val_int_of (eval-form (val_car args) env mac))
+                       (val_int_of (eval-form (val_car (val_cdr args)) env mac))) 1 0)))
     ((!= (name-is? id (cstr "cons")) 0)
-       (val_cons (eval-form (val_car args) env)
-                 (eval-form (val_car (val_cdr args)) env)))
+       (val_cons (eval-form (val_car args) env mac)
+                 (eval-form (val_car (val_cdr args)) env mac)))
     ((!= (name-is? id (cstr "car")) 0)
-       (val_car (eval-form (val_car args) env)))
+       (val_car (eval-form (val_car args) env mac)))
     ((!= (name-is? id (cstr "cdr")) 0)
-       (val_cdr (eval-form (val_car args) env)))
+       (val_cdr (eval-form (val_car args) env mac)))
     ((!= (name-is? id (cstr "nil?")) 0)
-       (val_int (is_nil (eval-form (val_car args) env))))
+       (val_int (is_nil (eval-form (val_car args) env mac))))
+    ((!= (name-is? id (cstr "sym-eq?")) 0)
+       (val_int (sym_eq (eval-form (val_car args) env mac)
+                        (eval-form (val_car (val_cdr args)) env mac))))
+    ((!= (name-is? id (cstr "list")) 0)
+       (eval-args args env mac))
     ((!= (name-is? id (cstr "println")) 0)
-       (val_println (eval-form (val_car args) env))
+       (val_println (eval-form (val_car args) env mac))
        (val_nil))
     (else
-      ;; Unknown call: leave it as data. This makes interp behave like a
-      ;; partial-evaluator for unbound names, useful for macro output.
-      form)))
+      ;; Look up id as a user fn in env, or macro in mac. Apply if found.
+      (let ((mfn (env-lookup mac id)))
+        (if (= (is_nil mfn) 0)
+            ;; Macro: expand body with UNEVALUATED args, then eval result.
+            (let ((expanded (apply-fn mfn args env mac)))
+              (eval-form expanded env mac))
+            (let ((fn (env-lookup env id)))
+              (if (= (is_nil fn) 0)
+                  (apply-fn fn (eval-args args env mac) env mac)
+                  ;; Unbound — return form as data.
+                  form)))))))
 
-(defn eval-if ((args :Value) (env :Value)) :Value
-  (let ((c (eval-form (val_car args) env)))
-    (if (= (is_nil c) 1)
-        (eval-form (val_car (val_cdr (val_cdr args))) env)
-        (eval-form (val_car (val_cdr args)) env))))
+(defn is-falsy ((v :Value)) :int
+  (cond
+    ((!= (is_nil v) 0) 1)
+    ((!= (is_int v) 0) (if (= (val_int_of v) 0) 1 0))
+    (else 0)))
 
-; ---- main loop ----
+; ---- quasiquote ----
+
+(defn append-list ((a :Value) (b :Value)) :Value
+  (if (!= (is_nil a) 0)
+      b
+      (val_cons (val_car a) (append-list (val_cdr a) b))))
+
+(defn is-tagged? ((form :Value) (tag :cstr)) :int
+  (if (= (is_cons form) 0) 0
+      (let ((head (val_car form)))
+        (if (= (is_sym head) 0) 0
+            (name-is? (val_sym_of head) tag)))))
+
+(defn eval-qq ((form :Value) (env :Value) (mac :Value)) :Value
+  ;; Walk a quasiquote template, splicing in unquoted/spliced expressions.
+  (if (= (is_cons form) 0)
+      form
+      (if (!= (is-tagged? form (cstr "unquote")) 0)
+          (eval-form (val_car (val_cdr form)) env mac)
+          (eval-qq-list form env mac))))
+
+(defn eval-qq-list ((items :Value) (env :Value) (mac :Value)) :Value
+  (if (!= (is_nil items) 0)
+      (val_nil)
+      (let ((first (val_car items))
+            (rest  (val_cdr items)))
+        (if (!= (is-tagged? first (cstr "splice")) 0)
+            (append-list (eval-form (val_car (val_cdr first)) env mac)
+                         (eval-qq-list rest env mac))
+            (val_cons (eval-qq first env mac)
+                      (eval-qq-list rest env mac))))))
+
+(defn eval-if ((args :Value) (env :Value) (mac :Value)) :Value
+  (let ((c (eval-form (val_car args) env mac)))
+    (if (= (is-falsy c) 1)
+        (eval-form (val_car (val_cdr (val_cdr args))) env mac)
+        (eval-form (val_car (val_cdr args)) env mac))))
+
+; (let ((x v) (y w)) body...) — evaluates v in current env, binds x, recurses.
+(defn eval-let ((args :Value) (env :Value) (mac :Value)) :Value
+  (let ((bindings (val_car args))
+        (body     (val_cdr args)))
+    (let ((new-env (eval-let-bindings bindings env mac)))
+      (eval-body body new-env mac))))
+
+(defn eval-let-bindings ((bindings :Value) (env :Value) (mac :Value)) :Value
+  (if (!= (is_nil bindings) 0)
+      env
+      (let ((b (val_car bindings)))
+        (let ((name (val_sym_of (val_car b)))
+              (val  (eval-form (val_car (val_cdr b)) env mac)))
+          (eval-let-bindings (val_cdr bindings)
+                             (env-bind env name val) mac)))))
+
+(defn eval-body ((body :Value) (env :Value) (mac :Value)) :Value
+  (if (!= (is_nil body) 0)
+      (val_nil)
+      (let ((first  (eval-form (val_car body) env mac))
+            (rest   (val_cdr body)))
+        (if (!= (is_nil rest) 0)
+            first
+            (eval-body rest env mac)))))
+
+(defn apply-fn ((fn :Value) (args :Value) (env :Value) (mac :Value)) :Value
+  ;; fn is a Closure Value. Bind params to args, eval body. Uses CURRENT
+  ;; env rather than the closure's captured env — sacrifices true
+  ;; lexical capture in exchange for correct recursion of top-level
+  ;; defns. Closure's cenv is unused for now.
+  (let ((params (closure_params fn))
+        (body   (closure_body fn)))
+    (let ((new-env (bind-list params args env)))
+      (eval-body body new-env mac))))
+
+; ---- top-level form handling ----
+
+(defn handle-form ((form :Value) (env :Value) (mac :Value)) :Value
+  ;; Returns the new (env mac result) packed as (cons env (cons mac result)).
+  ;; defn / defmacro mutate env or mac and return nil result.
+  ;; everything else evals the form normally.
+  (if (= (is_cons form) 0)
+      (val_cons env (val_cons mac (eval-form form env mac)))
+      (let ((head (val_car form)))
+        (if (= (is_sym head) 0)
+            (val_cons env (val_cons mac (eval-form form env mac)))
+            (cond
+              ((!= (name-is? (val_sym_of head) (cstr "defn")) 0)
+                 (let ((rest (val_cdr form)))
+                   (let ((name (val_sym_of (val_car rest)))
+                         (params (val_car (val_cdr rest)))
+                         (body   (val_cdr (val_cdr rest))))
+                     (let ((closure (val_closure params body env)))
+                       (val_cons (env-bind env name closure)
+                                 (val_cons mac (val_nil)))))))
+              ((!= (name-is? (val_sym_of head) (cstr "defmacro")) 0)
+                 (let ((rest (val_cdr form)))
+                   (let ((name (val_sym_of (val_car rest)))
+                         (params (val_car (val_cdr rest)))
+                         (body   (val_cdr (val_cdr rest))))
+                     (let ((closure (val_closure params body env)))
+                       (val_cons env
+                                 (val_cons (env-bind mac name closure) (val_nil)))))))
+              (else
+                 (val_cons env (val_cons mac (eval-form form env mac)))))))))
+
+; ---- main ----
 
 (defn main () :int
   (let ((in  (runtime_stdin))
         (out (runtime_stdout))
-        (env (val_nil)))
+        (env (val_nil))
+        (mac (val_nil)))
     (while (= (feof in) 0)
       (let ((form (read_sexp in)))
-        (when (= (is_nil form) 0)
-          (let ((result (eval-form form env)))
-            (write_sexp out result)
-            (fputc 10 out))))))
+        (when (!= (is_cons form) 0)
+          (let ((triple (handle-form form env mac)))
+            (let ((new-env (val_car triple))
+                  (rest    (val_cdr triple)))
+              (let ((new-mac (val_car rest))
+                    (result  (val_cdr rest)))
+                (set! env new-env)
+                (set! mac new-mac)
+                ;; Print only if result is non-nil (defn/defmacro return nil).
+                (when (= (is_nil result) 0)
+                  (write_sexp out result)
+                  (fputc 10 out)))))))))
   0)

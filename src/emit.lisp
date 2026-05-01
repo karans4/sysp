@@ -282,10 +282,21 @@
       (:retain  (format out "~a(~a);~%"
                         (rc-fn-name (ir-instr-type i) "retain")
                         (c-name (first (ir-instr-args i)))))
-      (:set     (let ((args (ir-instr-args i)))
-                  (format out "~a = ~a;~%"
-                          (c-name (first args))
-                          (nameref (second args)))))
+      (:set     (let* ((args (ir-instr-args i))
+                       (tgt  (first args))
+                       (src  (second args))
+                       (ity  (ir-instr-type i)))
+                  (cond
+                    ((ref-type-p ity)
+                     ;; release old; assign; retain new. Source's own ARC
+                     ;; release at last-use covers its end-of-scope.
+                     (format out "~a(~a);~%" (rc-fn-name ity "release") (c-name tgt))
+                     (ind out)
+                     (format out "~a = ~a;~%" (c-name tgt) (nameref src))
+                     (ind out)
+                     (format out "~a(~a);~%" (rc-fn-name ity "retain") (c-name tgt)))
+                    (t
+                     (format out "~a = ~a;~%" (c-name tgt) (nameref src))))))
       (:unary   (let ((args (ir-instr-args i)))
                   (format out "~a ~a = ~a~a;~%"
                           ty dst (first args) (nameref (second args)))))
