@@ -1,0 +1,8 @@
+; A real .sysp program.
+; Builds a greeting from an input name and returns it.
+
+(defn make-greeting ((name :string)) :string
+  (string-concat "hello " name))
+
+(defn loud ((name :string)) :string
+  (string-concat (make-greeting name) "!"))

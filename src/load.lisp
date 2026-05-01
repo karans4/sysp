@@ -1,6 +1,7 @@
 ;;;; Load all sysp-ir source files in dependency order.
 
 (load "src/package.lisp")
+(load "src/parser.lisp")
 (load "src/ir.lisp")
 (load "src/lower.lisp")
 (load "src/liveness.lisp")
