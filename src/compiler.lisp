@@ -181,22 +181,26 @@
                    :blocks (nreverse *blocks*))))))
 
 ;;; ---------- ownership / release-insertion pass ----------
-;;; v0: per-block, no cross-block flow. Straight-line code only.
-;;; Each ref-typed binding (param or local) gets released after its last use.
-;;; Exception: if the value flows into a :ret terminator, ownership transfers.
+;;; Cross-block CFG liveness over ref-typed bindings.
+;;;
+;;; Calling convention: caller's :jump-args TRANSFER ownership to dest's
+;;; block-params; :ret TRANSFERS to caller of the function. Function-params
+;;; of entry block are owned (+1) on entry. Calls (:call) BORROW their
+;;; args (no rc change at call boundary). Return value of a :call is owned (+1).
 
 (defun instr-uses (i)
-  "Return list of var-symbols this instruction uses (reads)."
+  "Variables this instruction reads."
   (case (ir-instr-op i)
     (:const   nil)
     (:str-lit nil)
     (:copy    (list (first (ir-instr-args i))))
-    (:prim    (rest (ir-instr-args i)))      ; (op a b) → uses a,b
-    (:call    (rest (ir-instr-args i)))      ; (cfn a b ...) → uses args
+    (:prim    (rest (ir-instr-args i)))
+    (:call    (rest (ir-instr-args i)))
     (:release (ir-instr-args i))
     (:retain  (ir-instr-args i))))
 
 (defun term-uses (term)
+  "Variables the terminator reads (including transferred-out)."
   (case (first term)
     (:ret  (list (second term)))
     (:br   (list (second term)))
@@ -204,79 +208,178 @@
     (t     nil)))
 
 (defun term-transfers (term)
-  "Variables whose ownership transfers out of the function (no release needed)."
+  "Variables whose ownership leaves this block via the terminator
+   (returned out of fn, or sent to a successor's block-param)."
   (case (first term)
     (:ret  (list (second term)))
+    (:jump (third term))
     (t     nil)))
 
-(defun insert-releases-block (blk fn-params)
-  "Walk block forward; track ref-typed live bindings + their types; at last
-   use, append a :release. Bindings that flow into term-transfers are skipped."
-  (let* ((instrs (ir-block-instrs blk))
-         (term   (ir-block-term blk))
-         ;; Collect all ref-typed bindings: params (for entry block) + locals.
-         (ref-vars (make-hash-table))         ; sym → type
-         ;; Add fn params if this is the entry block
-         (is-entry (eq (ir-block-name blk) 'entry)))
-    (when is-entry
+(defun term-successors (term)
+  (case (first term)
+    (:br   (list (third term) (fourth term)))
+    (:jump (list (second term)))
+    (t     nil)))
+
+(defun build-type-map (fn)
+  "All ref-typed bindings of the fn → type."
+  (let ((tm (make-hash-table)))
+    (dolist (p (ir-fn-params fn))
+      (when (ref-type-p (second p))
+        (setf (gethash (first p) tm) (second p))))
+    (dolist (b (ir-fn-blocks fn))
+      (dolist (p (ir-block-params b))
+        (when (ref-type-p (second p))
+          (setf (gethash (first p) tm) (second p))))
+      (dolist (i (ir-block-instrs b))
+        (when (ref-type-p (ir-instr-type i))
+          (setf (gethash (ir-instr-dst i) tm) (ir-instr-type i)))))
+    tm))
+
+(defun ref-filter (vars type-map)
+  (remove-if-not (lambda (v) (gethash v type-map)) vars))
+
+(defun block-gen-kill (blk fn-params type-map)
+  "GEN: ref vars used before being defined in this block.
+   KILL: ref vars defined in this block (block-params + ref-typed instr dsts)."
+  (let ((gen nil) (kill nil) (defined nil))
+    (when (eq (ir-block-name blk) 'entry)
       (dolist (p fn-params)
         (when (ref-type-p (second p))
-          (setf (gethash (first p) ref-vars) (second p)))))
-    ;; Add ref-typed defs from instrs.
-    (dolist (i instrs)
+          (push (first p) defined)
+          (push (first p) kill))))
+    (dolist (p (ir-block-params blk))
+      (when (ref-type-p (second p))
+        (push (first p) defined)
+        (push (first p) kill)))
+    (dolist (i (ir-block-instrs blk))
+      (dolist (u (ref-filter (instr-uses i) type-map))
+        (unless (or (member u defined) (member u gen))
+          (push u gen)))
       (when (ref-type-p (ir-instr-type i))
-        (setf (gethash (ir-instr-dst i) ref-vars) (ir-instr-type i))))
-    ;; Find last-use of each ref var by walking forward and remembering.
-    (let ((last-use (make-hash-table)))      ; sym → instr-index (-1 = term)
-      (loop for idx from 0
-            for i in instrs
-            do (dolist (u (instr-uses i))
-                 (when (gethash u ref-vars)
-                   (setf (gethash u last-use) idx))))
-      (dolist (u (term-uses term))
-        (when (gethash u ref-vars)
-          (setf (gethash u last-use) :term)))
-      ;; Bindings transferred by term: drop from release set.
-      (dolist (u (term-transfers term))
-        (remhash u last-use))
-      ;; Now build new instr list: walk forward, after each instr at index k,
-      ;; emit release for every var whose last-use is k AND not transferred.
-      (let ((new-instrs nil))
-        (loop for idx from 0
-              for i in instrs
-              do (push i new-instrs)
-                 (maphash (lambda (v k)
-                            (when (and (numberp k) (= k idx))
-                              (push (make-ir-instr :dst nil :type (gethash v ref-vars)
-                                                   :op :release :args (list v))
-                                    new-instrs)))
-                          last-use))
-        ;; Also: ref-typed bindings that have NO uses at all (dead on arrival),
-        ;; including unused fn params — release immediately at top of block.
-        ;; For simplicity: if not in last-use AND not transferred, release at end of block (before term).
-        (maphash (lambda (v ty)
-                   (declare (ignore ty))
-                   (unless (or (gethash v last-use)
-                               (member v (term-transfers term)))
-                     (push (make-ir-instr :dst nil :type (gethash v ref-vars)
-                                          :op :release :args (list v))
-                           new-instrs)))
-                 ref-vars)
-        ;; Special case: if last-use is :term but NOT transferred (e.g. used in
-        ;; a branch condition), release before the term.
-        (maphash (lambda (v k)
-                   (when (and (eq k :term)
-                              (not (member v (term-transfers term))))
-                     (push (make-ir-instr :dst nil :type (gethash v ref-vars)
-                                          :op :release :args (list v))
-                           new-instrs)))
-                 last-use)
-        (setf (ir-block-instrs blk) (nreverse new-instrs))))))
+        (push (ir-instr-dst i) defined)
+        (pushnew (ir-instr-dst i) kill)))
+    (dolist (u (ref-filter (term-uses (ir-block-term blk)) type-map))
+      (unless (or (member u defined) (member u gen))
+        (push u gen)))
+    (values gen kill)))
+
+(defun liveness (fn type-map)
+  "Returns (values live-in live-out), each a hashtable block-name → list of syms."
+  (let ((live-in (make-hash-table))
+        (live-out (make-hash-table))
+        (gen-tab (make-hash-table))
+        (kill-tab (make-hash-table)))
+    (dolist (b (ir-fn-blocks fn))
+      (multiple-value-bind (g k) (block-gen-kill b (ir-fn-params fn) type-map)
+        (setf (gethash (ir-block-name b) gen-tab) g
+              (gethash (ir-block-name b) kill-tab) k
+              (gethash (ir-block-name b) live-in) nil
+              (gethash (ir-block-name b) live-out) nil)))
+    (loop with changed = t
+          while changed do
+          (setf changed nil)
+          (dolist (b (ir-fn-blocks fn))
+            (let* ((name (ir-block-name b))
+                   (succs (term-successors (ir-block-term b)))
+                   (new-out (reduce (lambda (a sn) (union a (gethash sn live-in)))
+                                    succs :initial-value nil))
+                   (new-in (union (gethash name gen-tab)
+                                  (set-difference new-out (gethash name kill-tab)))))
+              (unless (and (null (set-exclusive-or new-out (gethash name live-out)))
+                           (null (set-exclusive-or new-in (gethash name live-in))))
+                (setf (gethash name live-out) new-out
+                      (gethash name live-in) new-in
+                      changed t)))))
+    (values live-in live-out)))
 
 (defun insert-releases (fn)
-  (dolist (b (ir-fn-blocks fn))
-    (insert-releases-block b (ir-fn-params fn)))
+  (let* ((type-map (build-type-map fn)))
+    (multiple-value-bind (live-in live-out) (liveness fn type-map)
+      (dolist (b (ir-fn-blocks fn))
+        (let ((bname (ir-block-name b)))
+          (insert-releases-block b fn type-map
+                                 (gethash bname live-in)
+                                 (gethash bname live-out))))
+      ;; Edge-deaths for :br: vars in P's live-out not in successor's live-in.
+      ;; Stored in the :br term as (then-releases) (else-releases) tail.
+      (dolist (b (ir-fn-blocks fn))
+        (let ((term (ir-block-term b)))
+          (when (eq (first term) :br)
+            (destructuring-bind (_ c tblk eblk &rest _rest) term
+              (declare (ignore _ _rest))
+              (let* ((lo (gethash (ir-block-name b) live-out))
+                     (then-deaths (set-difference lo (gethash tblk live-in)))
+                     (else-deaths (set-difference lo (gethash eblk live-in))))
+                (setf (ir-block-term b)
+                      (list :br c tblk eblk then-deaths else-deaths)))))))))
   fn)
+
+(defun insert-releases-block (blk fn type-map live-in live-out)
+  "Universe of owned vars in this block = live-in ∪ block-defs.
+   Of those, anything in live-out or in :ret/:jump-arg transfers is kept.
+   Everything else must be released after its last use in this block (or at
+   block top if never used)."
+  (let* ((instrs (ir-block-instrs blk))
+         (term   (ir-block-term blk))
+         (transferred (ref-filter (term-transfers term) type-map))
+         (defined nil)
+         (last-use (make-hash-table)))
+    (when (eq (ir-block-name blk) 'entry)
+      (dolist (p (ir-fn-params fn))
+        (when (ref-type-p (second p))
+          (push (first p) defined))))
+    (dolist (p (ir-block-params blk))
+      (when (ref-type-p (second p))
+        (push (first p) defined)))
+    (dolist (i instrs)
+      (when (ref-type-p (ir-instr-type i))
+        (push (ir-instr-dst i) defined)))
+    (let ((tracking (set-difference (union live-in defined) live-out)))
+      (setf tracking (set-difference tracking transferred))
+      (loop for idx from 0
+            for i in instrs
+            do (dolist (u (ref-filter (instr-uses i) type-map))
+                 (when (member u tracking)
+                   (setf (gethash u last-use) idx))))
+      (dolist (u (ref-filter (term-uses term) type-map))
+        (when (member u tracking)
+          ;; Release before term
+          (setf (gethash u last-use) :term)))
+      ;; Defined-but-never-used: release immediately after definition.
+      ;; For block-params (no instr defines them), release at idx 0 (before any instr).
+      ;; For instr defs, release after that instr.
+      (dolist (v tracking)
+        (unless (gethash v last-use)
+          (let ((def-idx (loop for idx from 0
+                               for i in instrs
+                               when (eq (ir-instr-dst i) v) return idx)))
+            (setf (gethash v last-use) (or def-idx :pre))))))
+    ;; Build new instr list with releases inserted.
+    (let ((new-instrs nil))
+      ;; :pre releases (for unused block-params)
+      (maphash (lambda (v k)
+                 (when (eq k :pre)
+                   (push (make-ir-instr :dst nil :type (gethash v type-map)
+                                        :op :release :args (list v))
+                         new-instrs)))
+               last-use)
+      (loop for idx from 0
+            for i in instrs
+            do (push i new-instrs)
+               (maphash (lambda (v k)
+                          (when (and (numberp k) (= k idx))
+                            (push (make-ir-instr :dst nil :type (gethash v type-map)
+                                                 :op :release :args (list v))
+                                  new-instrs)))
+                        last-use))
+      (maphash (lambda (v k)
+                 (when (eq k :term)
+                   (push (make-ir-instr :dst nil :type (gethash v type-map)
+                                        :op :release :args (list v))
+                         new-instrs)))
+               last-use)
+      (setf (ir-block-instrs blk) (nreverse new-instrs)))))
 
 ;;; ---------- IR pretty printer ----------
 
@@ -307,7 +410,9 @@
         (#\Tab (write-string "\\t" out))
         (t (write-char ch out))))))
 
-(defun c-name (s) (string-downcase (symbol-name s)))
+(defun c-name (s)
+  (let ((str (string-downcase (symbol-name s))))
+    (substitute #\_ #\- str)))
 
 (defvar *block-by-name*)
 
@@ -358,10 +463,15 @@
   (case (first term)
     (:ret      (format out "  return ~a;~%" (c-name (second term))))
     (:ret-unit (format out "  return;~%"))
-    (:br       (destructuring-bind (_ c tblk eblk _ta _ea) term
-                 (declare (ignore _ _ta _ea))
-                 (format out "  if (~a) goto ~a; else goto ~a;~%"
-                         (c-name c) (c-name tblk) (c-name eblk))))
+    (:br       (destructuring-bind (_ c tblk eblk &optional t-deaths e-deaths) term
+                 (declare (ignore _))
+                 (format out "  if (~a) {~%" (c-name c))
+                 (dolist (v t-deaths)
+                   (format out "    sysp_str_release(~a);~%" (c-name v)))
+                 (format out "    goto ~a;~%  } else {~%" (c-name tblk))
+                 (dolist (v e-deaths)
+                   (format out "    sysp_str_release(~a);~%" (c-name v)))
+                 (format out "    goto ~a;~%  }~%" (c-name eblk))))
     (:jump     (destructuring-bind (_ blk args) term
                  (declare (ignore _))
                  (let ((dest (gethash blk *block-by-name*)))
