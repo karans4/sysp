@@ -198,6 +198,18 @@ Alpha. 37 tests, valgrind clean. Expect breaking changes.
 
 The end goal is for sysp to compile itself. The bootstrap compiler (`sysp.lisp`, Common Lisp) would be replaced by `sysp.sysp`, which compiles to `bootstrap.c` — a checked-in generated C file that can build the compiler with just `cc bootstrap.c -o sysp`. New contributors need only a C compiler, not SBCL.
 
+## Alternative: the `sysp-ir` branch
+
+A from-scratch reimplementation of the compiler lives on the `sysp-ir` branch. It rebuilds sysp around a typed ANF/basic-block IR with dataflow-driven ARC analysis, structured C emission (no labels/gotos), and a sysp-in-sysp interpreter that handles compile-time macro expansion. ~3,500 LOC across 13 modules vs master's 6,800-line single file.
+
+Implements the same load-bearing features as master — HM inference, structs, externs, ARC strings + cons, macros with quasiquote/gensym, closures with free-var analysis, tail calls via `recur` — but leaves Vector/HashMap/Tuple/threads/CUDA/conditions out of the compiler core, intended as library code on top.
+
+```sh
+git fetch origin sysp-ir
+git log --oneline sysp-ir | head    # see Stage 1 → Stage 14 history
+git checkout sysp-ir                 # switch to it
+```
+
 ## License
 
 MIT
