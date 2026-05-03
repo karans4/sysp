@@ -14,8 +14,11 @@
 
 (defun insert-borrow-retains (fn)
   "Insert :retain before any :ret or :jump term that transfers a borrowed
-   fn-param. Destination receives a fresh +1."
-  (let ((borrowed (borrowed-params fn)))
+   fn-param. Destination receives a fresh +1. The retain instr carries
+   the param's actual type so emit can pick the right rc fn."
+  (let* ((borrowed (borrowed-params fn))
+         (param-types (loop for p in (ir-fn-params fn)
+                            collect (cons (first p) (second p)))))
     (when borrowed
       (dolist (b (ir-fn-blocks fn))
         (let* ((term (ir-block-term b))
@@ -23,8 +26,9 @@
                (borrowed-transferred (intersection transferred borrowed))
                (new-instrs nil))
           (dolist (v borrowed-transferred)
-            (push (make-ir-instr :dst nil :type :string :op :retain :args (list v))
-                  new-instrs))
+            (let ((ty (cdr (assoc v param-types))))
+              (push (make-ir-instr :dst nil :type ty :op :retain :args (list v))
+                    new-instrs)))
           (when new-instrs
             (setf (ir-block-instrs b)
                   (append (ir-block-instrs b) (nreverse new-instrs)))))))))

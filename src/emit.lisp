@@ -79,10 +79,10 @@
 
 (defun rc-fn-name (ty op-name)
   "Dispatch retain/release to the right runtime fn based on type.
-   op-name is \"retain\" or \"release\"."
+   op-name is \"retain\" or \"release\". Case-insensitive on keyword."
   (cond
-    ((eq ty :string) (format nil "sysp_str_~a" op-name))
-    ((eq ty :Value)  (format nil "val_~a" op-name))
+    ((eq ty :string)        (format nil "sysp_str_~a" op-name))
+    ((kw-name= ty "Value")  (format nil "val_~a" op-name))
     (t (error "rc-fn-name: no rc fn for type ~A" ty))))
 
 ;; Track whether the current program uses Value/cons. If so, we need to

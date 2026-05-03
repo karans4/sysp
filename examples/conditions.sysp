@@ -1,0 +1,39 @@
+; CL-style conditions: signal → handler-bind → invoke-restart → restart-case.
+; Demonstrates the no-unwind handler semantics — handler chooses to invoke
+; a restart, which unwinds to the restart-case site rather than to the
+; handler-bind.
+
+(include "<stdio.h>")
+(include "value.h")
+(include "conditions.h")
+
+(extern signal_cond     ((c :Value))                 :Value)
+(extern with_handler    ((type :u32) (h :Fn) (body :Fn)) :Value)
+(extern with_restart    ((name :u32) (body :Fn) (fb :Fn)) :Value)
+(extern invoke_restart  ((name :u32) (arg :Value))   :unit)
+(extern intern_sym      ((name :cstr))               :u32)
+(extern val_int         ((i :int))                   :Value)
+(extern val_int_of      ((v :Value))                 :int)
+(extern printf          ((fmt :cstr) (n :int))       :int)
+
+(defn main () :int
+  (let ((result
+          (with_restart
+            (intern_sym (cstr "use-default"))
+            ; body: install handler-bind, then signal
+            (lambda () :Value
+              (with_handler
+                (intern_sym (cstr "parse-error"))
+                ; handler: invoke the use-default restart with 99
+                (lambda ((c :Value)) :Value
+                  (invoke_restart (intern_sym (cstr "use-default"))
+                                  (val_int 99))
+                  (val-nil))
+                ; inner body: signal the condition
+                (lambda () :Value
+                  (signal_cond
+                    (cons (sym "parse-error") (val-nil))))))
+            ; fallback (restart arm): receives 99
+            (lambda ((v :Value)) :Value v))))
+    (printf (cstr "result: %d\n") (val_int_of result))
+    0))
