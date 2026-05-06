@@ -10,12 +10,6 @@
 ;; op ∈ :const :prim :copy :call :str-lit :release :retain :set
 (defstruct ir-instr dst type op args)
 
-(defun ref-type-p (ty)
-  ;; Types that participate in ARC: :string (sysp String) and :Value (cons cells).
-  ;; Case-insensitive for :Value to bridge parser-preserved vs CL-upcased.
-  (or (eq ty :string)
-      (and (keywordp ty) (string-equal (symbol-name ty) "Value"))))
-
 ;;; Struct registry: name (symbol) → list of (field-name field-type) pairs.
 (defvar *struct-fields* (make-hash-table))
 
@@ -31,6 +25,24 @@
 
 ;;; Top-level constants: name → (type literal-value).
 (defvar *globals* (make-hash-table))
+
+(defun ref-type-p (ty)
+  ;; Types that participate in ARC: :string (sysp String), :Value (cons cells),
+  ;; and structs whose fields transitively contain rc types. Pointers and
+  ;; primitives stay non-rc — only the *content* of a struct matters here.
+  (cond
+    ((eq ty :string) t)
+    ((and (keywordp ty) (string-equal (symbol-name ty) "Value")) t)
+    ((and (keywordp ty) (gethash (intern (symbol-name ty) :sysp-ir) *struct-fields*))
+     (struct-has-rc-fields-p (intern (symbol-name ty) :sysp-ir)))
+    (t nil)))
+
+(defun struct-has-rc-fields-p (struct-name)
+  "True when any field's type is itself rc-tracked. Direct self-reference
+   is impossible in C (would have infinite size), so this terminates;
+   pointer fields are not rc-typed and short-circuit indirect cycles."
+  (some (lambda (f) (ref-type-p (second f)))
+        (gethash struct-name *struct-fields*)))
 
 (defun struct-name-p (sym)
   (and (symbolp sym) (gethash sym *struct-fields*)))

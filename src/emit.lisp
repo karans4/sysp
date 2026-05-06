@@ -81,11 +81,24 @@
 
 (defun rc-fn-name (ty op-name)
   "Dispatch retain/release to the right runtime fn based on type.
-   op-name is \"retain\" or \"release\". Case-insensitive on keyword."
+   op-name is \"retain\" or \"release\". Case-insensitive on keyword.
+   Auto-derived struct-level retain/release functions follow the convention
+   <StructName>_retain / <StructName>_release."
   (cond
     ((eq ty :string)        (format nil "sysp_str_~a" op-name))
     ((kw-name= ty "Value")  (format nil "val_~a" op-name))
+    ((and (keywordp ty)
+          (gethash (intern (symbol-name ty) :sysp-ir) *struct-fields*))
+     (format nil "~a_~a"
+             (symbol-name (intern (symbol-name ty) :sysp-ir))
+             op-name))
     (t (error "rc-fn-name: no rc fn for type ~A" ty))))
+
+(defun struct-rc-type-p (ty)
+  "True when ty is a struct keyword whose retain/release takes a pointer.
+   String and Value pass by value; structs pass by &address."
+  (and (keywordp ty)
+       (gethash (intern (symbol-name ty) :sysp-ir) *struct-fields*)))
 
 ;; Track whether the current program uses Value/cons. If so, we need to
 ;; emit the runtime header and link runtime/value.c.
@@ -121,21 +134,39 @@
               (string-downcase (symbol-name (first f)))))
     (format out "} ~a;~%" (symbol-name name))))
 
-(defun emit-env-destructor (form out)
-  "Emit a static <Env>_release(void* p) for each lambda env struct that
-   carries rc'd captures. No-op when the env has none — the lambda site
-   passes NULL for release_state in that case."
-  (let* ((name (second form))
-         (fields (normalize-struct-fields (cddr form)))
-         (rc-fields (remove-if-not (lambda (f) (ref-type-p (second f))) fields)))
+(defun emit-struct-rc-fns (struct-name out)
+  "Emit auto-derived <Name>_retain(void*) and <Name>_release(void*) for a
+   struct that has rc-tracked fields. Both walk the fields and dispatch
+   per-field via rc-fn-name. Pointer-typed fields and primitives are no-ops.
+   Used both by ARC for struct values and by make_fn's release_state for
+   lambda env structs (single fn signature serves both call sites)."
+  (let* ((fields (gethash struct-name *struct-fields*))
+         (rc-fields (remove-if-not (lambda (f) (ref-type-p (second f))) fields))
+         (cname (symbol-name struct-name)))
     (when rc-fields
-      (format out "static void ~a_release(void* _p) {~%" (symbol-name name))
-      (format out "  ~a* e = (~a*)_p;~%" (symbol-name name) (symbol-name name))
-      (dolist (f rc-fields)
-        (format out "  ~a(e->~a);~%"
-                (rc-fn-name (second f) "release")
-                (string-downcase (symbol-name (first f)))))
-      (format out "}~%~%"))))
+      (dolist (op '("retain" "release"))
+        (format out "static void ~a_~a(void* _p) {~%" cname op)
+        (format out "  ~a* s = (~a*)_p;~%" cname cname)
+        (dolist (f rc-fields)
+          (let* ((fty (second f))
+                 (rc-call (rc-fn-name fty op))
+                 (field-c (string-downcase (symbol-name (first f)))))
+            (cond
+              ((struct-rc-type-p fty)
+               (format out "  ~a(&s->~a);~%" rc-call field-c))
+              (t
+               (format out "  ~a(s->~a);~%" rc-call field-c)))))
+        (format out "}~%~%")))))
+
+(defun emit-struct-rc-fn-decls (struct-name out)
+  "Forward declarations so retain/release bodies can call into each other
+   regardless of the order they were defined in the program."
+  (let* ((fields (gethash struct-name *struct-fields*))
+         (rc-fields (remove-if-not (lambda (f) (ref-type-p (second f))) fields))
+         (cname (symbol-name struct-name)))
+    (when rc-fields
+      (format out "static void ~a_retain(void* _p);~%" cname)
+      (format out "static void ~a_release(void* _p);~%" cname))))
 
 (defun emit-include (form out)
   "(include \"foo.h\") → #include \"foo.h\"
@@ -286,8 +317,10 @@
       (:copy  (format out "~a ~a = ~a;~%" ty dst (nameref (first (ir-instr-args i))))
               (when (ref-type-p (ir-instr-type i))
                 (ind out)
-                (format out "~a(~a);~%"
-                        (rc-fn-name (ir-instr-type i) "retain") dst)))
+                (format out "~a(~:[~;&~]~a);~%"
+                        (rc-fn-name (ir-instr-type i) "retain")
+                        (struct-rc-type-p (ir-instr-type i))
+                        dst)))
       (:prim  (let ((a (ir-instr-args i)))
                 (format out "~a ~a = ~a ~a ~a;~%"
                         ty dst (nameref (second a)) (first a) (nameref (third a)))))
@@ -304,11 +337,13 @@
       (:cstr-lit (let ((s (first (ir-instr-args i))))
                    (format out "const char* ~a = \"~a\";~%"
                            dst (c-escape-string s))))
-      (:release (format out "~a(~a);~%"
+      (:release (format out "~a(~:[~;&~]~a);~%"
                         (rc-fn-name (ir-instr-type i) "release")
+                        (struct-rc-type-p (ir-instr-type i))
                         (c-name (first (ir-instr-args i)))))
-      (:retain  (format out "~a(~a);~%"
+      (:retain  (format out "~a(~:[~;&~]~a);~%"
                         (rc-fn-name (ir-instr-type i) "retain")
+                        (struct-rc-type-p (ir-instr-type i))
                         (c-name (first (ir-instr-args i)))))
       (:set     (let* ((args (ir-instr-args i))
                        (tgt  (first args))
@@ -318,11 +353,15 @@
                     ((ref-type-p ity)
                      ;; release old; assign; retain new. Source's own ARC
                      ;; release at last-use covers its end-of-scope.
-                     (format out "~a(~a);~%" (rc-fn-name ity "release") (c-name tgt))
+                     (format out "~a(~:[~;&~]~a);~%"
+                             (rc-fn-name ity "release") (struct-rc-type-p ity)
+                             (c-name tgt))
                      (ind out)
                      (format out "~a = ~a;~%" (c-name tgt) (nameref src))
                      (ind out)
-                     (format out "~a(~a);~%" (rc-fn-name ity "retain") (c-name tgt)))
+                     (format out "~a(~:[~;&~]~a);~%"
+                             (rc-fn-name ity "retain") (struct-rc-type-p ity)
+                             (c-name tgt)))
                     (t
                      (format out "~a = ~a;~%" (c-name tgt) (nameref src))))))
       (:unary   (let ((args (ir-instr-args i)))
@@ -351,19 +390,36 @@
                               (symbol-name struct-name) dst
                               (symbol-name struct-name)
                               (mapcar #'nameref vals))))
-      (:field-get (let ((args (ir-instr-args i)))
+      (:field-get (let ((args (ir-instr-args i))
+                        (fty (ir-instr-type i)))
                     (format out "~a ~a = ~a.~a;~%"
                             ty dst (nameref (first args))
-                            (string-downcase (symbol-name (second args))))))
+                            (string-downcase (symbol-name (second args))))
+                    ;; rc'd field: copy creates a second co-owner. The struct
+                    ;; itself still holds its share; the new local needs +1 so
+                    ;; both can be released independently.
+                    (when (ref-type-p fty)
+                      (ind out)
+                      (format out "~a(~:[~;&~]~a);~%"
+                              (rc-fn-name fty "retain")
+                              (struct-rc-type-p fty)
+                              dst))))
       (:field-set (let ((args (ir-instr-args i)))
                     (format out "~a.~a = ~a;~%"
                             (nameref (first args))
                             (string-downcase (symbol-name (second args)))
                             (nameref (third args)))))
-      (:field-get-ptr (let ((args (ir-instr-args i)))
+      (:field-get-ptr (let ((args (ir-instr-args i))
+                            (fty (ir-instr-type i)))
                         (format out "~a ~a = ~a->~a;~%"
                                 ty dst (nameref (first args))
-                                (string-downcase (symbol-name (second args))))))
+                                (string-downcase (symbol-name (second args))))
+                        (when (ref-type-p fty)
+                          (ind out)
+                          (format out "~a(~:[~;&~]~a);~%"
+                                  (rc-fn-name fty "retain")
+                                  (struct-rc-type-p fty)
+                                  dst))))
       (:field-set-ptr (let ((args (ir-instr-args i)))
                         (format out "~a->~a = ~a;~%"
                                 (nameref (first args))

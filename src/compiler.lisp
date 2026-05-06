@@ -74,6 +74,12 @@
    (extern-struct ...), (extern ...), (define ...), (enum ...), (defn ...)."
   (setf forms (expand-uses forms))
   (setf forms (expand-macros forms))
+  ;; Reset per-program registries so a long-lived SBCL session doesn't
+  ;; carry stale generic instances or struct fields between compiles.
+  (clrhash *struct-fields*)
+  (clrhash *generic-structs*)
+  (clrhash *generic-struct-instances*)
+  (clrhash *globals*)
   (let (includes structs extern-structs defines externs defns)
     (dolist (f forms)
       (case (first f)
@@ -170,8 +176,20 @@
                        (terpri out)))
                    *generic-struct-instances*))
         (dolist (s extra-structs)
-          (emit-struct-decl s out) (terpri out)
-          (emit-env-destructor s out))
+          (emit-struct-decl s out) (terpri out))
+        ;; Forward declarations for every rc'd struct's retain/release —
+        ;; lets bodies call each other in any order. Then emit bodies.
+        ;; Walk *struct-fields* (covers user, generic instances, env structs).
+        (let ((rc-names nil))
+          (maphash (lambda (n fields)
+                     (declare (ignore fields))
+                     (when (struct-has-rc-fields-p n)
+                       (push n rc-names)))
+                   *struct-fields*)
+          (when rc-names
+            (dolist (n rc-names) (emit-struct-rc-fn-decls n out))
+            (terpri out)
+            (dolist (n rc-names) (emit-struct-rc-fns n out))))
         (dolist (d defines)
           (let ((name (second d)) (val (third d)))
             (format out "static const ~a ~a = ~a;~%"

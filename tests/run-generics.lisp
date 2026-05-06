@@ -53,6 +53,29 @@ int main(){ printf(\"%d\\n\", use()); return 0; }"
 int main(){ printf(\"%d %d\\n\", use_int(), use_u8()); return 0; }"
             "42 7")
 
+;; --- Box<String>: rc'd field. Without retain at struct-init + auto
+;; <Box_string>_release, the field's buf would be freed at the local's
+;; ARC release before main reads it (UAF). Result is the captured string.
+(check-prog "box-string"
+            '((defstruct (Box :T) ((value :T)))
+              (defn make-box ((s :string)) (Box :string) (Box s))
+              (defn use () :string
+                (let ((b (make-box (string-concat "hello" "_world"))))
+                  (get-field b value))))
+            "int main(){ String s = use(); sysp_str_print(s); sysp_str_release(s); return 0; }"
+            "hello_world")
+
+;; --- Pair<String, int>: mixed rc/non-rc fields. The retain/release walk
+;; should only fire on the rc'd one; the int field is left alone.
+(check-prog "pair-string-int"
+            '((defstruct (Pair :A :B) ((fst :A) (snd :B)))
+              (defn name-and-len () :int
+                (let ((p (Pair (string-concat "ab" "cd") 99)))
+                  (+ (string-len (get-field p fst)) (get-field p snd)))))
+            "#include <stdio.h>
+int main(){ printf(\"%d\\n\", name_and_len()); return 0; }"
+            "103")
+
 ;; --- Two type params: Pair<int, int> with both fields read ---
 (check-prog "pair-int-int"
             '((defstruct (Pair :A :B) ((fst :A) (snd :B)))
@@ -62,33 +85,45 @@ int main(){ printf(\"%d %d\\n\", use_int(), use_u8()); return 0; }"
 int main(){ printf(\"%d %d\\n\", use_fst(), use_snd()); return 0; }"
             "7 99")
 
-;; --- Vec<int> with a (:ptr :T) field — exercises struct templates that
-;; reference the type param inside another type form. This is the real
-;; Stage-17 milestone: a generic data structure as library code.
-(check-prog "vec-int-push-get"
-            '((extern malloc ((sz :size)) :ptr-void)
+;; --- Vec<int> with a (:ptr :T) field — generic data structure as
+;; library code, with realloc-based growth. Exercises pointer-in-struct,
+;; multiple instantiations through poly fns, and realistic memory mgmt.
+(check-prog "vec-int-push-realloc"
+            '((extern malloc  ((sz :size)) :ptr-void)
+              (extern realloc ((p :ptr-void) (sz :size)) :ptr-void)
+              (extern free    ((p :ptr-void)) :unit)
 
               (defstruct (Vec :T) ((data (:ptr :T)) (len :int) (cap :int)))
 
-              (defn vec-empty () (Vec :int)
+              (defn vec-empty-i () (Vec :int)
                 (Vec (cast (:ptr :int) (cast :ptr-void 0)) 0 0))
 
               (defn vec-push-i ((v (Vec :int)) (x :int)) (Vec :int)
-                ;; This sample reserves 8 ints up front on first push, then
-                ;; appends. Real growable push needs realloc — out of scope for
-                ;; the milestone; this proves struct fields + (:ptr :T) work.
-                (let ((newcap 8))
-                  (let ((newdata (cast (:ptr :int) (malloc (cast :size 32)))))
-                    (ptr-set-at! newdata 0 x)
-                    (Vec newdata 1 newcap))))
+                (let ((cap (get-field v cap))
+                      (len (get-field v len)))
+                  (let ((new-cap (if (= len cap)
+                                     (if (= cap 0) 4 (* cap 2))
+                                   cap)))
+                    (let ((data (if (= len cap)
+                                    (cast (:ptr :int)
+                                          (realloc (cast :ptr-void (get-field v data))
+                                                   (cast :size (* new-cap 4))))
+                                  (get-field v data))))
+                      (ptr-set-at! data len x)
+                      (Vec data (+ len 1) new-cap)))))
 
               (defn use () :int
-                (let ((v (vec-empty)))
-                  (let ((v2 (vec-push-i v 99)))
-                    (ptr-ref (get-field v2 data) 0)))))
+                (let ((v (vec-empty-i)))
+                  (let ((v1 (vec-push-i v  10)))
+                    (let ((v2 (vec-push-i v1 20)))
+                      (let ((v3 (vec-push-i v2 30)))
+                        ;; sum first three
+                        (+ (ptr-ref (get-field v3 data) 0)
+                           (+ (ptr-ref (get-field v3 data) 1)
+                              (ptr-ref (get-field v3 data) 2)))))))))
             "#include <stdio.h>
 int main(){ printf(\"%d\\n\", use()); return 0; }"
-            "99")
+            "60")
 
 (format t "~%~a passed, ~a failed~%" *ok* *fail*)
 (unless (zerop *fail*) (sb-ext:exit :code 1))

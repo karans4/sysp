@@ -762,16 +762,27 @@
   ;; default: struct constructor OR call to user/extern fn.
   (cond
     ((struct-name-p head)
-     ;; Struct constructor: (Name v1 v2 ...) → struct literal.
+     ;; Struct constructor: (Name v1 v2 ...) → struct literal. For each
+     ;; rc'd-field arg, emit :retain before the struct-init so the new
+     ;; struct co-owns the field. The arg's local then has its ARC release
+     ;; at end-of-life, leaving the struct as sole owner of the rc'd value.
      (let ((arg-names nil))
        (dolist (a args)
          (multiple-value-bind (n _ty) (lower a env)
            (declare (ignore _ty))
            (push n arg-names)))
-       (let ((d (fresh-tmp))
-             (sty (struct-type-keyword head)))
+       (setf arg-names (nreverse arg-names))
+       (let* ((fields (gethash head *struct-fields*))
+              (sty (struct-type-keyword head))
+              (d (fresh-tmp)))
+         (loop for an in arg-names
+               for fld in fields
+               for ft = (second fld)
+               when (ref-type-p ft) do
+                 (emit (make-ir-instr :dst nil :type ft :op :retain
+                                      :args (list an))))
          (emit (make-ir-instr :dst d :type sty :op :struct-init
-                              :args (cons head (nreverse arg-names))))
+                              :args (cons head arg-names)))
          (values d sty))))
     (t
      (let ((arg-names nil))
