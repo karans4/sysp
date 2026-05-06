@@ -31,6 +31,8 @@
     ((kw-name= ty "Value")  "Value")
     ((kw-name= ty "symbol") "uint32_t")
     ((kw-name= ty "Fn")     "Fn*")
+    ;; Structural (:fn (arg-tys) ret-ty) — same C representation as opaque :Fn.
+    ((and (consp ty) (eq (first ty) :fn)) "Fn*")
     ;; :ptr-T → "T*"
     ((and (keywordp ty)
           (let ((s (symbol-name ty)))
@@ -356,16 +358,17 @@
       (:fn-addr  (format out "~a ~a = (void*)&~a;~%"
                          ty dst (c-name (first (ir-instr-args i)))))
       (:fn-call  (let* ((args (ir-instr-args i))
-                        (f (first args))
-                        (call-args (rest args))
-                        (n-args (length call-args))
+                        (fn-ty (first args))
+                        (arg-tys (second fn-ty))
+                        (ret-ty  (third fn-ty))
+                        (f (second args))
+                        (call-args (cddr args))
                         (cast-type (with-output-to-string (s)
-                                     (write-string "int(*)(void*" s)
-                                     (dotimes (k n-args)
-                                       (declare (ignore k))
-                                       (write-string ", int" s))
-                                     (write-string ")" s))))
-                   (format out "int ~a = ((~a)~a->invoke)(~a->state~{, ~a~});~%"
-                           dst cast-type
+                                     (format s "~a(*)(void*" (c-type ret-ty))
+                                     (dolist (at arg-tys)
+                                       (format s ", ~a" (c-type at)))
+                                     (write-char #\) s))))
+                   (format out "~a ~a = ((~a)~a->invoke)(~a->state~{, ~a~});~%"
+                           (c-type ret-ty) dst cast-type
                            (c-name f) (c-name f)
                            (mapcar #'nameref call-args)))))))

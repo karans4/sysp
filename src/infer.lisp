@@ -104,6 +104,13 @@
       ;; numeric ↔ numeric: silently accept; C handles all width/float
       ;; promotions and narrowing implicitly.
       ((and (numeric-type-p r1) (numeric-type-p r2)) t)
+      ;; Opaque :Fn unifies with any structural (:fn ...). Keeps legacy
+      ;; :Fn-annotated params interchangeable with structurally-typed
+      ;; lambda values. Information is lost — callers using :Fn-annotated
+      ;; vars stay on the legacy ret-ty=:int path inside the callee body.
+      ((or (and (keywordp r1) (string-equal (symbol-name r1) "FN") (fn-type-p r2))
+           (and (keywordp r2) (string-equal (symbol-name r2) "FN") (fn-type-p r1)))
+       t)
       ;; :unit unifies with anything — value is discarded at C level.
       ((or (eq r1 :unit) (eq r2 :unit)) t)
       ((and (consp r1) (consp r2)
@@ -238,27 +245,51 @@
 (defmethod infer-form ((head (eql 'val-print)) args env)
   (infer (first args) env) :unit)
 
-;; Closures
+;; Closures: structural (:fn (param-tys) ret-ty) types.
 (defmethod infer-form ((head (eql 'lambda)) args env)
-  ;; v1: all lambdas are typed as :Fn (no signature tracked through HM yet).
-  (multiple-value-bind (params _ret-annot body) (lambda-split-args args)
-    (declare (ignore _ret-annot))
-    (let ((env2 env))
-      (dolist (p params)
-        (let ((np (parse-lambda-param p)))
-          (push (cons (first np) (or (second np) :int)) env2)))
-      (dolist (b body) (infer b env2)))
-    :Fn))
+  (multiple-value-bind (raw-params ret-annot body) (lambda-split-args args)
+    (let* ((typed-params
+            (mapcar (lambda (p)
+                      (let ((np (parse-lambda-param p)))
+                        (list (first np) (or (second np) (fresh-tvar)))))
+                    raw-params))
+           (param-types (mapcar #'second typed-params))
+           (ret-type (or ret-annot (fresh-tvar)))
+           (env2 env))
+      (dolist (p typed-params) (push (cons (first p) (second p)) env2))
+      (let (last-ty)
+        (dolist (b body) (setf last-ty (infer b env2)))
+        (when last-ty (unify ret-type last-ty)))
+      (list :fn param-types ret-type))))
 
 (defmethod infer-form ((head (eql 'call)) args env)
-  ;; (call f arg...) — f must be :Fn; result is :int (v1).
+  ;; (call f arg...). f's type drives result:
+  ;;   - :Fn (legacy opaque): walks args, returns fresh tvar (defaults to :int)
+  ;;   - :tvar: unify with structural fn type, drive ret from there
+  ;;   - (:fn (a-tys) r-ty): unify args, return r-ty
   (let ((fty (resolve-type (infer (first args) env))))
-    (unless (or (and (keywordp fty)
-                     (string-equal (symbol-name fty) "FN"))
-                (tvar-p fty))
-      (error "call: expected :Fn, got ~A" fty)))
-  (dolist (a (rest args)) (infer a env))
-  :int)
+    (cond
+      ((and (keywordp fty) (string-equal (symbol-name fty) "FN"))
+       (dolist (a (rest args)) (infer a env))
+       (fresh-tvar))
+      ((tvar-p fty)
+       (let* ((arg-tvars (mapcar (lambda (_) (declare (ignore _)) (fresh-tvar))
+                                 (rest args)))
+              (ret-tvar (fresh-tvar)))
+         (unify fty (list :fn arg-tvars ret-tvar))
+         (loop for a in (rest args) for at in arg-tvars
+               do (unify at (infer a env)))
+         ret-tvar))
+      ((fn-type-p fty)
+       (let ((arg-tys (second fty))
+             (ret-ty  (third fty)))
+         (unless (= (length arg-tys) (length (rest args)))
+           (error "call: expected ~D args, got ~D"
+                  (length arg-tys) (length (rest args))))
+         (loop for a in (rest args) for at in arg-tys
+               do (unify at (infer a env)))
+         ret-ty))
+      (t (error "call: expected fn, got ~A" fty)))))
 
 (defmethod infer-form ((head (eql 'addr-of)) args env)
   (let* ((sym (first args))

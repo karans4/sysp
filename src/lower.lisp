@@ -272,20 +272,31 @@
                            :args (list fn-name)))
       (emit (make-ir-instr :dst fn-tmp :type :Fn :op :call
                            :args (list 'make_fn fn-ptr-tmp state-arg))))
-    (values fn-tmp :Fn)))
+    ;; Type-channel returns the structural (:fn ...) so call sites can read
+    ;; ret-ty even though the IR-level value tag stays :Fn.
+    (values fn-tmp (list :fn param-types ret-type))))
 
 (defmethod lower-form ((head (eql 'call)) args env)
-  ;; (call f args...) — invoke an Fn value via the trampoline cast.
+  ;; (call f args...) — invoke an Fn value via the trampoline cast. Pull
+  ;; structural arg-types and ret-type from f's type so emit can build the
+  ;; correct invoke cast. Legacy :Fn (no structural info) falls back to int.
   (multiple-value-bind (fn-name fn-ty) (lower (first args) env)
-    (declare (ignore fn-ty))
-    (let ((arg-names nil))
+    (let* ((structural (and (consp fn-ty) (eq (first fn-ty) :fn)))
+           (ret-ty   (if structural (third fn-ty)  :int))
+           (arg-tys  (if structural (second fn-ty)
+                         (mapcar (lambda (_) (declare (ignore _)) :int)
+                                 (rest args))))
+           (arg-names nil))
       (dolist (a (rest args))
         (multiple-value-bind (n _) (lower a env) (declare (ignore _))
           (push n arg-names)))
       (let ((d (fresh-tmp)))
-        (emit (make-ir-instr :dst d :type :int :op :fn-call
-                             :args (cons fn-name (nreverse arg-names))))
-        (values d :int)))))
+        ;; Stash arg-tys + ret-ty as the first arg so :fn-call emit can
+        ;; reconstruct the proper cast without needing a separate slot.
+        (emit (make-ir-instr :dst d :type ret-ty :op :fn-call
+                             :args (cons (list :fn arg-tys ret-ty)
+                                         (cons fn-name (nreverse arg-names)))))
+        (values d ret-ty)))))
 
 ;;; --- Lisp data: cons / Value / symbols ---
 

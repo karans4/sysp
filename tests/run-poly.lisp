@@ -70,5 +70,21 @@ int main(){ printf(\"%d\\n\", use()); return 0; }"
 int main(){ printf(\"%d %d\\n\", is_even(8), is_odd(7)); return 0; }"
             "1 1")
 
+;; --- Lambda with structural fn-type annotation: ret-type flows through ---
+(check-prog "lambda-string-ret"
+            '((defn pipe ((f (:fn (:int) :string)) (x :int)) :string (call f x))
+              (defn run () :string (pipe (lambda ((x :int)) :string (string-concat "n=" "X")) 1)))
+            "int main(){ String r = run(); sysp_str_print(r); sysp_str_release(r); return 0; }"
+            "n=X")
+
+;; --- Local lambda assigned to let binding, then called ---
+(check-prog "local-lambda-call"
+            '((defn run () :int
+                (let ((f (lambda ((x :int)) :int (* x 3))))
+                  (call f 7))))
+            "#include <stdio.h>
+int main(){ printf(\"%d\\n\", run()); return 0; }"
+            "21")
+
 (format t "~%~a passed, ~a failed~%" *ok* *fail*)
 (unless (zerop *fail*) (sb-ext:exit :code 1))
