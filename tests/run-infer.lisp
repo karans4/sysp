@@ -22,7 +22,7 @@
         (if (string= got expected)
             (progn (incf *ok*) (format t " ok"))
             (progn (incf *fail*) (format t " FAIL got ~s want ~s" got expected)))))
-    (when valgrind
+    (when (and valgrind (probe-file "/usr/bin/valgrind"))
       (let ((p (sb-ext:run-program "/usr/bin/valgrind"
                                    (list "--error-exitcode=2" "--leak-check=full" "-q" exe)
                                    :output nil :error nil)))

@@ -126,13 +126,17 @@ foo"
          (let ((got (string-trim '(#\Newline #\Space) out)))
            (cond
              ((string= got "hello karan!")
-              (let* ((vp (sb-ext:run-program "/usr/bin/valgrind"
-                          (list "--error-exitcode=2" "--leak-check=full" "-q" exe)
-                          :output nil :error :stream)))
-                (sb-ext:process-wait vp)
-                (if (zerop (sb-ext:process-exit-code vp))
-                    (progn (incf *ok*) (format t "e2e-parse-file: ok (valgrind clean)~%"))
-                    (progn (incf *fail*) (format t "e2e-parse-file: VG FAIL~%")))))
+              (cond
+                ((not (probe-file "/usr/bin/valgrind"))
+                 (incf *ok*) (format t "e2e-parse-file: ok (valgrind unavailable)~%"))
+                (t
+                 (let* ((vp (sb-ext:run-program "/usr/bin/valgrind"
+                             (list "--error-exitcode=2" "--leak-check=full" "-q" exe)
+                             :output nil :error :stream)))
+                   (sb-ext:process-wait vp)
+                   (if (zerop (sb-ext:process-exit-code vp))
+                       (progn (incf *ok*) (format t "e2e-parse-file: ok (valgrind clean)~%"))
+                       (progn (incf *fail*) (format t "e2e-parse-file: VG FAIL~%")))))))
              (t (incf *fail*)
                 (format t "e2e-parse-file: FAIL got ~s~%" got))))))))
   (format t "C output:~%~a~%" full))
