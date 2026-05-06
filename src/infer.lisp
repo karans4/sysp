@@ -1,4 +1,4 @@
-;;;; Hindley-Milner type inference (monomorphic).
+;;;; Hindley-Milner type inference with let-polymorphism.
 ;;;;
 ;;;; Surface form (possibly with naked params / no ret-type) → fully-annotated
 ;;;; form ready for lower-defn. Nothing below this layer needs to change.
@@ -7,17 +7,78 @@
 ;;;;   :int :bool :unit :string                         -- concrete
 ;;;;   (:fn (T1 T2 ...) Tret)                           -- function type
 ;;;;   (:tvar N)                                        -- type variable
+;;;;   (:forall (id ...) ty)                            -- type scheme
 
 (in-package :sysp-ir)
 
 (defvar *subst*)          ; hash table: tvar id → type
 (defvar *tvar-counter*)
-(defvar *fn-sigs*)        ; sym → (:fn arg-types ret-type)
+(defvar *fn-sigs*)        ; sym → (:fn arg-types ret-type) | (:forall ids (:fn ...))
 
 (defun fresh-tvar ()
   (list :tvar (incf *tvar-counter*)))
 
 (defun tvar-p (ty) (and (consp ty) (eq (first ty) :tvar)))
+(defun forall-p (ty) (and (consp ty) (eq (first ty) :forall)))
+(defun fn-type-p (ty) (and (consp ty) (eq (first ty) :fn)))
+
+(defun free-tvars (ty)
+  "Tvar IDs free in ty, after resolution. Walks fn types and forall bodies."
+  (let ((seen (make-hash-table)) (acc nil))
+    (labels ((rec (ty1 bound)
+               (let ((r (resolve-type ty1)))
+                 (cond
+                   ((tvar-p r)
+                    (let ((id (second r)))
+                      (unless (or (member id bound) (gethash id seen))
+                        (setf (gethash id seen) t)
+                        (push id acc))))
+                   ((forall-p r)
+                    (rec (third r) (append (second r) bound)))
+                   ((fn-type-p r)
+                    (mapc (lambda (a) (rec a bound)) (second r))
+                    (rec (third r) bound))))))
+      (rec ty nil)
+      (nreverse acc))))
+
+(defun env-free-tvars (env)
+  (let ((acc nil))
+    (dolist (b env) (setf acc (union acc (free-tvars (cdr b)))))
+    acc))
+
+(defun substitute-tvars (ty subs)
+  "Substitute tvar IDs to types per alist subs. Resolves before substituting."
+  (let ((r (resolve-type ty)))
+    (cond
+      ((tvar-p r)
+       (let ((s (assoc (second r) subs)))
+         (if s (cdr s) r)))
+      ((fn-type-p r)
+       (list :fn (mapcar (lambda (a) (substitute-tvars a subs)) (second r))
+             (substitute-tvars (third r) subs)))
+      ;; forall: don't substitute under bound names
+      ((forall-p r)
+       (let ((bound (second r)))
+         (list :forall bound
+               (substitute-tvars (third r)
+                                 (remove-if (lambda (s) (member (car s) bound))
+                                            subs)))))
+      (t r))))
+
+(defun generalize (ty env)
+  "Wrap free tvars of ty (not free in env) in a forall."
+  (let* ((ty-r (resolve-type ty))
+         (env-tvars (env-free-tvars env))
+         (free (set-difference (free-tvars ty-r) env-tvars)))
+    (if free (list :forall free ty-r) ty-r)))
+
+(defun instantiate (scheme)
+  "Replace forall-bound tvars with fresh ones. Pass-through for non-schemes."
+  (cond
+    ((forall-p scheme)
+     (let ((subs (mapcar (lambda (id) (cons id (fresh-tvar))) (second scheme))))
+       (substitute-tvars (third scheme) subs)))
+    (t scheme)))
 
 (defun resolve-type (ty)
   "Follow tvar chain to a (possibly partially) concrete type."
@@ -381,8 +442,11 @@
      (let ((sig (and *fn-sigs* (gethash head *fn-sigs*))))
        (unless sig
          (error "infer: unknown function ~A" head))
-       (let ((arg-tys (second sig))
-             (ret-ty  (third sig)))
+       ;; Forall-bound schemes get fresh tvars per call site (let-poly).
+       ;; Raw fn types (intra-SCC recursive references) pass through.
+       (let* ((insted (instantiate sig))
+              (arg-tys (second insted))
+              (ret-ty  (third insted)))
          (unless (= (length arg-tys) (length args))
            (error "infer: ~A expects ~D args, got ~D"
                   head (length arg-tys) (length args)))
@@ -469,21 +533,236 @@
      (mapcar (lambda (p) (list (first p) (second p))) params))
     (t (loop for (name ty) on params by #'cddr collect (list name ty)))))
 
+;;; --- call graph + SCC for let-polymorphism ---
+
+(defun collect-call-targets (form known)
+  "Head-position symbols in form that appear in known."
+  (let ((acc nil))
+    (labels ((rec (e)
+               (when (consp e)
+                 (let ((h (first e)))
+                   (when (and (symbolp h) (member h known))
+                     (pushnew h acc)))
+                 (mapc #'rec (rest e)))))
+      (rec form))
+    acc))
+
+(defun build-call-graph (defn-info)
+  (let ((g (make-hash-table))
+        (names (mapcar #'first defn-info)))
+    (dolist (e defn-info)
+      (destructuring-bind (name typed-params ret-type body) e
+        (declare (ignore typed-params ret-type))
+        (let ((calls nil))
+          (dolist (b body)
+            (setf calls (union calls (collect-call-targets b names))))
+          (setf (gethash name g) calls))))
+    g))
+
+(defun tarjan-sccs (graph node-list)
+  "Tarjan's SCC. Returns SCCs in topological order — callees first."
+  (let ((index 0) (stack nil)
+        (idx (make-hash-table)) (low (make-hash-table))
+        (on-stack (make-hash-table))
+        (sccs nil))
+    (labels ((strongconnect (v)
+               (setf (gethash v idx) index (gethash v low) index)
+               (incf index)
+               (push v stack)
+               (setf (gethash v on-stack) t)
+               (dolist (w (gethash v graph))
+                 (cond
+                   ((not (gethash w idx))
+                    (strongconnect w)
+                    (setf (gethash v low)
+                          (min (gethash v low) (gethash w low))))
+                   ((gethash w on-stack)
+                    (setf (gethash v low)
+                          (min (gethash v low) (gethash w idx))))))
+               (when (= (gethash v low) (gethash v idx))
+                 (let ((scc nil))
+                   (loop
+                     (let ((w (pop stack)))
+                       (setf (gethash w on-stack) nil)
+                       (push w scc)
+                       (when (eq w v) (return))))
+                   (push scc sccs)))))
+      (dolist (v node-list)
+        (unless (gethash v idx) (strongconnect v))))
+    (nreverse sccs)))
+
+;;; --- monomorphization ---
+
+(defvar *mono-cache*)         ; (poly-name concrete-args) → mono-name
+(defvar *mono-defns*)         ; list of (name typed-params ret-type body)
+(defvar *info-table-mono*)    ; name → defn-info entry
+
+(defun mono-type-suffix (ty)
+  (cond
+    ((keywordp ty) (string-downcase (symbol-name ty)))
+    ((fn-type-p ty)
+     (with-output-to-string (s)
+       (write-string "fn" s)
+       (dolist (a (second ty)) (write-char #\_ s) (write-string (mono-type-suffix a) s))
+       (write-char #\_ s) (write-string (mono-type-suffix (third ty)) s)))
+    (t (format nil "~a" ty))))
+
+(defun fresh-mono-name (poly-name concrete-args)
+  (intern (with-output-to-string (s)
+            (write-string (symbol-name poly-name) s)
+            (dolist (ty concrete-args)
+              (write-char #\_ s)
+              (write-string (mono-type-suffix ty) s)))
+          :sysp-ir))
+
+(defun monomorphize-program (defn-info)
+  "Specialize poly defns at each call site. Drops uninstantiated polys
+   in favor of a single :int-defaulted copy (legacy behavior)."
+  (let ((*mono-cache* (make-hash-table :test 'equal))
+        (*mono-defns* nil)
+        (*info-table-mono* (make-hash-table))
+        (concrete nil))
+    (dolist (e defn-info) (setf (gethash (first e) *info-table-mono*) e))
+    ;; Walk concrete defns, specialize their poly call sites in place.
+    (dolist (e defn-info)
+      (let ((scheme (gethash (first e) *fn-sigs*)))
+        (unless (forall-p scheme)
+          (let ((env (mapcar (lambda (p) (cons (first p) (resolve-type (second p))))
+                             (second e))))
+            (dolist (b (fourth e)) (mono-walk b env)))
+          (push e concrete))))
+    ;; For poly defns never instantiated, default-emit (back-compat).
+    (dolist (e defn-info)
+      (let* ((name (first e))
+             (scheme (gethash name *fn-sigs*))
+             (instantiated (loop for k being the hash-keys of *mono-cache*
+                                 thereis (eq (first k) name))))
+        (when (and (forall-p scheme) (not instantiated))
+          (push e concrete))))
+    ;; Annotate forms in declaration order: materialized monos first
+    ;; (they're called by concretes), then concretes.
+    (let ((all (append (nreverse *mono-defns*) (nreverse concrete))))
+      (mapcar (lambda (e)
+                (destructuring-bind (name typed-params ret-type body) e
+                  (let ((rp (mapcar (lambda (p)
+                                      (list (first p) (defaulting (second p))))
+                                    typed-params)))
+                    (list* 'defn name rp (defaulting ret-type) body))))
+              all))))
+
+(defun mono-walk (form env)
+  "Walk form, rewriting poly call heads in place to specialized names."
+  (cond
+    ((atom form) nil)
+    ((eq (first form) 'quote) nil)
+    ((eq (first form) 'cstr)  nil)
+    ((eq (first form) 'sym)   nil)
+    ((eq (first form) 'let)
+     (let ((bindings (second form)) (body (cddr form)) (env2 env))
+       (dolist (b bindings)
+         (mono-walk (second b) env2)
+         (push (cons (first b) (resolve-type (infer (second b) env2))) env2))
+       (dolist (b body) (mono-walk b env2))))
+    ((eq (first form) 'lambda)
+     (multiple-value-bind (raw-params _ret body) (lambda-split-args (rest form))
+       (declare (ignore _ret))
+       (let ((env2 env))
+         (dolist (p raw-params)
+           (let ((np (parse-lambda-param p)))
+             (push (cons (first np) (or (second np) :int)) env2)))
+         (dolist (b body) (mono-walk b env2)))))
+    ((eq (first form) 'set!)
+     (mono-walk (third form) env))
+    ((eq (first form) 'for)
+     (let* ((spec (second form))
+            (var (first spec)) (lo (second spec)) (hi (third spec))
+            (body (cddr form)))
+       (mono-walk lo env) (mono-walk hi env)
+       (dolist (b body)
+         (mono-walk b (cons (cons var :int) env)))))
+    ((eq (first form) 'while)
+     (mono-walk (second form) env)
+     (dolist (b (cddr form)) (mono-walk b env)))
+    ((eq (first form) 'if)
+     (mono-walk (second form) env)
+     (mono-walk (third form) env)
+     (when (fourth form) (mono-walk (fourth form) env)))
+    ((eq (first form) 'do)
+     (dolist (b (rest form)) (mono-walk b env)))
+    ((eq (first form) 'when)
+     (mono-walk (second form) env)
+     (dolist (b (cddr form)) (mono-walk b env)))
+    ((and (symbolp (first form))
+          (let ((sig (gethash (first form) *fn-sigs*)))
+            (forall-p sig)))
+     (dolist (a (rest form)) (mono-walk a env))
+     (mono-walk-poly-call form env))
+    (t
+     (dolist (a (rest form)) (mono-walk a env)))))
+
+(defun mono-walk-poly-call (call-form env)
+  (let* ((poly-name (first call-form))
+         (scheme (gethash poly-name *fn-sigs*))
+         (bound-ids (second scheme))
+         (sig (third scheme))
+         (param-types (second sig))
+         (ret-type (third sig))
+         ;; Fresh substitution for this call site, tracked explicitly so we
+         ;; can read concrete types back per bound id.
+         (subs (mapcar (lambda (id) (cons id (fresh-tvar))) bound-ids))
+         (fresh-params (mapcar (lambda (pt) (substitute-tvars pt subs)) param-types)))
+    (declare (ignore ret-type))
+    ;; Drive unification by re-inferring args.
+    (loop for arg in (rest call-form) for fpt in fresh-params
+          do (unify fpt (infer arg env)))
+    ;; Resolve each bound id to its concrete type.
+    (let* ((concrete-subs (mapcar (lambda (s)
+                                    (cons (car s) (resolve-type (cdr s))))
+                                  subs))
+           (concrete-args (mapcar (lambda (pt) (substitute-tvars pt concrete-subs))
+                                  param-types))
+           (key (list poly-name concrete-args))
+           (mono-name (or (gethash key *mono-cache*)
+                          (materialize-mono poly-name concrete-subs))))
+      (rplaca call-form mono-name))))
+
+(defun materialize-mono (poly-name concrete-subs)
+  (let* ((info (gethash poly-name *info-table-mono*))
+         (orig-typed-params (second info))
+         (orig-ret-type (third info))
+         (orig-body (fourth info))
+         (mono-params (mapcar (lambda (p)
+                                (list (first p)
+                                      (substitute-tvars (second p) concrete-subs)))
+                              orig-typed-params))
+         (mono-ret (substitute-tvars orig-ret-type concrete-subs))
+         (mono-name (fresh-mono-name poly-name (mapcar #'second mono-params)))
+         (key (list poly-name (mapcar #'second mono-params))))
+    ;; Cache before recursing — supports recursive poly fns.
+    (setf (gethash key *mono-cache*) mono-name)
+    (setf (gethash mono-name *fn-sigs*)
+          (list :fn (mapcar #'second mono-params) mono-ret))
+    (let* ((cloned-body (copy-tree orig-body))
+           (env (mapcar (lambda (p) (cons (first p) (second p))) mono-params)))
+      (dolist (b cloned-body) (mono-walk b env))
+      (push (list mono-name mono-params mono-ret cloned-body) *mono-defns*))
+    mono-name))
+
 (defun infer-program (forms &key externs)
-  "Annotate all defns in a program. Handles mutual recursion. Externs are
-   pre-registered so defns can call them."
+  "Annotate all defns. Handles mutual recursion via SCC and let-polymorphism
+   via forall schemes + a per-call-site monomorphization pass."
   (let ((*subst* (make-hash-table))
         (*tvar-counter* 0)
         (*fn-sigs* (make-hash-table))
-        (info nil))
-    ;; Pre-register externs.
+        (defn-info nil))
+    ;; Pre-register externs as monomorphic.
     (dolist (e externs)
       (let* ((name (second e))
              (params (normalize-extern-params (third e)))
              (param-types (mapcar #'second params))
              (ret-type (fourth e)))
         (setf (gethash name *fn-sigs*) (list :fn param-types ret-type))))
-    ;; Pass 1: register each fn's signature with tvars where unannotated.
+    ;; Pass 1: register each defn with fresh-tvars sig.
     (dolist (f forms)
       (destructuring-bind (defn-sym name &rest rest) f
         (declare (ignore defn-sym))
@@ -492,22 +771,27 @@
                  (param-types (mapcar #'second typed-params))
                  (ret-type (or ret-annot (fresh-tvar))))
             (setf (gethash name *fn-sigs*) (list :fn param-types ret-type))
-            (push (list name typed-params ret-type body) info)))))
-    (setf info (nreverse info))
-    ;; Pass 2: infer each body.
-    (dolist (e info)
-      (destructuring-bind (name typed-params ret-type body) e
-        (declare (ignore name))
-        (let ((env (mapcar (lambda (p) (cons (first p) (second p))) typed-params)))
-          (let (last-ty)
-            (dolist (b body) (setf last-ty (infer b env)))
-            (when last-ty (unify ret-type last-ty))))))
-    ;; Pass 3: produce annotated forms.
-    (mapcar (lambda (e)
-              (destructuring-bind (name typed-params ret-type body) e
-                (let ((rp (mapcar (lambda (p)
-                                    (list (first p) (defaulting (second p))))
-                                  typed-params))
-                      (rt (defaulting ret-type)))
-                  (list* 'defn name rp rt body))))
-            info)))
+            (push (list name typed-params ret-type body) defn-info)))))
+    (setf defn-info (nreverse defn-info))
+    ;; Pass 2: SCC-aware inference. Within an SCC, sigs are raw (shared
+    ;; tvars; mutual recursion works). After each SCC's bodies are inferred,
+    ;; generalize all its sigs into forall schemes.
+    (let* ((info-table (make-hash-table))
+           (graph (build-call-graph defn-info))
+           (sccs (tarjan-sccs graph (mapcar #'first defn-info))))
+      (dolist (e defn-info) (setf (gethash (first e) info-table) e))
+      (dolist (scc sccs)
+        (dolist (name scc)
+          (let* ((info (gethash name info-table))
+                 (typed-params (second info))
+                 (ret-type (third info))
+                 (body (fourth info))
+                 (env (mapcar (lambda (p) (cons (first p) (second p))) typed-params)))
+            (let (last-ty)
+              (dolist (b body) (setf last-ty (infer b env)))
+              (when last-ty (unify ret-type last-ty)))))
+        (dolist (name scc)
+          (setf (gethash name *fn-sigs*)
+                (generalize (gethash name *fn-sigs*) nil)))))
+    ;; Pass 3: monomorphize. Returns final list of concrete annotated forms.
+    (monomorphize-program defn-info)))
