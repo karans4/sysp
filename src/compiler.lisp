@@ -69,17 +69,21 @@
       (sb-ext:process-wait proc)
       (sb-ext:process-close proc))))
 
+(defun reset-program-state ()
+  "Clear every persistent global so compile-program is a pure function of
+   its input — running it twice on the same forms must produce the same C."
+  (clrhash *struct-fields*)
+  (clrhash *generic-structs*)
+  (clrhash *generic-struct-instances*)
+  (clrhash *globals*)
+  (setf *lambda-counter* 0))
+
 (defun compile-program (forms &optional (out t))
   "Compile a top-level program: (use ...), (include ...), (defstruct ...),
    (extern-struct ...), (extern ...), (define ...), (enum ...), (defn ...)."
   (setf forms (expand-uses forms))
   (setf forms (expand-macros forms))
-  ;; Reset per-program registries so a long-lived SBCL session doesn't
-  ;; carry stale generic instances or struct fields between compiles.
-  (clrhash *struct-fields*)
-  (clrhash *generic-structs*)
-  (clrhash *generic-struct-instances*)
-  (clrhash *globals*)
+  (reset-program-state)
   (let (includes structs extern-structs defines externs defns)
     (dolist (f forms)
       (case (first f)

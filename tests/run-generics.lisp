@@ -2,46 +2,14 @@
 ;;;; (defstruct (Name :T1 :T2 ...) fields) → template; each concrete
 ;;;; instantiation materializes a per-T struct with substituted field types.
 
-(load "src/load.lisp")
+(load "tests/common.lisp")
 (in-package :sysp-ir)
-
-(defvar *ok* 0) (defvar *fail* 0)
-
-(defun program-c (defns)
-  (with-output-to-string (s) (compile-program defns s)))
-
-(defun cc-and-run (preamble program-c driver expected)
-  (let ((c-file "/tmp/sysp-gen.c") (exe "/tmp/sysp-gen"))
-    (with-open-file (s c-file :direction :output :if-exists :supersede)
-      (write-string preamble s) (terpri s)
-      (write-string program-c s) (terpri s)
-      (write-string driver s))
-    (let ((cc (sb-ext:run-program "/usr/bin/cc"
-                                  (list "-O0" "-Isrc" "-Iruntime" "-o" exe c-file
-                                        "runtime/value.c")
-                                  :output t :error t)))
-      (unless (zerop (sb-ext:process-exit-code cc))
-        (incf *fail*) (format t " [CC FAIL]~%") (return-from cc-and-run nil)))
-    (let* ((p (sb-ext:run-program exe nil :output :stream))
-           (out (with-output-to-string (s)
-                  (loop for line = (read-line (sb-ext:process-output p) nil nil)
-                        while line do (write-line line s)))))
-      (sb-ext:process-wait p)
-      (let ((got (string-trim '(#\Newline #\Space) out)))
-        (if (string= got expected)
-            (progn (incf *ok*) (format t " ok~%"))
-            (progn (incf *fail*) (format t " FAIL got ~s want ~s~%" got expected)))))))
-
-(defun check-prog (label defns driver expected)
-  (format t "~a:" label)
-  (cc-and-run "#include \"runtime.h\"" (program-c defns) driver expected))
 
 ;; --- Box<int>: simplest case, value-typed field ---
 (check-prog "box-int"
             '((defstruct (Box :T) ((value :T)))
               (defn use () :int (get-field (Box 5) value)))
-            "#include <stdio.h>
-int main(){ printf(\"%d\\n\", use()); return 0; }"
+            "int main(){ printf(\"%d\\n\", use()); return 0; }"
             "5")
 
 ;; --- Two materializations of Box at different int widths ---
@@ -49,8 +17,7 @@ int main(){ printf(\"%d\\n\", use()); return 0; }"
             '((defstruct (Box :T) ((value :T)))
               (defn use-int () :int (get-field (Box 42) value))
               (defn use-u8  () :u8  (cast :u8 (get-field (Box 7) value))))
-            "#include <stdio.h>
-int main(){ printf(\"%d %d\\n\", use_int(), use_u8()); return 0; }"
+            "int main(){ printf(\"%d %d\\n\", use_int(), use_u8()); return 0; }"
             "42 7")
 
 ;; --- Box<String>: rc'd field. Without retain at struct-init + auto
@@ -72,8 +39,7 @@ int main(){ printf(\"%d %d\\n\", use_int(), use_u8()); return 0; }"
               (defn name-and-len () :int
                 (let ((p (Pair (string-concat "ab" "cd") 99)))
                   (+ (string-len (get-field p fst)) (get-field p snd)))))
-            "#include <stdio.h>
-int main(){ printf(\"%d\\n\", name_and_len()); return 0; }"
+            "int main(){ printf(\"%d\\n\", name_and_len()); return 0; }"
             "103")
 
 ;; --- Two type params: Pair<int, int> with both fields read ---
@@ -81,8 +47,7 @@ int main(){ printf(\"%d\\n\", name_and_len()); return 0; }"
             '((defstruct (Pair :A :B) ((fst :A) (snd :B)))
               (defn use-fst () :int (get-field (Pair 7 99) fst))
               (defn use-snd () :int (get-field (Pair 7 99) snd)))
-            "#include <stdio.h>
-int main(){ printf(\"%d %d\\n\", use_fst(), use_snd()); return 0; }"
+            "int main(){ printf(\"%d %d\\n\", use_fst(), use_snd()); return 0; }"
             "7 99")
 
 ;; --- Vec<int> with a (:ptr :T) field — generic data structure as
@@ -117,13 +82,10 @@ int main(){ printf(\"%d %d\\n\", use_fst(), use_snd()); return 0; }"
                   (let ((v1 (vec-push-i v  10)))
                     (let ((v2 (vec-push-i v1 20)))
                       (let ((v3 (vec-push-i v2 30)))
-                        ;; sum first three
                         (+ (ptr-ref (get-field v3 data) 0)
                            (+ (ptr-ref (get-field v3 data) 1)
                               (ptr-ref (get-field v3 data) 2)))))))))
-            "#include <stdio.h>
-int main(){ printf(\"%d\\n\", use()); return 0; }"
+            "int main(){ printf(\"%d\\n\", use()); return 0; }"
             "60")
 
-(format t "~%~a passed, ~a failed~%" *ok* *fail*)
-(unless (zerop *fail*) (sb-ext:exit :code 1))
+(report-and-exit)

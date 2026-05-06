@@ -1,85 +1,63 @@
-(load "src/load.lisp")
+(load "tests/common.lisp")
 (in-package :sysp-ir)
 
-(defvar *ok* 0) (defvar *fail* 0)
-
-(defun cc-and-run (program-c expected)
-  (let ((c-file "/tmp/sysp-ir-cl.c") (exe "/tmp/sysp-ir-cl"))
-    (with-open-file (s c-file :direction :output :if-exists :supersede)
-      (write-string "#include \"runtime.h\"" s) (terpri s)
-      (write-string program-c s) (terpri s))
-    (let ((cc (sb-ext:run-program "/usr/bin/cc"
-                  (list "-O0" "-Isrc" "-Iruntime" "-o" exe c-file "runtime/value.c")
-                  :output t :error t)))
-      (unless (zerop (sb-ext:process-exit-code cc))
-        (incf *fail*) (format t " [CC FAIL]~%") (return-from cc-and-run nil)))
-    (let ((p (sb-ext:run-program exe nil :output nil)))
-      (sb-ext:process-wait p)
-      (let ((got (sb-ext:process-exit-code p)))
-        (if (= got expected)
-            (progn (incf *ok*) (format t " ok (exit ~a)~%" got))
-            (progn (incf *fail*) (format t " FAIL exit ~a want ~a~%" got expected)))))))
-
-(defun program-c (forms) (with-output-to-string (s) (compile-program forms s)))
-(defun check (label forms expected)
-  (format t "~a:" label)
-  (cc-and-run (program-c forms) expected))
+;; All exit-code tests — sysp main IS the C main; no driver needed.
+(defparameter +driver+ "")
 
 ;; Non-capturing
-(check "lambda-no-capture"
-       '((defn main () :int
-            (let ((f (lambda ((x :int)) :int (+ x 1))))
-              (call f 9))))
-       10)
+(check-prog "lambda-no-capture"
+            '((defn main () :int
+                (let ((f (lambda ((x :int)) :int (+ x 1))))
+                  (call f 9))))
+            +driver+ 10 :mode :exit)
 
 ;; Single capture
-(check "lambda-1-capture"
-       '((defn main () :int
-            (let ((n 100))
-              (let ((adder (lambda ((x :int)) :int (+ x n))))
-                (call adder 7)))))
-       107)
+(check-prog "lambda-1-capture"
+            '((defn main () :int
+                (let ((n 100))
+                  (let ((adder (lambda ((x :int)) :int (+ x n))))
+                    (call adder 7)))))
+            +driver+ 107 :mode :exit)
 
 ;; Multiple captures
-(check "lambda-2-captures"
-       '((defn main () :int
-            (let ((a 3) (b 4))
-              (let ((f (lambda ((x :int)) :int (+ (* a x) b))))
-                (call f 10)))))
-       34)
+(check-prog "lambda-2-captures"
+            '((defn main () :int
+                (let ((a 3) (b 4))
+                  (let ((f (lambda ((x :int)) :int (+ (* a x) b))))
+                    (call f 10)))))
+            +driver+ 34 :mode :exit)
 
 ;; Pass closure as argument
-(check "hof"
-       '((defn apply-fn ((f :Fn) (x :int)) :int (call f x))
-         (defn main () :int
-            (let ((m 5))
-              (let ((times-m (lambda ((x :int)) :int (* x m))))
-                (apply-fn times-m 8)))))
-       40)
+(check-prog "hof"
+            '((defn apply-fn ((f :Fn) (x :int)) :int (call f x))
+              (defn main () :int
+                (let ((m 5))
+                  (let ((times-m (lambda ((x :int)) :int (* x m))))
+                    (apply-fn times-m 8)))))
+            +driver+ 40 :mode :exit)
 
 ;; Two closures over different captures, used independently
-(check "two-closures"
-       '((defn main () :int
-            (let ((a (let ((n1 10))
-                       (lambda ((x :int)) :int (+ x n1))))
-                  (b (let ((n2 20))
-                       (lambda ((x :int)) :int (+ x n2)))))
-              (+ (call a 1) (call b 1)))))
-       32)
+(check-prog "two-closures"
+            '((defn main () :int
+                (let ((a (let ((n1 10))
+                           (lambda ((x :int)) :int (+ x n1))))
+                      (b (let ((n2 20))
+                           (lambda ((x :int)) :int (+ x n2)))))
+                  (+ (call a 1) (call b 1)))))
+            +driver+ 32 :mode :exit)
 
 ;; rc'd capture: lambda captures a String. Without retain at capture +
 ;; release on Fn cleanup, the captured buf would be freed by the outer
 ;; fn's ARC pass before the lambda runs (UAF), or leak forever. Lambda
 ;; body returns string-len(captured) — UAF would crash or return junk;
 ;; correct behavior returns the actual length.
-(check "lambda-captures-string"
-       '((defn make-len-of ((prefix :string)) (:fn () :int)
-           (lambda () :int (string-len prefix)))
-         (defn main () :int
-           (let ((s (string-concat "hello" "_world")))
-             (let ((f (make-len-of s)))
-               (call f)))))
-       11)
+(check-prog "lambda-captures-string"
+            '((defn make-len-of ((prefix :string)) (:fn () :int)
+                (lambda () :int (string-len prefix)))
+              (defn main () :int
+                (let ((s (string-concat "hello" "_world")))
+                  (let ((f (make-len-of s)))
+                    (call f)))))
+            +driver+ 11 :mode :exit)
 
-(format t "~%~a passed, ~a failed~%" *ok* *fail*)
-(unless (zerop *fail*) (sb-ext:exit :code 1))
+(report-and-exit)

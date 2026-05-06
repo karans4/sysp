@@ -15,6 +15,20 @@
 (defvar *tvar-counter*)
 (defvar *fn-sigs*)        ; sym → (:fn arg-types ret-type) | (:forall ids (:fn ...))
 
+;;; The cons cell currently being type-checked. Read by infer-error to look
+;;; up the source location attached by the parser. Reset by every recursive
+;;; descent into a child form.
+(defvar *current-form* nil)
+
+(defun infer-error (fmt &rest args)
+  "Signal an inference error pointing at *current-form* if a location is
+   known. Falls back to a plain error when called from a form built at
+   compile time (no parser-attached location)."
+  (cond
+    ((and *current-form* (loc-of *current-form*))
+     (apply #'error-at *current-form* fmt args))
+    (t (apply #'error fmt args))))
+
 (defun fresh-tvar ()
   (list :tvar (incf *tvar-counter*)))
 
@@ -157,7 +171,7 @@
       ((and (consp r1) (consp r2)
             (eq (first r1) :fn) (eq (first r2) :fn))
        (unless (= (length (second r1)) (length (second r2)))
-         (error "infer: arity mismatch ~A vs ~A" r1 r2))
+         (infer-error "infer: arity mismatch ~A vs ~A" r1 r2))
        (mapc #'unify (second r1) (second r2))
        (unify (third r1) (third r2)))
       ;; Two generic struct apps unify when the names match and each
@@ -172,7 +186,7 @@
             (eq (first r1) :ptr) (eq (first r2) :ptr))
        (unify (second r1) (second r2))
        t)
-      (t (error "infer: type mismatch ~A vs ~A" r1 r2)))))
+      (t (infer-error "infer: type mismatch ~A vs ~A" r1 r2)))))
 
 ;;; --- inference walk ---
 
@@ -188,9 +202,12 @@
        (cond
          (b (cdr b))
          ((gethash e *globals*) (first (gethash e *globals*)))
-         (t (error "infer: unbound symbol ~A" e)))))
-    ((consp e) (infer-form (car e) (cdr e) env))
-    (t (error "infer: cannot type ~A" e))))
+         (t (infer-error "infer: unbound symbol ~A" e)))))
+    ((consp e)
+     ;; Track the current form so deeper errors carry the right location.
+     (let ((*current-form* e))
+       (infer-form (car e) (cdr e) env)))
+    (t (infer-error "infer: cannot type ~A" e))))
 
 (defgeneric infer-form (head args env))
 
@@ -337,17 +354,17 @@
        (let ((arg-tys (second fty))
              (ret-ty  (third fty)))
          (unless (= (length arg-tys) (length (rest args)))
-           (error "call: expected ~D args, got ~D"
-                  (length arg-tys) (length (rest args))))
+           (infer-error "call: expected ~D args, got ~D"
+                        (length arg-tys) (length (rest args))))
          (loop for a in (rest args) for at in arg-tys
                do (unify at (infer a env)))
          ret-ty))
-      (t (error "call: expected fn, got ~A" fty)))))
+      (t (infer-error "call: expected fn, got ~A" fty)))))
 
 (defmethod infer-form ((head (eql 'addr-of)) args env)
   (let* ((sym (first args))
          (b (assoc sym env)))
-    (unless b (error "addr-of: unbound ~A" sym))
+    (unless b (infer-error "addr-of: unbound ~A" sym))
     (let ((inner (resolve-type (cdr b))))
       (intern (format nil "PTR-~A" (symbol-name inner)) :keyword))))
 
@@ -363,7 +380,7 @@
               (and (> (length s) 4) (string-equal s "PTR-" :end1 4))))
        (intern (subseq (symbol-name pty) 4) :keyword))
       ((eq pty :ptr-void) :u8)
-      (t (error "deref: expected pointer, got ~A" pty)))))
+      (t (infer-error "deref: expected pointer, got ~A" pty)))))
 
 (defmethod infer-form ((head (eql 'ptr-ref)) args env)
   (let ((pty (resolve-type (infer (first args) env))))
@@ -407,7 +424,7 @@
 (defmethod infer-form ((head (eql 'set!)) args env)
   (let* ((target (first args))
          (tgt-ty (cdr (assoc target env))))
-    (unless tgt-ty (error "infer: set! on unbound ~A" target))
+    (unless tgt-ty (infer-error "infer: set! on unbound ~A" target))
     (unify tgt-ty (infer (second args) env))
     :unit))
 
@@ -500,7 +517,7 @@
          (subs (mapcar #'cons params concrete))
          (field-spec (assoc field-sym fields)))
     (unless field-spec
-      (error "get-field: generic struct ~A has no field ~A" name field-sym))
+      (infer-error "get-field: generic struct ~A has no field ~A" name field-sym))
     (subst-type-params (second field-spec) subs)))
 
 (defmethod infer-form ((head (eql 'get-field)) args env)
@@ -510,8 +527,8 @@
     (cond
       ((generic-type-p obj-ty) (generic-field-type obj-ty field-sym))
       (struct-ty (struct-field-type struct-ty field-sym))
-      (t (error "get-field: ~A is not a struct or struct pointer, got ~A"
-                (first args) obj-ty)))))
+      (t (infer-error "get-field: ~A is not a struct or struct pointer, got ~A"
+                      (first args) obj-ty)))))
 
 (defmethod infer-form ((head (eql 'set-field!)) args env)
   (let* ((obj-ty (resolve-type (infer (first args) env)))
@@ -525,8 +542,8 @@
       (struct-ty
        (unify (struct-field-type struct-ty field-sym) val-ty)
        :unit)
-      (t (error "set-field!: ~A is not a struct or struct pointer, got ~A"
-                (first args) obj-ty)))))
+      (t (infer-error "set-field!: ~A is not a struct or struct pointer, got ~A"
+                      (first args) obj-ty)))))
 
 (defmethod infer-form (head args env)
   ;; Default: struct constructor (concrete or generic) OR function call.
@@ -535,8 +552,8 @@
      ;; Concrete struct constructor: types must match field types.
      (let ((fields (gethash head *struct-fields*)))
        (unless (= (length fields) (length args))
-         (error "struct ~A: expected ~D fields, got ~D"
-                head (length fields) (length args)))
+         (infer-error "struct ~A: expected ~D fields, got ~D"
+                      head (length fields) (length args)))
        (loop for a in args for f in fields
              do (unify (second f) (infer a env)))
        (struct-type-keyword head)))
@@ -549,23 +566,23 @@
             (fields (second entry))
             (subs (mapcar (lambda (p) (cons p (fresh-tvar))) params)))
        (unless (= (length fields) (length args))
-         (error "generic struct ~A: expected ~D fields, got ~D"
-                head (length fields) (length args)))
+         (infer-error "generic struct ~A: expected ~D fields, got ~D"
+                      head (length fields) (length args)))
        (loop for a in args for f in fields
              do (unify (subst-type-params (second f) subs) (infer a env)))
        (list* :generic head (mapcar #'cdr subs))))
     (t
      (let ((sig (and *fn-sigs* (gethash head *fn-sigs*))))
        (unless sig
-         (error "infer: unknown function ~A" head))
+         (infer-error "infer: unknown function ~A" head))
        ;; Forall-bound schemes get fresh tvars per call site (let-poly).
        ;; Raw fn types (intra-SCC recursive references) pass through.
        (let* ((insted (instantiate sig))
               (arg-tys (second insted))
               (ret-ty  (third insted)))
          (unless (= (length arg-tys) (length args))
-           (error "infer: ~A expects ~D args, got ~D"
-                  head (length arg-tys) (length args)))
+           (infer-error "infer: ~A expects ~D args, got ~D"
+                        head (length arg-tys) (length args)))
          (loop for a in args for at in arg-tys
                do (unify at (infer a env)))
          ret-ty)))))
@@ -736,17 +753,11 @@
        (write-char #\_ s) (write-string (mono-type-suffix (third ty)) s)))
     (t (format nil "~a" ty))))
 
-(defun fresh-mono-name (poly-name concrete-args)
-  (intern (with-output-to-string (s)
-            (write-string (symbol-name poly-name) s)
-            (dolist (ty concrete-args)
-              (write-char #\_ s)
-              (write-string (mono-type-suffix ty) s)))
-          :sysp-ir))
-
-(defun mangle-generic-instance (name concrete-args)
-  "Symbol for the materialized monomorphic struct: Box + (:int) → Box_int.
-   Lowercase suffix so c-name's mixed-case detection preserves it verbatim."
+(defun mono-mangle (name concrete-args)
+  "Symbol for a monomorphized fn or generic-struct instance, e.g.
+   id + (:int) → id_int, Box + (:string) → Box_string. Used by both poly-fn
+   mono and generic-struct mono. The symbol is interned mixed-case so
+   c-name's preserve-on-mixed heuristic emits it verbatim in C."
   (intern (with-output-to-string (s)
             (write-string (symbol-name name) s)
             (dolist (ty concrete-args)
@@ -762,7 +773,7 @@
   (let* ((concrete-args (mapcar (lambda (a) (defaulting a)) concrete-args))
          (key (cons name concrete-args)))
     (or (gethash key *generic-struct-instances*)
-        (let* ((mangled (mangle-generic-instance name concrete-args))
+        (let* ((mangled (mono-mangle name concrete-args))
                (entry (gethash name *generic-structs*))
                (params (first entry))
                (fields (second entry))
@@ -783,7 +794,13 @@
         (*mono-defns* nil)
         (*info-table-mono* (make-hash-table))
         (concrete nil))
-    (dolist (e defn-info) (setf (gethash (first e) *info-table-mono*) e))
+    ;; Make a working copy of each defn's body. mono-walk uses rplaca to
+    ;; rewrite generic ctors / poly-fn-call heads to mangled names — it
+    ;; would mutate the parser-tracked source forms otherwise, breaking
+    ;; both source locations and any second compile-program on the same input.
+    (dolist (e defn-info)
+      (setf (fourth e) (copy-tree (fourth e)))
+      (setf (gethash (first e) *info-table-mono*) e))
     ;; Walk concrete defns, specialize their poly call sites in place.
     (dolist (e defn-info)
       (let ((scheme (gethash (first e) *fn-sigs*)))
@@ -912,7 +929,7 @@
                                       (substitute-tvars (second p) concrete-subs)))
                               orig-typed-params))
          (mono-ret (substitute-tvars orig-ret-type concrete-subs))
-         (mono-name (fresh-mono-name poly-name (mapcar #'second mono-params)))
+         (mono-name (mono-mangle poly-name (mapcar #'second mono-params)))
          (key (list poly-name (mapcar #'second mono-params))))
     ;; Cache before recursing — supports recursive poly fns.
     (setf (gethash key *mono-cache*) mono-name)
