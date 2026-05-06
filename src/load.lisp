@@ -4,6 +4,7 @@
 (load "src/parser.lisp")
 (load "src/ir.lisp")
 (load "src/infer.lisp")
+(load "src/mono.lisp")
 (load "src/lower.lisp")
 (load "src/liveness.lisp")
 (load "src/arc.lisp")
