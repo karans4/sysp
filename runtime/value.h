@@ -65,6 +65,9 @@ typedef struct Closure {
 typedef struct Fn {
     void* invoke;     /* compiled: function ptr.  interp: trampoline. */
     void* state;      /* compiled: env struct ptr. interp: Closure*.  */
+    /* Per-env destructor. Called on state before free(state) when the
+     * Fn's rc hits 0. NULL if state has no rc'd captures. */
+    void  (*release_state)(void*);
     int   rc;
 } Fn;
 
@@ -148,10 +151,10 @@ FILE* runtime_stderr(void);
  * with VAL_FN tag.
  */
 
-/* Compiled lambda: just a thin Fn wrapper around a function pointer +
- * heap env struct. The runtime frees state when Fn's rc → 0 (assumes
- * env contains no rc'd captures for v1). */
-struct Fn* make_fn(void* invoke, void* state);
+/* Compiled lambda: thin Fn wrapper around a function pointer + heap env
+ * struct. release_state is invoked on state before state is freed when
+ * the Fn's rc hits 0. Pass NULL when state has no rc'd captures. */
+struct Fn* make_fn(void* invoke, void* state, void (*release_state)(void*));
 
 Value val_closure(Value params, Value body, Value env);
 Value closure_params(Value v);

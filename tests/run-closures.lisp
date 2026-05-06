@@ -6,9 +6,10 @@
 (defun cc-and-run (program-c expected)
   (let ((c-file "/tmp/sysp-ir-cl.c") (exe "/tmp/sysp-ir-cl"))
     (with-open-file (s c-file :direction :output :if-exists :supersede)
+      (write-string "#include \"runtime.h\"" s) (terpri s)
       (write-string program-c s) (terpri s))
     (let ((cc (sb-ext:run-program "/usr/bin/cc"
-                  (list "-O0" "-Iruntime" "-o" exe c-file "runtime/value.c")
+                  (list "-O0" "-Isrc" "-Iruntime" "-o" exe c-file "runtime/value.c")
                   :output t :error t)))
       (unless (zerop (sb-ext:process-exit-code cc))
         (incf *fail*) (format t " [CC FAIL]~%") (return-from cc-and-run nil)))
@@ -65,6 +66,20 @@
                        (lambda ((x :int)) :int (+ x n2)))))
               (+ (call a 1) (call b 1)))))
        32)
+
+;; rc'd capture: lambda captures a String. Without retain at capture +
+;; release on Fn cleanup, the captured buf would be freed by the outer
+;; fn's ARC pass before the lambda runs (UAF), or leak forever. Lambda
+;; body returns string-len(captured) — UAF would crash or return junk;
+;; correct behavior returns the actual length.
+(check "lambda-captures-string"
+       '((defn make-len-of ((prefix :string)) (:fn () :int)
+           (lambda () :int (string-len prefix)))
+         (defn main () :int
+           (let ((s (string-concat "hello" "_world")))
+             (let ((f (make-len-of s)))
+               (call f)))))
+       11)
 
 (format t "~%~a passed, ~a failed~%" *ok* *fail*)
 (unless (zerop *fail*) (sb-ext:exit :code 1))

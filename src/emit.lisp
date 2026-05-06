@@ -121,6 +121,22 @@
               (string-downcase (symbol-name (first f)))))
     (format out "} ~a;~%" (symbol-name name))))
 
+(defun emit-env-destructor (form out)
+  "Emit a static <Env>_release(void* p) for each lambda env struct that
+   carries rc'd captures. No-op when the env has none — the lambda site
+   passes NULL for release_state in that case."
+  (let* ((name (second form))
+         (fields (normalize-struct-fields (cddr form)))
+         (rc-fields (remove-if-not (lambda (f) (ref-type-p (second f))) fields)))
+    (when rc-fields
+      (format out "static void ~a_release(void* _p) {~%" (symbol-name name))
+      (format out "  ~a* e = (~a*)_p;~%" (symbol-name name) (symbol-name name))
+      (dolist (f rc-fields)
+        (format out "  ~a(e->~a);~%"
+                (rc-fn-name (second f) "release")
+                (string-downcase (symbol-name (first f)))))
+      (format out "}~%~%"))))
+
 (defun emit-include (form out)
   "(include \"foo.h\") → #include \"foo.h\"
    (include \"<stdio.h>\") → #include <stdio.h>"

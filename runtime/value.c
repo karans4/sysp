@@ -104,8 +104,11 @@ void val_release(Value v) {
                         free(c);
                     }
                 } else if (fn->state) {
-                    /* Compiled lambda env: plain malloc'd, free directly.
-                     * (v1: assumes no rc'd captures inside.) */
+                    /* Compiled lambda env: invoke per-env destructor (which
+                     * releases any rc'd captures), then free the malloc'd
+                     * state struct. release_state is NULL for envs with no
+                     * rc'd captures. */
+                    if (fn->release_state) fn->release_state(fn->state);
                     free(fn->state);
                 }
                 free(fn);
@@ -338,11 +341,12 @@ FILE* runtime_stderr(void) { return stderr; }
  * For now, helpers don't set invoke — the interpreter does so before
  * the closure is ever called. */
 
-struct Fn* make_fn(void* invoke, void* state) {
+struct Fn* make_fn(void* invoke, void* state, void (*release_state)(void*)) {
     Fn* fn = malloc(sizeof(Fn));
-    fn->invoke = invoke;
-    fn->state  = state;
-    fn->rc     = 1;
+    fn->invoke         = invoke;
+    fn->state          = state;
+    fn->release_state  = release_state;
+    fn->rc             = 1;
     return fn;
 }
 

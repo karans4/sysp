@@ -226,14 +226,27 @@
                              ,@body-with-unpack))
               *lambda-fns*))
       ;; At the use site: build env, malloc + fill if captures, make Fn.
-      (emit-lambda-site env-name fn-name free-vars param-types ret-type env))))
+      (emit-lambda-site env-name fn-name free-vars free-types
+                        param-types ret-type env))))
 
-(defun emit-lambda-site (env-name fn-name free-vars param-types ret-type env)
+(defun env-needs-destructor-p (free-types)
+  "Any rc'd capture means the env struct's destructor is non-trivial."
+  (some #'ref-type-p free-types))
+
+(defun env-destructor-name (env-name)
+  ;; Lower-case suffix so the symbol is mixed-case overall — c-name treats
+  ;; mixed-case as preserve-verbatim, matching the struct decl's emission.
+  (intern (concatenate 'string (symbol-name env-name) "_release") :sysp-ir))
+
+(defun emit-lambda-site (env-name fn-name free-vars free-types
+                         param-types ret-type env)
   ;; Allocate env (if captures), fill from current scope, make_fn.
-  (declare (ignore param-types ret-type env))
+  (declare (ignore env))
   (let ((env-ptr (fresh-tmp))
         (state-arg (fresh-tmp))
-        (fn-tmp (fresh-tmp)))
+        (release-arg (fresh-tmp))
+        (fn-tmp (fresh-tmp))
+        (has-rc (env-needs-destructor-p free-types)))
     (cond
       (free-vars
        ;; Allocate the env struct.
@@ -253,25 +266,38 @@
                                                             (symbol-name env-name))
                                                     :keyword)
                                             mp))))
-         ;; Fill captured fields
-         (dolist (v free-vars)
-           (emit (make-ir-instr :dst nil :type :unit :op :field-set-ptr
-                                :args (list env-ptr v v))))
+         ;; Retain rc'd captures before storing them in the env: env now
+         ;; co-owns each rc'd value, paired with the destructor's release.
+         (loop for v in free-vars for ty in free-types do
+               (when (ref-type-p ty)
+                 (emit (make-ir-instr :dst nil :type ty :op :retain :args (list v))))
+               (emit (make-ir-instr :dst nil :type :unit :op :field-set-ptr
+                                    :args (list env-ptr v v))))
          ;; Cast env-ptr to void* for make_fn
          (emit (make-ir-instr :dst state-arg :type :ptr-void :op :cast
-                              :args (list :ptr-void env-ptr))))
-       )
+                              :args (list :ptr-void env-ptr)))))
       (t
        ;; No captures: state = NULL via (cast :ptr-void 0)
        (let ((zt (fresh-tmp)))
          (emit (make-ir-instr :dst zt :type :int :op :const :args (list 0)))
          (emit (make-ir-instr :dst state-arg :type :ptr-void :op :cast
                               :args (list :ptr-void zt))))))
+    ;; Build the release_state pointer arg: address of the env destructor
+    ;; if captures need rc cleanup, NULL otherwise.
+    (cond
+      (has-rc
+       (emit (make-ir-instr :dst release-arg :type :ptr-void :op :fn-addr
+                            :args (list (env-destructor-name env-name)))))
+      (t
+       (let ((zt (fresh-tmp)))
+         (emit (make-ir-instr :dst zt :type :int :op :const :args (list 0)))
+         (emit (make-ir-instr :dst release-arg :type :ptr-void :op :cast
+                              :args (list :ptr-void zt))))))
     (let ((fn-ptr-tmp (fresh-tmp)))
       (emit (make-ir-instr :dst fn-ptr-tmp :type :ptr-void :op :fn-addr
                            :args (list fn-name)))
       (emit (make-ir-instr :dst fn-tmp :type :Fn :op :call
-                           :args (list 'make_fn fn-ptr-tmp state-arg))))
+                           :args (list 'make_fn fn-ptr-tmp state-arg release-arg))))
     ;; Type-channel returns the structural (:fn ...) so call sites can read
     ;; ret-ty even though the IR-level value tag stays :Fn.
     (values fn-tmp (list :fn param-types ret-type))))

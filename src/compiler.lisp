@@ -141,7 +141,9 @@
         (when *uses-value* (format out "#include \"value.h\"~%"))
         (when (or includes *uses-value*) (terpri out))
         (dolist (s structs)        (emit-struct-decl s out) (terpri out))
-        (dolist (s extra-structs)  (emit-struct-decl s out) (terpri out))
+        (dolist (s extra-structs)
+          (emit-struct-decl s out) (terpri out)
+          (emit-env-destructor s out))
         (dolist (d defines)
           (let ((name (second d)) (val (third d)))
             (format out "static const ~a ~a = ~a;~%"
