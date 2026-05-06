@@ -19,11 +19,24 @@
 ;;; Struct registry: name (symbol) → list of (field-name field-type) pairs.
 (defvar *struct-fields* (make-hash-table))
 
+;;; Generic struct templates: name (symbol) → (params fields), where
+;;; params is a list of type-param keywords like (:T :U) and fields is
+;;; the raw template that may reference those keywords. Concrete instances
+;;; are produced by mono and added to *struct-fields* under a mangled name.
+(defvar *generic-structs* (make-hash-table))
+
+;;; Concrete instantiations seen this compile: (name . concrete-args)
+;;; → mangled-name keyword. Drives per-program emit of struct decls.
+(defvar *generic-struct-instances* (make-hash-table :test 'equal))
+
 ;;; Top-level constants: name → (type literal-value).
 (defvar *globals* (make-hash-table))
 
 (defun struct-name-p (sym)
   (and (symbolp sym) (gethash sym *struct-fields*)))
+
+(defun generic-struct-name-p (sym)
+  (and (symbolp sym) (gethash sym *generic-structs*)))
 
 (defun struct-type-keyword (sym)
   "Convert struct name symbol to its type keyword: CPU → :CPU."

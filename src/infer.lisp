@@ -21,6 +21,40 @@
 (defun tvar-p (ty) (and (consp ty) (eq (first ty) :tvar)))
 (defun forall-p (ty) (and (consp ty) (eq (first ty) :forall)))
 (defun fn-type-p (ty) (and (consp ty) (eq (first ty) :fn)))
+(defun generic-type-p (ty) (and (consp ty) (eq (first ty) :generic)))
+
+(defun canonicalize-type (ty)
+  "Recognize (Name args) where Name is a registered generic struct as the
+   applied form (:generic Name args). Idempotent and recursive — :ptr,
+   :fn, and nested (:generic ...) all get walked."
+  (cond
+    ((and (consp ty) (symbolp (first ty)) (generic-struct-name-p (first ty)))
+     (list* :generic (first ty) (mapcar #'canonicalize-type (rest ty))))
+    ((generic-type-p ty)
+     (list* :generic (second ty) (mapcar #'canonicalize-type (cddr ty))))
+    ((and (consp ty) (eq (first ty) :ptr))
+     (list :ptr (canonicalize-type (second ty))))
+    ((fn-type-p ty)
+     (list :fn (mapcar #'canonicalize-type (second ty))
+           (canonicalize-type (third ty))))
+    (t ty)))
+
+(defun subst-type-params (ty subs)
+  "Substitute type-param keywords (e.g. :T) with concrete types per alist subs.
+   Distinct from substitute-tvars: this targets keyword params, not tvar IDs.
+   Canonicalizes first so (Name args) sugar inside templates is handled."
+  (let ((ty (canonicalize-type ty)))
+    (cond
+      ((and (keywordp ty) (assoc ty subs)) (cdr (assoc ty subs)))
+      ((and (consp ty) (eq (first ty) :ptr))
+       (list :ptr (subst-type-params (second ty) subs)))
+      ((fn-type-p ty)
+       (list :fn (mapcar (lambda (a) (subst-type-params a subs)) (second ty))
+             (subst-type-params (third ty) subs)))
+      ((generic-type-p ty)
+       (list* :generic (second ty)
+              (mapcar (lambda (a) (subst-type-params a subs)) (cddr ty))))
+      (t ty))))
 
 (defun free-tvars (ty)
   "Tvar IDs free in ty, after resolution. Walks fn types and forall bodies."
@@ -37,7 +71,9 @@
                     (rec (third r) (append (second r) bound)))
                    ((fn-type-p r)
                     (mapc (lambda (a) (rec a bound)) (second r))
-                    (rec (third r) bound))))))
+                    (rec (third r) bound))
+                   ((generic-type-p r)
+                    (mapc (lambda (a) (rec a bound)) (cddr r)))))))
       (rec ty nil)
       (nreverse acc))))
 
@@ -56,6 +92,9 @@
       ((fn-type-p r)
        (list :fn (mapcar (lambda (a) (substitute-tvars a subs)) (second r))
              (substitute-tvars (third r) subs)))
+      ((generic-type-p r)
+       (list* :generic (second r)
+              (mapcar (lambda (a) (substitute-tvars a subs)) (cddr r))))
       ;; forall: don't substitute under bound names
       ((forall-p r)
        (let ((bound (second r)))
@@ -86,8 +125,10 @@
     ((tvar-p ty)
      (let ((sub (gethash (second ty) *subst*)))
        (if sub (resolve-type sub) ty)))
-    ((and (consp ty) (eq (first ty) :fn))
+    ((fn-type-p ty)
      (list :fn (mapcar #'resolve-type (second ty)) (resolve-type (third ty))))
+    ((generic-type-p ty)
+     (list* :generic (second ty) (mapcar #'resolve-type (cddr ty))))
     (t ty)))
 
 (defun unify (t1 t2)
@@ -119,6 +160,18 @@
          (error "infer: arity mismatch ~A vs ~A" r1 r2))
        (mapc #'unify (second r1) (second r2))
        (unify (third r1) (third r2)))
+      ;; Two generic struct apps unify when the names match and each
+      ;; argument unifies positionally — same shape as :fn.
+      ((and (generic-type-p r1) (generic-type-p r2)
+            (eq (second r1) (second r2))
+            (= (length (cddr r1)) (length (cddr r2))))
+       (mapc #'unify (cddr r1) (cddr r2))
+       t)
+      ;; Pointer types unify element-wise.
+      ((and (consp r1) (consp r2)
+            (eq (first r1) :ptr) (eq (first r2) :ptr))
+       (unify (second r1) (second r2))
+       t)
       (t (error "infer: type mismatch ~A vs ~A" r1 r2)))))
 
 ;;; --- inference walk ---
@@ -436,32 +489,50 @@
      (let ((inner (intern (subseq (symbol-name obj-ty) 4) :keyword)))
        (when (struct-type-p inner) inner)))))
 
+(defun generic-field-type (obj-ty field-sym)
+  "obj-ty is (:generic Name args...). Look up the template, build subs from
+   params→concrete-args, return the field's type with subs applied."
+  (let* ((name (second obj-ty))
+         (concrete (cddr obj-ty))
+         (entry (gethash name *generic-structs*))
+         (params (first entry))
+         (fields (second entry))
+         (subs (mapcar #'cons params concrete))
+         (field-spec (assoc field-sym fields)))
+    (unless field-spec
+      (error "get-field: generic struct ~A has no field ~A" name field-sym))
+    (subst-type-params (second field-spec) subs)))
+
 (defmethod infer-form ((head (eql 'get-field)) args env)
   (let* ((obj-ty (resolve-type (infer (first args) env)))
          (field-sym (second args))
          (struct-ty (resolve-struct-or-ptr obj-ty)))
-    (unless struct-ty
-      (error "get-field: ~A is not a struct or struct pointer, got ~A"
-             (first args) obj-ty))
-    (struct-field-type struct-ty field-sym)))
+    (cond
+      ((generic-type-p obj-ty) (generic-field-type obj-ty field-sym))
+      (struct-ty (struct-field-type struct-ty field-sym))
+      (t (error "get-field: ~A is not a struct or struct pointer, got ~A"
+                (first args) obj-ty)))))
 
 (defmethod infer-form ((head (eql 'set-field!)) args env)
   (let* ((obj-ty (resolve-type (infer (first args) env)))
          (field-sym (second args))
          (val-ty (infer (third args) env))
          (struct-ty (resolve-struct-or-ptr obj-ty)))
-    (unless struct-ty
-      (error "set-field!: ~A is not a struct or struct pointer, got ~A"
-             (first args) obj-ty))
-    (let ((field-ty (struct-field-type struct-ty field-sym)))
-      (unify field-ty val-ty)
-      :unit)))
+    (cond
+      ((generic-type-p obj-ty)
+       (unify (generic-field-type obj-ty field-sym) val-ty)
+       :unit)
+      (struct-ty
+       (unify (struct-field-type struct-ty field-sym) val-ty)
+       :unit)
+      (t (error "set-field!: ~A is not a struct or struct pointer, got ~A"
+                (first args) obj-ty)))))
 
 (defmethod infer-form (head args env)
-  ;; Default: struct constructor OR function call.
+  ;; Default: struct constructor (concrete or generic) OR function call.
   (cond
     ((struct-name-p head)
-     ;; Struct constructor: types must match field types.
+     ;; Concrete struct constructor: types must match field types.
      (let ((fields (gethash head *struct-fields*)))
        (unless (= (length fields) (length args))
          (error "struct ~A: expected ~D fields, got ~D"
@@ -469,6 +540,20 @@
        (loop for a in args for f in fields
              do (unify (second f) (infer a env)))
        (struct-type-keyword head)))
+    ((generic-struct-name-p head)
+     ;; Generic ctor: build subs from params→fresh tvars, unify each field's
+     ;; substituted type against the arg's inferred type, return the applied
+     ;; (:generic Name concrete-args) — concrete-args are the resolved tvars.
+     (let* ((entry (gethash head *generic-structs*))
+            (params (first entry))
+            (fields (second entry))
+            (subs (mapcar (lambda (p) (cons p (fresh-tvar))) params)))
+       (unless (= (length fields) (length args))
+         (error "generic struct ~A: expected ~D fields, got ~D"
+                head (length fields) (length args)))
+       (loop for a in args for f in fields
+             do (unify (subst-type-params (second f) subs) (infer a env)))
+       (list* :generic head (mapcar #'cdr subs))))
     (t
      (let ((sig (and *fn-sigs* (gethash head *fn-sigs*))))
        (unless sig
@@ -490,7 +575,7 @@
 (defun type-annotation-p (x)
   "Heuristic: distinguish a type form from a body form. Types are keywords
    like :int, :string, :u8, :ptr-void, :CPU (struct), or compound (:fn ...)
-   / (:ptr T) forms."
+   / (:ptr T) / (:generic Name args) / (Name args) forms."
   (cond
     ((keywordp x)
      (or (member x '(:int :bool :unit :string :cstr :size
@@ -501,35 +586,48 @@
          (let ((s (symbol-name x)))
            (and (> (length s) 4) (string= s "PTR-" :end1 4)))
          (struct-type-p x)))
-    ((consp x) (member (first x) '(:fn :ptr)))))
+    ((consp x)
+     (or (member (first x) '(:fn :ptr :generic))
+         (and (symbolp (first x)) (generic-struct-name-p (first x)))))))
 
 (defun split-defn-shape (rest-of-form)
   "Given the part after 'name' in (defn name PARAMS [ret] BODY...), return
-   (values params ret-type body) where ret-type may be nil (infer)."
+   (values params ret-type body) where ret-type may be nil (infer).
+   Generic struct sugar in ret-type is canonicalized."
   (let ((params (first rest-of-form))
         (after (rest rest-of-form)))
     (cond
       ((and after (type-annotation-p (first after)))
-       (values params (first after) (rest after)))
+       (values params (canonicalize-type (first after)) (rest after)))
       (t
        (values params nil after)))))
 
 (defun param-name-and-tvar (p)
-  "p is either a naked symbol (or single-element list) or (name :type)."
+  "p is either a naked symbol (or single-element list) or (name :type).
+   Type annotations are canonicalized so generic struct sugar (Name args)
+   becomes (:generic Name args)."
   (cond
     ((symbolp p)               (list p (fresh-tvar)))
     ((and (consp p) (= (length p) 1)) (list (first p) (fresh-tvar)))
-    ((and (consp p) (= (length p) 2)) (list (first p) (second p)))
+    ((and (consp p) (= (length p) 2))
+     (list (first p) (canonicalize-type (second p))))
     (t (error "infer: bad param spec ~A" p))))
 
 (defun defaulting (ty)
   "If a tvar remains after solving, default to :int with a warning. Avoids
-   emitting (:tvar N) into the C output."
+   emitting (:tvar N) into the C output. (:generic Name args) types are
+   materialized into a mangled struct keyword so the rest of the pipeline
+   sees a normal struct type."
   (let ((r (resolve-type ty)))
     (cond
       ((tvar-p r) (warn "unconstrained type variable, defaulting to :int") :int)
-      ((and (consp r) (eq (first r) :fn))
+      ((fn-type-p r)
        (list :fn (mapcar #'defaulting (second r)) (defaulting (third r))))
+      ((generic-type-p r)
+       (let* ((name (second r))
+              (args (cddr r))
+              (mangled (materialize-generic-instance name args)))
+         (struct-type-keyword mangled)))
       (t r))))
 
 (defun infer-defn (form)
@@ -646,6 +744,38 @@
               (write-string (mono-type-suffix ty) s)))
           :sysp-ir))
 
+(defun mangle-generic-instance (name concrete-args)
+  "Symbol for the materialized monomorphic struct: Box + (:int) → Box_int.
+   Lowercase suffix so c-name's mixed-case detection preserves it verbatim."
+  (intern (with-output-to-string (s)
+            (write-string (symbol-name name) s)
+            (dolist (ty concrete-args)
+              (write-char #\_ s)
+              (write-string (mono-type-suffix ty) s)))
+          :sysp-ir))
+
+(defun materialize-generic-instance (name concrete-args)
+  "Register a concrete instantiation of generic struct `name`. Resolves
+   each concrete-arg (so :int is actually :int, not a tvar bound to it),
+   then writes the substituted fields into *struct-fields* under the
+   mangled name. Cached via *generic-struct-instances*."
+  (let* ((concrete-args (mapcar (lambda (a) (defaulting a)) concrete-args))
+         (key (cons name concrete-args)))
+    (or (gethash key *generic-struct-instances*)
+        (let* ((mangled (mangle-generic-instance name concrete-args))
+               (entry (gethash name *generic-structs*))
+               (params (first entry))
+               (fields (second entry))
+               (subs (mapcar #'cons params concrete-args))
+               (concrete-fields
+                (mapcar (lambda (f)
+                          (list (first f)
+                                (defaulting (subst-type-params (second f) subs))))
+                        fields)))
+          (setf (gethash key *generic-struct-instances*) mangled)
+          (setf (gethash mangled *struct-fields*) concrete-fields)
+          mangled))))
+
 (defun monomorphize-program (defn-info)
   "Specialize poly defns at each call site. Drops uninstantiated polys
    in favor of a single :int-defaulted copy (legacy behavior)."
@@ -728,6 +858,21 @@
             (forall-p sig)))
      (dolist (a (rest form)) (mono-walk a env))
      (mono-walk-poly-call form env))
+    ;; Generic struct ctor (Box 5): re-infer args, materialize the
+    ;; instance, and rewrite the call head to the mangled struct name so
+    ;; lower sees a regular concrete struct ctor.
+    ((and (symbolp (first form)) (generic-struct-name-p (first form)))
+     (dolist (a (rest form)) (mono-walk a env))
+     (let* ((name (first form))
+            (entry (gethash name *generic-structs*))
+            (params (first entry))
+            (fields (second entry))
+            (subs (mapcar (lambda (p) (cons p (fresh-tvar))) params)))
+       (loop for a in (rest form) for f in fields
+             do (unify (subst-type-params (second f) subs) (infer a env)))
+       (let* ((concrete-args (mapcar (lambda (s) (resolve-type (cdr s))) subs))
+              (mangled (materialize-generic-instance name concrete-args)))
+         (rplaca form mangled))))
     (t
      (dolist (a (rest form)) (mono-walk a env)))))
 

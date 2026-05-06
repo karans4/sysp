@@ -102,9 +102,24 @@
                        ((stringp val)  :cstr)
                        (t :int))))
         (setf (gethash name *globals*) (list ty val))))
-    (dolist (s structs)
-      (setf (gethash (second s) *struct-fields*)
-            (normalize-struct-fields (cddr s))))
+    ;; Split concrete vs generic structs. Concrete go through the normal
+    ;; *struct-fields* path; generic templates land in *generic-structs* and
+    ;; are skipped at emit time — their instances are emitted separately
+    ;; once mono materializes them.
+    (let (concrete-structs)
+      (dolist (s structs)
+        (let ((head (second s)))
+          (cond
+            ((consp head)
+             (let ((name (first head))
+                   (params (rest head))
+                   (fields (normalize-struct-fields (cddr s))))
+               (setf (gethash name *generic-structs*) (list params fields))))
+            (t
+             (setf (gethash head *struct-fields*)
+                   (normalize-struct-fields (cddr s)))
+             (push s concrete-structs)))))
+      (setf structs (nreverse concrete-structs)))
     (dolist (e externs)
       (setf (get (second e) 'ret-type) (fourth e)))
     ;; Lower defns first so we can detect Value usage before emitting headers.
@@ -141,6 +156,19 @@
         (when *uses-value* (format out "#include \"value.h\"~%"))
         (when (or includes *uses-value*) (terpri out))
         (dolist (s structs)        (emit-struct-decl s out) (terpri out))
+        ;; Emit each materialized generic-struct instance. Fields were
+        ;; written into *struct-fields* by materialize-generic-instance
+        ;; with concrete substituted types.
+        (let ((emitted (make-hash-table)))
+          (maphash (lambda (key mangled)
+                     (declare (ignore key))
+                     (unless (gethash mangled emitted)
+                       (setf (gethash mangled emitted) t)
+                       (emit-struct-decl
+                        `(defstruct ,mangled ,@(gethash mangled *struct-fields*))
+                        out)
+                       (terpri out)))
+                   *generic-struct-instances*))
         (dolist (s extra-structs)
           (emit-struct-decl s out) (terpri out)
           (emit-env-destructor s out))
