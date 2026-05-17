@@ -143,6 +143,7 @@
              (*lambda-structs* nil)
              (user-fns (mapcar (lambda (f)
                                  (let ((fn (lower-defn f)))
+                                   (coalesce-copies fn)
                                    (insert-releases fn)
                                    (rewrite-jump-to-ret fn)
                                    (prune-unreachable fn)
@@ -151,6 +152,7 @@
              ;; Now finalize lambda-synthesized fns. They were lowered at
              ;; lambda-site time; run the same passes on each.
              (lambda-fns (mapcar (lambda (fn)
+                                   (coalesce-copies fn)
                                    (insert-releases fn)
                                    (rewrite-jump-to-ret fn)
                                    (prune-unreachable fn)
