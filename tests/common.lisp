@@ -17,6 +17,7 @@
 
 (defvar *ok* 0)
 (defvar *fail* 0)
+(defvar *mem-skipped* 0)   ; memory-safety checks with no usable tool
 
 (defparameter *test-c-file* "/tmp/sysp-test.c")
 (defparameter *test-exe*    "/tmp/sysp-test")
@@ -55,17 +56,70 @@
     (values (string-trim '(#\Newline #\Space) out)
             (sb-ext:process-exit-code p))))
 
-(defun run-valgrind (exe)
-  "Run valgrind on exe. Returns t (clean), nil (leaks/errors), or :skip
-   when the binary is unavailable (e.g. macOS)."
+(defun proc-stream-string (stream)
+  (with-output-to-string (s)
+    (loop for l = (read-line stream nil nil) while l do (write-line l s))))
+
+(defun valgrind-check (exe)
+  (let ((p (sb-ext:run-program "/usr/bin/valgrind"
+                               (list "--error-exitcode=2"
+                                     "--leak-check=full" "-q" exe)
+                               :output nil :error nil)))
+    (sb-ext:process-wait p)
+    (zerop (sb-ext:process-exit-code p))))
+
+(defun asan-check (c-path runtime-key)
+  "Rebuild c-path with ASan+UBSan and run it. t = clean, nil = sanitizer
+   diagnostic, :skip = toolchain can't build sanitized. Exit code is
+   ignored (programs legitimately exit non-zero in :exit mode); only a
+   sanitizer report on stderr counts as failure."
+  (let* ((exe (concatenate 'string *test-exe* ".asan"))
+         (args (append (list "-fsanitize=address,undefined"
+                             "-fno-sanitize-recover=undefined"
+                             "-DSYSP_ALLOC_AUDIT"
+                             "-g" "-O1" "-Isrc" "-Iruntime" "-o" exe c-path)
+                       (runtime-srcs runtime-key)))
+         (cc (sb-ext:run-program "/usr/bin/cc" args :output nil :error nil)))
+    (if (not (zerop (sb-ext:process-exit-code cc)))
+        :skip
+        (let ((p (sb-ext:run-program
+                  exe nil
+                  :environment (cons "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1"
+                                     (sb-ext:posix-environ))
+                  :output nil :error :stream)))
+          (let ((err (proc-stream-string (sb-ext:process-error p))))
+            (sb-ext:process-wait p)
+            (not (or (search "Sanitizer" err)
+                     (search "runtime error:" err)
+                     (search "SYSP_LEAK" err))))))))
+
+(defun leaks-check (exe)
+  "macOS `leaks`. t = no leaks, nil = leaks, :skip = tool couldn't run
+   (SIP/attach failure — surfaced, not silently passed)."
+  (let* ((p (sb-ext:run-program "/usr/bin/leaks"
+                                (list "--atExit" "--" exe)
+                                :output :stream :error nil))
+         (out (proc-stream-string (sb-ext:process-output p))))
+    (sb-ext:process-wait p)
+    (cond ((search "0 leaks for 0 total leaked bytes" out) t)
+          ((search " leaks for " out) nil)
+          (t :skip))))
+
+(defun run-valgrind (c-path exe runtime-key)
+  "Memory-safety gate. valgrind when present (Linux/CI); otherwise the
+   macOS substitute: ASan+UBSan (use-after-free / overflow / UB) plus
+   `leaks` (leak detection). Together these cover valgrind memcheck +
+   leak-check. Returns t (clean), nil (real failure), or :skip ONLY when
+   no usable tool exists — and a :skip is reported loudly, never swallowed."
   (cond
-    ((not (probe-file "/usr/bin/valgrind")) :skip)
-    (t (let ((p (sb-ext:run-program "/usr/bin/valgrind"
-                                    (list "--error-exitcode=2"
-                                          "--leak-check=full" "-q" exe)
-                                    :output nil :error nil)))
-         (sb-ext:process-wait p)
-         (zerop (sb-ext:process-exit-code p))))))
+    ((probe-file "/usr/bin/valgrind") (valgrind-check exe))
+    ((probe-file "/usr/bin/leaks")
+     (let ((a (asan-check c-path runtime-key))
+           (l (leaks-check exe)))
+       (cond ((or (eq a :skip) (eq l :skip)) :skip)
+             ((and a l) t)
+             (t nil))))
+    (t :skip)))
 
 (defun write-c-source (preamble program-src driver path)
   (with-open-file (s path :direction :output :if-exists :supersede)
@@ -96,10 +150,14 @@
                (t (incf *fail*)
                   (format t " FAIL exit ~a want ~a~%" code expected)))))
       (when valgrind
-        (case (run-valgrind *test-exe*)
-          (:skip nil)            ; silently skip — not all platforms have it
-          ((nil) (incf *fail*) (format t "  VG FAIL~%")))))))
+        (case (run-valgrind *test-c-file* *test-exe* runtime)
+          (:skip (incf *mem-skipped*)
+                 (format t "  MEM SKIP (no valgrind/leaks)~%"))
+          ((nil) (incf *fail*) (format t "  MEM FAIL~%")))))))
 
 (defun report-and-exit ()
   (format t "~%~a passed, ~a failed~%" *ok* *fail*)
+  (unless (zerop *mem-skipped*)
+    (format t "WARNING: ~a memory-safety check(s) skipped — no valgrind or leaks~%"
+            *mem-skipped*))
   (unless (zerop *fail*) (sb-ext:exit :code 1)))

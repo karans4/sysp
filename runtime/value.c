@@ -15,6 +15,7 @@ Value val_fn(Fn* fn)        { Value v = {0}; v.tag = VAL_FN;    v.as.fn = fn; re
 
 Value val_cons(Value car, Value cdr) {
     Cons* c = malloc(sizeof(Cons));
+    sysp_audit_inc();
     c->car = car;
     c->cdr = cdr;
     c->rc = 1;
@@ -85,6 +86,7 @@ void val_release(Value v) {
             if (--v.as.cons->rc == 0) {
                 val_release(v.as.cons->car);
                 val_release(v.as.cons->cdr);
+                sysp_audit_dec();
                 free(v.as.cons);
             }
             break;
@@ -101,6 +103,7 @@ void val_release(Value v) {
                         val_release(c->params);
                         val_release(c->body);
                         val_release(c->env);
+                        sysp_audit_dec();
                         free(c);
                     }
                 } else if (fn->state) {
@@ -111,6 +114,7 @@ void val_release(Value v) {
                     if (fn->release_state) fn->release_state(fn->state);
                     free(fn->state);
                 }
+                sysp_audit_dec();
                 free(fn);
             }
             break;
@@ -343,6 +347,7 @@ FILE* runtime_stderr(void) { return stderr; }
 
 struct Fn* make_fn(void* invoke, void* state, void (*release_state)(void*)) {
     Fn* fn = malloc(sizeof(Fn));
+    sysp_audit_inc();
     fn->invoke         = invoke;
     fn->state          = state;
     fn->release_state  = release_state;
@@ -352,12 +357,14 @@ struct Fn* make_fn(void* invoke, void* state, void (*release_state)(void*)) {
 
 Value val_closure(Value params, Value body, Value env) {
     Closure* c = malloc(sizeof(Closure));
+    sysp_audit_inc();
     c->params = params; val_retain(params);
     c->body   = body;   val_retain(body);
     c->env    = env;    val_retain(env);
     c->rc = 1;
 
     Fn* fn = malloc(sizeof(Fn));
+    sysp_audit_inc();
     fn->invoke = NULL;     /* interpreter sets this */
     fn->state  = c;
     fn->rc = 1;
