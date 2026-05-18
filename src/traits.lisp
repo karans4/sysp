@@ -57,10 +57,20 @@
    `(use \"lib...\")` impl and an in-program call always agree."
   (intern (tname x) :sysp-ir))
 
+(defun trait-self-key (ty)
+  "Dispatch key for a self type. A generic instantiation keys by its
+   struct name only — `(:generic Vec :int)` and `(:generic Vec :bool)`
+   share the one `(impl Trait (Vec :T) ...)`; the impl method is then
+   monomorphized per element type by the ordinary poly pipeline."
+  (let ((r (resolve-type ty)))
+    (if (and (consp r) (eq (first r) :generic))
+        (intern (string-upcase (string (second r))) :keyword)
+        r)))
+
 (defun trait-impl-mangled (method self-ty)
   "Mangled impl-fn symbol for METHOD on a concrete SELF-TY. Both impl
    registration and call sites go through here, so they always agree."
-  (mono-mangle (canon-sym method) (list (resolve-type self-ty))))
+  (mono-mangle (canon-sym method) (list (trait-self-key self-ty))))
 
 (defun register-impl (form)
   "(impl Trait (Type ...) (defn m (params) :ret body) ...).
@@ -98,7 +108,7 @@
    Gettable/Settable: an impl overrides, absence falls back to the
    built-in struct field access."
   (let* ((key  (format nil "~a:~a" (string-upcase trait)
-                        (mono-type-suffix (resolve-type self-ty))))
+                        (mono-type-suffix (trait-self-key self-ty))))
          (cell (assoc (string-upcase method) (gethash key *trait-impls*)
                       :test #'equal)))
     (and cell (cdr cell))))

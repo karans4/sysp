@@ -1,0 +1,25 @@
+;;;; A collection as a pure library type.
+;;;;
+;;;; IVec is an ordinary struct. It implements a user trait (Seq) and
+;;;; the compiler-magic Gettable, exactly as a user library would. The
+;;;; compiler has no notion of "vector" — this is the vision's "no type
+;;;; is special except Cons" demonstrated for collections.
+;;;;
+;;;; (Generic-element collections — (impl Trait (Vec :T) ...) — need
+;;;; inference-driven generic impl methods; tracked as a follow-up,
+;;;; since stage-16 generics come from inference, not :T annotations.)
+
+(defstruct IVec ((s0 :int) (s1 :int) (s2 :int) (n :int)))
+
+(defn ivec3 ((x :int) (y :int) (z :int)) :IVec
+  (IVec x y z 3))
+
+(deftrait Seq () (seq-len ((self :int)) :int))
+(impl Seq (IVec)
+  (defn seq-len ((self :IVec)) :int (get-field self n)))
+
+;; Gettable override: indexed access on a library collection.
+(impl Gettable (IVec)
+  (defn get ((self :IVec) (i :int)) :int
+    (if (= i 0) (get-field self s0)
+      (if (= i 1) (get-field self s1) (get-field self s2)))))

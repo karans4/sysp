@@ -225,7 +225,12 @@
     ;; self's type. After this the head is an ordinary concrete fn.
     ((trait-method-name-p (first form))
      (dolist (a (rest form)) (mono-walk a env))
-     (rplaca form (resolve-trait-call (first form) (second form) env)))
+     (let ((m (resolve-trait-call (first form) (second form) env)))
+       (rplaca form m)
+       ;; A generic impl method is an ordinary poly fn — let the
+       ;; existing per-call-site monomorphization specialize it.
+       (when (forall-p (gethash m *fn-sigs*))
+         (mono-walk-poly-call form env))))
     ((and (symbolp (first form))
           (let ((sig (gethash (first form) *fn-sigs*)))
             (forall-p sig)))

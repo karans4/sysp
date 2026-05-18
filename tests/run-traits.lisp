@@ -117,4 +117,13 @@
                    (slen (str-new (cstr "worldXX"))))))
             "" 12 :mode :exit)
 
+;; --- A collection as a pure library type (Seq + Gettable override) ---
+
+(check-prog "collection-as-library"
+            '((use "lib/collections.sysp")
+              (defn main () :int
+                (let ((v (ivec3 10 20 12)))
+                  (+ (seq-len v) (+ (get v 0) (get v 2))))))
+            "" 25 :mode :exit)
+
 (report-and-exit)
