@@ -1,0 +1,24 @@
+;;;; String as a pure library type.
+;;;;
+;;;; The compiler knows nothing about this: Str is an ordinary struct,
+;;;; built on a C buffer (:cstr) via FFI, and it participates in the
+;;;; trait system like any other type. No :string keyword, no bespoke
+;;;; codegen, no runtime.h String. This is the vision's core claim
+;;;; demonstrated on the stage-16 engine.
+
+(extern strlen ((s :cstr)) :int)
+
+(defstruct Str ((data :cstr) (len :int)))
+
+(defn str-new ((p :cstr)) :Str
+  (Str p (strlen p)))
+
+;; A library trait, implemented for the library String — exactly as a
+;; user would implement it for their own type.
+(deftrait Show () (show ((self :int)) :int))
+(impl Show (Str)
+  (defn show ((self :Str)) :int (get-field self len)))
+
+(deftrait Iterable () (slen ((self :int)) :int))
+(impl Iterable (Str)
+  (defn slen ((self :Str)) :int (get-field self len)))

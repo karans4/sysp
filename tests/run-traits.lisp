@@ -106,4 +106,15 @@
                 (let ((w (mk))) (string-len (get w s)))))
             "" 4 :mode :exit :valgrind t)
 
+;; --- String as a pure library type, pulled in via (use ...) ---
+;; Proves "no type is special": Str is a plain struct + trait impls,
+;; loaded from lib/string.sysp, with zero compiler special-casing.
+
+(check-prog "string-as-library"
+            '((use "lib/string.sysp")
+              (defn main () :int
+                (+ (show (str-new (cstr "hello")))
+                   (slen (str-new (cstr "worldXX"))))))
+            "" 12 :mode :exit)
+
 (report-and-exit)

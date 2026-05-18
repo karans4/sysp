@@ -50,10 +50,17 @@
           ((struct-name-p h) (struct-type-keyword h))
           (t (intern (string-downcase (symbol-name h)) :keyword)))))
 
+(defun canon-sym (x)
+  "Case-canonical symbol for trait mangling. A method written `show`
+   reaches us upcased from the CL-reader test path but case-preserved
+   from the sysp parser (libs). Mangle on the canonical name so a
+   `(use \"lib...\")` impl and an in-program call always agree."
+  (intern (tname x) :sysp-ir))
+
 (defun trait-impl-mangled (method self-ty)
   "Mangled impl-fn symbol for METHOD on a concrete SELF-TY. Both impl
    registration and call sites go through here, so they always agree."
-  (mono-mangle method (list (resolve-type self-ty))))
+  (mono-mangle (canon-sym method) (list (resolve-type self-ty))))
 
 (defun register-impl (form)
   "(impl Trait (Type ...) (defn m (params) :ret body) ...).
@@ -67,7 +74,7 @@
     (dolist (d (cdddr form))
       (when (and (consp d) (eq (first d) 'defn))
         (let* ((mname   (tname (second d)))
-               (mangled (mono-mangle (second d) (list tkw))))
+               (mangled (mono-mangle (canon-sym (second d)) (list tkw))))
           (push (cons mname mangled) (gethash key *trait-impls*))
           (push (list* 'defn mangled (cddr d)) out))))
     (nreverse out)))
