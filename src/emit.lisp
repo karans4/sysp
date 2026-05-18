@@ -85,15 +85,21 @@
    op-name is \"retain\" or \"release\". Case-insensitive on keyword.
    Auto-derived struct-level retain/release functions follow the convention
    <StructName>_retain / <StructName>_release."
-  (cond
-    ((eq ty :string)        (format nil "sysp_str_~a" op-name))
-    ((kw-name= ty "Value")  (format nil "val_~a" op-name))
-    ((and (keywordp ty)
-          (gethash (intern (symbol-name ty) :sysp-ir) *struct-fields*))
-     (format nil "~a_~a"
-             (symbol-name (intern (symbol-name ty) :sysp-ir))
-             op-name))
-    (t (error "rc-fn-name: no rc fn for type ~A" ty))))
+  (let ((drop (and (string-equal op-name "release")
+                    (keywordp ty)
+                    (gethash (intern (symbol-name ty) :sysp-ir) *struct-fields*)
+                    (trait-impl-fn "Drop" "drop" ty))))
+    (cond
+      ;; A Drop impl overrides the auto field-walk destructor.
+      (drop (c-name drop))
+      ((eq ty :string)        (format nil "sysp_str_~a" op-name))
+      ((kw-name= ty "Value")  (format nil "val_~a" op-name))
+      ((and (keywordp ty)
+            (gethash (intern (symbol-name ty) :sysp-ir) *struct-fields*))
+       (format nil "~a_~a"
+               (symbol-name (intern (symbol-name ty) :sysp-ir))
+               op-name))
+      (t (error "rc-fn-name: no rc fn for type ~A" ty)))))
 
 (defun struct-rc-type-p (ty)
   "True when ty is a struct keyword whose retain/release takes a pointer.

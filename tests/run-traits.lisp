@@ -82,4 +82,28 @@
                   (get a v))))
             "" 10 :mode :exit)
 
+;; --- Drop: default auto field-walk release of an rc'd field ---
+;; The memory gate (alloc audit) fails if the String leaks.
+
+(check-prog "drop-default-rc-field"
+            '((defstruct WRAP ((s :string)))
+              (defn mk () :WRAP (WRAP (string-concat "ab" "cd")))
+              (defn main () :int
+                (let ((w (mk))) (string-len (get w s)))))
+            "" 4 :mode :exit :valgrind t)
+
+;; --- Drop: a Drop impl overrides the auto destructor. If the override
+;; is not invoked at scope exit, the String leaks -> MEM FAIL. ---
+
+(check-prog "drop-impl-override"
+            '((extern sysp_str_release ((s :string)) :unit)
+              (defstruct WRAP ((s :string)))
+              (impl Drop (WRAP)
+                (defn drop ((self :ptr-WRAP)) :unit
+                  (sysp_str_release (get-field self s))))
+              (defn mk () :WRAP (WRAP (string-concat "xy" "zw")))
+              (defn main () :int
+                (let ((w (mk))) (string-len (get w s)))))
+            "" 4 :mode :exit :valgrind t)
+
 (report-and-exit)
