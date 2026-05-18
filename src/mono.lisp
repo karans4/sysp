@@ -182,8 +182,26 @@
            (let ((np (parse-lambda-param p)))
              (push (cons (first np) (or (second np) :int)) env2)))
          (dolist (b body) (mono-walk b env2)))))
+    ((eq (first form) 'get)
+     ;; Gettable override → rewrite to a plain call to the impl fn;
+     ;; otherwise leave it for lower's struct-field default.
+     (dolist (a (rest form)) (mono-walk a env))
+     (let ((m (trait-impl-fn "Gettable" "get"
+                             (resolve-type (infer (second form) env)))))
+       (when m (rplaca form m))))
     ((eq (first form) 'set!)
-     (mono-walk (third form) env))
+     (let ((target (second form)))
+       (cond
+         ((and (consp target) (eq (first target) 'get))
+          (let ((obj (second target)) (key (third target)) (val (third form)))
+            (mono-walk obj env) (mono-walk key env) (mono-walk val env)
+            (let ((m (trait-impl-fn "Settable" "set"
+                                    (resolve-type (infer obj env)))))
+              (when m
+                ;; (set! (get o k) v) → (set_<ty> o k v)
+                (setf (car form) m
+                      (cdr form) (list obj key val))))))
+         (t (mono-walk (third form) env)))))
     ((eq (first form) 'for)
      (let* ((spec (second form))
             (var (first spec)) (lo (second spec)) (hi (third spec))

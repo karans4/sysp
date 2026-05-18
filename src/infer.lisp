@@ -421,12 +421,47 @@
     (unify t-ty e-ty)
     t-ty))
 
+(defun infer-getset-default (obj-ty key val-ty)
+  "Struct-field typing for the no-impl case of get/set!. VAL-TY nil = get
+   (return field type); non-nil = set! (unify, return :unit)."
+  (let ((struct-ty (resolve-struct-or-ptr obj-ty)))
+    (flet ((fty ()
+             (cond ((generic-type-p obj-ty) (generic-field-type obj-ty key))
+                   (struct-ty (struct-field-type struct-ty key))
+                   (t (infer-error "get/set!: ~A is neither a struct nor a ~
+                                    Gettable/Settable type" obj-ty)))))
+      (if val-ty (progn (unify (fty) val-ty) :unit) (fty)))))
+
+(defun infer-impl-call (mangled args env)
+  "Type an args list against a resolved impl fn's signature."
+  (let* ((insted (instantiate (gethash mangled *fn-sigs*)))
+         (arg-tys (second insted)) (ret-ty (third insted)))
+    (loop for a in args for at in arg-tys do (unify at (infer a env)))
+    ret-ty))
+
+(defmethod infer-form ((head (eql 'get)) args env)
+  ;; (get obj key): Gettable impl override, else struct field access.
+  (let* ((obj-ty (resolve-type (infer (first args) env)))
+         (m (trait-impl-fn "Gettable" "get" obj-ty)))
+    (if m
+        (infer-impl-call m args env)
+        (infer-getset-default obj-ty (second args) nil))))
+
 (defmethod infer-form ((head (eql 'set!)) args env)
-  (let* ((target (first args))
-         (tgt-ty (cdr (assoc target env))))
-    (unless tgt-ty (infer-error "infer: set! on unbound ~A" target))
-    (unify tgt-ty (infer (second args) env))
-    :unit))
+  (let ((target (first args)))
+    (if (and (consp target) (eq (first target) 'get))
+        ;; (set! (get o k) v): Settable impl override, else field set.
+        (let* ((obj (second target)) (key (third target))
+               (obj-ty (resolve-type (infer obj env)))
+               (m (trait-impl-fn "Settable" "set" obj-ty)))
+          (if m
+              (progn (infer-impl-call m (list obj key (second args)) env) :unit)
+              (infer-getset-default obj-ty key (infer (second args) env))))
+        ;; (set! var v): plain reassignment.
+        (let ((tgt-ty (cdr (assoc target env))))
+          (unless tgt-ty (infer-error "infer: set! on unbound ~A" target))
+          (unify tgt-ty (infer (second args) env))
+          :unit))))
 
 (defmethod infer-form ((head (eql 'do)) args env)
   (let (last-ty)

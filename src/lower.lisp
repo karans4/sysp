@@ -519,12 +519,24 @@
         (values nil :unit)))))
 
 (defmethod lower-form ((head (eql 'set!)) args env)
-  ;; (set! target expr) — re-assign. Currently int-only.
+  ;; (set! var v) reassignment, or (set! (get o field) v) struct-field
+  ;; store. The Settable-impl case was rewritten to a plain call by mono,
+  ;; so a (get ...) target here is always the field default.
   (let ((target (first args)))
-    (multiple-value-bind (vn vty) (lower (second args) env)
-      (emit (make-ir-instr :dst nil :type vty :op :set
-                           :args (list target vn)))
-      (values target vty))))
+    (if (and (consp target) (eq (first target) 'get))
+        (multiple-value-bind (obj-name obj-ty) (lower (second target) env)
+          (multiple-value-bind (_s is-ptr) (struct-or-ptr-target obj-ty)
+            (declare (ignore _s))
+            (multiple-value-bind (vn _vt) (lower (second args) env)
+              (declare (ignore _vt))
+              (emit (make-ir-instr :dst nil :type :unit
+                                   :op (if is-ptr :field-set-ptr :field-set)
+                                   :args (list obj-name (third target) vn)))
+              (values nil :unit))))
+        (multiple-value-bind (vn vty) (lower (second args) env)
+          (emit (make-ir-instr :dst nil :type vty :op :set
+                               :args (list target vn)))
+          (values target vty)))))
 
 (defmethod lower-form ((head (eql 'do)) args env)
   ;; (do e1 e2 ... eN) — sequential, value is eN.
@@ -737,6 +749,19 @@
     (t (error "field access on non-struct type ~A" ty))))
 
 (defmethod lower-form ((head (eql 'get-field)) args env)
+  (multiple-value-bind (obj-name obj-ty) (lower (first args) env)
+    (multiple-value-bind (struct-ty is-ptr) (struct-or-ptr-target obj-ty)
+      (let* ((field-sym (second args))
+             (field-ty (struct-field-type struct-ty field-sym))
+             (d (fresh-tmp)))
+        (emit (make-ir-instr :dst d :type field-ty
+                             :op (if is-ptr :field-get-ptr :field-get)
+                             :args (list obj-name field-sym)))
+        (values d field-ty)))))
+
+(defmethod lower-form ((head (eql 'get)) args env)
+  ;; mono rewrites the Gettable-impl case to a plain call, so here `get`
+  ;; is always the struct-field default — mirrors get-field.
   (multiple-value-bind (obj-name obj-ty) (lower (first args) env)
     (multiple-value-bind (struct-ty is-ptr) (struct-or-ptr-target obj-ty)
       (let* ((field-sym (second args))

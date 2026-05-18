@@ -45,4 +45,41 @@
               (defn main () :int (b (Q 20))))
             "" 41 :mode :exit)
 
+;; --- Gettable/Settable: built-in struct-field default ---
+
+(check-prog "get-default-field"
+            '((defstruct PT ((x :int) (y :int)))
+              (defn main () :int (get (PT 11 31) y)))
+            "" 31 :mode :exit)
+
+(check-prog "set-default-field"
+            '((defstruct CELL ((v :int)))
+              (defn bump ((c :ptr-CELL)) :unit (set! (get c v) 99))
+              (defn main () :int
+                (let ((c (CELL 1)))
+                  (bump (addr-of c))
+                  (get c v))))
+            "" 99 :mode :exit)
+
+;; --- Gettable/Settable: trait override wins over the default ---
+
+(check-prog "gettable-override"
+            '((defstruct BOX ((v :int)))
+              (impl Gettable (BOX)
+                (defn get ((self :BOX) (i :int)) :int
+                  (+ (get-field self v) i)))
+              (defn main () :int (get (BOX 40) 2)))
+            "" 42 :mode :exit)
+
+(check-prog "settable-override"
+            '((defstruct ACC ((v :int)))
+              (impl Settable (ptr-ACC)
+                (defn set ((self :ptr-ACC) (k :int) (val :int)) :unit
+                  (set-field! self v (+ val k))))
+              (defn main () :int
+                (let ((a (ACC 0)))
+                  (set! (get (addr-of a) 1) 9)
+                  (get a v))))
+            "" 10 :mode :exit)
+
 (report-and-exit)

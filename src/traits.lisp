@@ -18,19 +18,25 @@
   (clrhash *trait-impls*)
   (clrhash *method->trait*))
 
+(defun tname (x)
+  "Canonical (case-insensitive) name for a trait/method symbol. The test
+   harness reads forms with the CL reader (upcased) while the sysp parser
+   preserves case — upcasing the name makes lookups agree across both."
+  (string-upcase (symbol-name x)))
+
 (defun trait-method-name-p (sym)
   "True if SYM is a method of some registered trait."
   (and (symbolp sym)
-       (nth-value 1 (gethash (symbol-name sym) *method->trait*))))
+       (nth-value 1 (gethash (tname sym) *method->trait*))))
 
 (defun register-deftrait (form)
   "(deftrait Name [tparams] (m (params) :ret) ...) — record signatures."
-  (let ((name (symbol-name (second form)))
+  (let ((name (tname (second form)))
         (tparams (third form))
         (sigs nil))
     (dolist (m (cdddr form))
       (when (consp m)
-        (let ((mn (symbol-name (first m))))
+        (let ((mn (tname (first m))))
           (push (list mn (second m) (and (cddr m) (third m))) sigs)
           (setf (gethash mn *method->trait*) name))))
     (setf (gethash name *traits*) (list tparams (nreverse sigs)))))
@@ -53,14 +59,14 @@
   "(impl Trait (Type ...) (defn m (params) :ret body) ...).
    Returns the materialized concrete defns (renamed to mangled names)
    to splice into the program's defn list."
-  (let* ((trait (symbol-name (second form)))
+  (let* ((trait (tname (second form)))
          (tform (third form))
          (tkw   (impl-type-keyword tform))
          (key   (format nil "~a:~a" trait (mono-type-suffix tkw)))
          (out   nil))
     (dolist (d (cdddr form))
       (when (and (consp d) (eq (first d) 'defn))
-        (let* ((mname   (symbol-name (second d)))
+        (let* ((mname   (tname (second d)))
                (mangled (mono-mangle (second d) (list tkw))))
           (push (cons mname mangled) (gethash key *trait-impls*))
           (push (list* 'defn mangled (cddr d)) out))))
@@ -75,9 +81,20 @@
          (mangled (trait-impl-mangled method self-ty)))
     (unless (and *fn-sigs* (gethash mangled *fn-sigs*))
       (infer-error "no impl of ~A for ~A (looked for ~A)"
-                   (gethash (symbol-name method) *method->trait*)
+                   (gethash (tname method) *method->trait*)
                    self-ty mangled))
     mangled))
+
+(defun trait-impl-fn (trait method self-ty)
+  "Mangled impl-fn symbol for TRAIT's METHOD on the concrete SELF-TY, or
+   nil if no such impl is registered. Used by the compiler-magic
+   Gettable/Settable: an impl overrides, absence falls back to the
+   built-in struct field access."
+  (let* ((key  (format nil "~a:~a" (string-upcase trait)
+                        (mono-type-suffix (resolve-type self-ty))))
+         (cell (assoc (string-upcase method) (gethash key *trait-impls*)
+                      :test #'equal)))
+    (and cell (cdr cell))))
 
 (defun infer-trait-method (head args env)
   "Type a trait method call by delegating to the resolved impl's
