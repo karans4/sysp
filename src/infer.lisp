@@ -546,8 +546,10 @@
                       (first args) obj-ty)))))
 
 (defmethod infer-form (head args env)
-  ;; Default: struct constructor (concrete or generic) OR function call.
+  ;; Default: trait method call, struct constructor, or function call.
   (cond
+    ((trait-method-name-p head)
+     (infer-trait-method head args env))
     ((struct-name-p head)
      ;; Concrete struct constructor: types must match field types.
      (let ((fields (gethash head *struct-fields*)))

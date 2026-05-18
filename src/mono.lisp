@@ -203,6 +203,11 @@
     ((eq (first form) 'when)
      (mono-walk (second form) env)
      (dolist (b (cddr form)) (mono-walk b env)))
+    ;; Trait method call: rewrite head to the concrete impl resolved by
+    ;; self's type. After this the head is an ordinary concrete fn.
+    ((trait-method-name-p (first form))
+     (dolist (a (rest form)) (mono-walk a env))
+     (rplaca form (resolve-trait-call (first form) (second form) env)))
     ((and (symbolp (first form))
           (let ((sig (gethash (first form) *fn-sigs*)))
             (forall-p sig)))
