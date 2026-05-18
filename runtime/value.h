@@ -19,6 +19,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+/* String (rc'd, header-only static-inline) lives in src/runtime.h. The
+ * generated code emits a single #include "value.h"; pull String in here
+ * so the embedded/interp path gets it too. Needs -Isrc on the include
+ * path (build-interp.sh and the test harness both pass it). */
+#include "runtime.h"
+
 typedef enum {
     VAL_NIL = 0,
     VAL_INT,

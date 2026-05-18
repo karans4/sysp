@@ -13,7 +13,7 @@ EOF
 sbcl --script /tmp/compile-interp.lisp
 
 cc -O2 -o runtime/interp \
-   -Iruntime \
+   -Isrc -Iruntime \
    runtime/value.c runtime/interp.c
 
 echo "built runtime/interp"
