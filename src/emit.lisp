@@ -76,6 +76,7 @@
 
 (defvar *block-by-name*)
 (defvar *indent*)
+(defvar *type-map*)   ; sym → type, for typing :br edge-death releases
 
 (defun ind (out) (loop repeat *indent* do (write-string "  " out)))
 
@@ -96,8 +97,14 @@
 
 (defun struct-rc-type-p (ty)
   "True when ty is a struct keyword whose retain/release takes a pointer.
-   String and Value pass by value; structs pass by &address."
+   String, Value and Fn are runtime-provided with by-value rc ABIs, so
+   they pass by value even when an extern-struct declaration registers
+   them in *struct-fields* (which would otherwise flip them to &address
+   and emit val_retain(&x) against a by-value val_retain(Value))."
   (and (keywordp ty)
+       (not (eq ty :string))
+       (not (kw-name= ty "Value"))
+       (not (kw-name= ty "Fn"))
        (gethash (intern (symbol-name ty) :sysp-ir) *struct-fields*)))
 
 ;; Track whether the current program uses Value/cons. If so, we need to
@@ -216,7 +223,8 @@
   (let* ((*block-by-name* (make-hash-table))
          (*indent* 1)
          (*no-inline* (ir-fn-no-inline fn))
-         (*inlinable* (build-inlinable fn)))
+         (*inlinable* (build-inlinable fn))
+         (*type-map* (build-type-map fn)))
     (dolist (b (ir-fn-blocks fn))
       (setf (gethash (ir-block-name b) *block-by-name*) b))
     (format out "~a ~a(" (c-type (ir-fn-ret-type fn)) (c-name (ir-fn-name fn)))
@@ -248,6 +256,17 @@
           (unless (and (ir-instr-dst i) (gethash (ir-instr-dst i) *inlinable*))
             (emit-c-instr-indented i out))))
       (emit-c-term-structured blk term until out))))
+
+(defun emit-death-release (v out)
+  "Release an edge-dying variable. Same dispatch as a :release instr —
+   the var's type (via *type-map*) picks val_/sysp_str_/Struct_ and
+   whether it passes by &address."
+  (let ((ty (gethash v *type-map*)))
+    (ind out)
+    (format out "~a(~:[~;&~]~a);~%"
+            (rc-fn-name ty "release")
+            (struct-rc-type-p ty)
+            (c-name v))))
 
 (defun emit-c-term-structured (blk term until out)
   (case (first term)
@@ -293,13 +312,11 @@
                  (ind out)
                  (format out "if (~a) {~%" (cond-ref c))
                  (let ((*indent* (1+ *indent*)))
-                   (dolist (v t-d)
-                     (ind out) (format out "sysp_str_release(~a);~%" (c-name v)))
+                   (dolist (v t-d) (emit-death-release v out))
                    (emit-structured (gethash tblk *block-by-name*) jblk out))
                  (ind out) (format out "} else {~%")
                  (let ((*indent* (1+ *indent*)))
-                   (dolist (v e-d)
-                     (ind out) (format out "sysp_str_release(~a);~%" (c-name v)))
+                   (dolist (v e-d) (emit-death-release v out))
                    (emit-structured (gethash eblk *block-by-name*) jblk out))
                  (ind out) (format out "}~%")
                  (emit-structured (gethash jblk *block-by-name*) until out)))))
