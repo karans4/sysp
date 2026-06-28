@@ -111,8 +111,10 @@
                (subs (mapcar #'cons params concrete-args))
                (concrete-fields
                 (mapcar (lambda (f)
-                          (list (first f)
-                                (defaulting (subst-type-params (second f) subs))))
+                          ;; preserve any trailing :mut marker (cddr f)
+                          (list* (first f)
+                                 (defaulting (subst-type-params (second f) subs))
+                                 (cddr f)))
                         fields)))
           (setf (gethash key *generic-struct-instances*) mangled)
           (setf (gethash mangled *struct-fields*) concrete-fields)

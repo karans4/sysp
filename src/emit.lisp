@@ -119,20 +119,32 @@
 
 ;;; --- top-level fn / proto emit ---
 
+(defun normalize-one-field (p)
+  "Normalize one field spec to (name type) or (name type :mut).
+     (name :t)        — immutable field
+     (mut name :t)    — mutable field (SPEC §9.2)"
+  (cond
+    ((and (= (length p) 3)
+          (symbolp (first p))
+          (string-equal (symbol-name (first p)) "mut"))
+     (list (second p) (third p) :mut))
+    (t (list (first p) (second p)))))
+
 (defun normalize-struct-fields (raw)
   "Accept several shapes for fields:
      ((f :t) (g :t))                  — list of pairs (preferred)
-     (f :t g :t)                      — flat
+     ((mut f :t) (g :t))              — `mut` marks a mutable field
+     (f :t g :t)                      — flat (no mut in this form)
      (((f :t) (g :t)))                — wrapped list of pairs
-   Normalize to list of (name type) pairs."
+   Normalize to list of (name type [:mut]) entries."
   (cond
     ((null raw) nil)
     ;; wrapped: a single list-of-pairs
     ((and (= (length raw) 1) (consp (car raw)) (consp (caar raw)))
-     (mapcar (lambda (p) (list (first p) (second p))) (car raw)))
+     (mapcar #'normalize-one-field (car raw)))
     ;; list of pairs
     ((consp (car raw))
-     (mapcar (lambda (p) (list (first p) (second p))) raw))
+     (mapcar #'normalize-one-field raw))
     ;; flat name/type
     (t (loop for (n ty) on raw by #'cddr collect (list n ty)))))
 

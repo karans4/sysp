@@ -66,3 +66,36 @@
   (let ((fields (gethash (struct-keyword-name struct-ty) *struct-fields*)))
     (or (second (assoc field-name fields))
         (error "struct ~A has no field ~A" struct-ty field-name))))
+
+;;; --- mutability axis (SPEC §9) ---
+;;; A normalized field is (name type) for an immutable field, or
+;;; (name type :mut) for a `mut` field. The only source of mutability is
+;;; a :mut field; everything else (primitives, pointers, String, Value,
+;;; Cons, Fn) is immutable.
+
+(defun field-mut-p (field)
+  "True if a normalized struct field is declared `mut`."
+  (eq (third field) :mut))
+
+(defun deeply-immutable-p (ty &optional in-progress)
+  "True iff TY is transitively immutable, i.e. shareable by reference
+   (SPEC §9.2). A struct is deeply immutable when it has no `mut` field
+   and every field type is deeply immutable. Recursion is treated as
+   immutable: a recursive immutable type (Cons-shaped) is still immutable.
+   Everything that is not a struct-with-a-reachable-mut-field is immutable
+   (primitives, pointers, String, Value, Fn)."
+  (cond
+    ((struct-type-p ty)
+     (let ((name (struct-keyword-name ty)))
+       (or (member name in-progress)        ; recursion: assume immutable
+           (let ((ip (cons name in-progress)))
+             (every (lambda (f)
+                      (and (not (field-mut-p f))
+                           (deeply-immutable-p (second f) ip)))
+                    (gethash name *struct-fields*))))))
+    (t t)))
+
+(defun mutable-type-p (ty)
+  "TY obeys mutable value semantics (SPEC §9.1): a struct with a reachable
+   `mut` field. The complement of deeply-immutable-p."
+  (not (deeply-immutable-p ty)))
