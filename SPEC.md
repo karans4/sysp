@@ -396,9 +396,12 @@ cycle collector, no lifetime annotations, and no GC.
   and every field type is itself deeply immutable. The compiler computes
   this by SCC over the type-reference graph; recursive immutable types
   (like `Cons`) are shareable.
-- A type with any reachable `mut` is **mutable** and obeys MVS. This is
-  the precise replacement for the old "struct has rc fields" test:
-  shareable-immutable is rc-managed, mutable is value-semantics.
+- A type with any reachable `mut` is **mutable** and obeys MVS. This
+  axis is **orthogonal to field-level ARC**: a struct of either kind
+  still releases its rc'd fields when it dies (the old "struct has rc
+  fields" test still drives that). The shareable/mutable distinction
+  instead governs whether a value may be **reference-shared** and whether
+  Perceus may **reuse it in place** (§9.1).
 
 ### 9.3 `inout` — borrowing mutable values
 
