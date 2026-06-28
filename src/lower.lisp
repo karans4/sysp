@@ -525,13 +525,16 @@
   (let ((target (first args)))
     (if (and (consp target) (eq (first target) 'get))
         (multiple-value-bind (obj-name obj-ty) (lower (second target) env)
-          (multiple-value-bind (_s is-ptr) (struct-or-ptr-target obj-ty)
-            (declare (ignore _s))
+          (multiple-value-bind (struct-ty is-ptr) (struct-or-ptr-target obj-ty)
             (multiple-value-bind (vn _vt) (lower (second args) env)
               (declare (ignore _vt))
-              (emit (make-ir-instr :dst nil :type :unit
-                                   :op (if is-ptr :field-set-ptr :field-set)
-                                   :args (list obj-name (third target) vn)))
+              ;; Carry the field type (not :unit) so emit dispatches ARC for
+              ;; ref-typed fields: release the overwritten value, retain new.
+              (emit (make-ir-instr
+                     :dst nil
+                     :type (struct-field-type struct-ty (third target))
+                     :op (if is-ptr :field-set-ptr :field-set)
+                     :args (list obj-name (third target) vn)))
               (values nil :unit))))
         (multiple-value-bind (vn vty) (lower (second args) env)
           (emit (make-ir-instr :dst nil :type vty :op :set
@@ -574,16 +577,30 @@
     (error "recur: wrong arg count"))
   (let ((arg-tmps nil))
     (dolist (a args)
-      (multiple-value-bind (n _ty) (lower a env) (declare (ignore _ty))
+      (multiple-value-bind (n ty) (lower a env)
+        ;; Ref-typed accumulators need owned-parameter support: a recur
+        ;; reassigns the param, but params are borrowed, so release-old on
+        ;; the first iteration would free the caller's value (and the
+        ;; transfer-on-return over-retains). Promoting the param to owned
+        ;; requires the release pass to understand :set redefinitions —
+        ;; that lands with the Perceus owned-param work. Until then, reject
+        ;; it loudly rather than silently miscompiling.
+        (when (ref-type-p ty)
+          (error "recur with a ref-typed accumulator (~A : ~A) is not yet ~
+                  supported — needs owned-parameter ARC. Restructure to ~
+                  carry the value via an explicit loop, or wait for the ~
+                  Perceus owned-param pass." a ty))
         ;; Force a fresh temp so the value can't be inlined-and-reused.
+        ;; Carry the real type so the :copy/:set dispatch ARC correctly
+        ;; once owned params exist (for non-ref types this is just :int).
         (let ((forced (fresh-tmp)))
-          (emit (make-ir-instr :dst forced :type :int :op :copy
+          (emit (make-ir-instr :dst forced :type ty :op :copy
                                :args (list n)))
           (push forced *no-inline*)
-          (push forced arg-tmps))))
+          (push (cons forced ty) arg-tmps))))
     (setf arg-tmps (nreverse arg-tmps))
-    (loop for p in *recur-params* for tmp in arg-tmps do
-      (emit (make-ir-instr :dst nil :type :int :op :set
+    (loop for p in *recur-params* for (tmp . ty) in arg-tmps do
+      (emit (make-ir-instr :dst nil :type ty :op :set
                            :args (list p tmp))))
     (finish-block (list :recur))
     (start-block (fresh-blk "AFTER-RECUR") nil)
@@ -774,11 +791,12 @@
 
 (defmethod lower-form ((head (eql 'set-field!)) args env)
   (multiple-value-bind (obj-name obj-ty) (lower (first args) env)
-    (multiple-value-bind (_struct-ty is-ptr) (struct-or-ptr-target obj-ty)
-      (declare (ignore _struct-ty))
+    (multiple-value-bind (struct-ty is-ptr) (struct-or-ptr-target obj-ty)
       (multiple-value-bind (val-name _vt) (lower (third args) env) (declare (ignore _vt))
         (let ((field-sym (second args)))
-          (emit (make-ir-instr :dst nil :type :unit
+          ;; Field type (not :unit) so emit dispatches ARC for ref fields.
+          (emit (make-ir-instr :dst nil
+                               :type (struct-field-type struct-ty field-sym)
                                :op (if is-ptr :field-set-ptr :field-set)
                                :args (list obj-name field-sym val-name)))
           (values nil :unit))))))

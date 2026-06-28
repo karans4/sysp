@@ -34,4 +34,17 @@
   printf(\"%d %d %d\\n\", cpu_a(c), c.sp, cpu_pc(c)); return 0; }"
             "0 253 0")
 
+;; set-field! over an rc'd (String) field must release the overwritten
+;; value, not just store over it. Before the fix the old "aaa" leaked; the
+;; memory gate (alloc audit) catches it.
+(check-prog "set-field-rc-releases-old"
+            '((defstruct HOLDER ((s :string)))
+              (defn run () :int
+                (let ((a "aaa") (b "bbb"))
+                  (let ((h (HOLDER a)))
+                    (do (set-field! h s b)
+                        (string-len (get h s)))))))
+            "int main(){ printf(\"%d\\n\", run()); return 0; }"
+            "3" :valgrind t)
+
 (report-and-exit)

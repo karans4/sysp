@@ -427,11 +427,24 @@
                               (rc-fn-name fty "retain")
                               (struct-rc-type-p fty)
                               dst))))
-      (:field-set (let ((args (ir-instr-args i)))
-                    (format out "~a.~a = ~a;~%"
-                            (nameref (first args))
-                            (string-downcase (symbol-name (second args)))
-                            (nameref (third args)))))
+      (:field-set (let* ((args (ir-instr-args i))
+                         (obj (nameref (first args)))
+                         (fld (string-downcase (symbol-name (second args))))
+                         (val (nameref (third args)))
+                         (fty (ir-instr-type i)))
+                    (cond
+                      ;; rc'd field: release the overwritten value, store,
+                      ;; retain the new one. (:unit-typed stores — e.g. lambda
+                      ;; env construction into fresh memory — skip this.)
+                      ((ref-type-p fty)
+                       (format out "~a(~:[~;&~]~a.~a);~%"
+                               (rc-fn-name fty "release") (struct-rc-type-p fty) obj fld)
+                       (ind out)
+                       (format out "~a.~a = ~a;~%" obj fld val)
+                       (ind out)
+                       (format out "~a(~:[~;&~]~a.~a);~%"
+                               (rc-fn-name fty "retain") (struct-rc-type-p fty) obj fld))
+                      (t (format out "~a.~a = ~a;~%" obj fld val)))))
       (:field-get-ptr (let ((args (ir-instr-args i))
                             (fty (ir-instr-type i)))
                         (format out "~a ~a = ~a->~a;~%"
@@ -443,11 +456,21 @@
                                   (rc-fn-name fty "retain")
                                   (struct-rc-type-p fty)
                                   dst))))
-      (:field-set-ptr (let ((args (ir-instr-args i)))
-                        (format out "~a->~a = ~a;~%"
-                                (nameref (first args))
-                                (string-downcase (symbol-name (second args)))
-                                (nameref (third args)))))
+      (:field-set-ptr (let* ((args (ir-instr-args i))
+                             (obj (nameref (first args)))
+                             (fld (string-downcase (symbol-name (second args))))
+                             (val (nameref (third args)))
+                             (fty (ir-instr-type i)))
+                        (cond
+                          ((ref-type-p fty)
+                           (format out "~a(~:[~;&~]~a->~a);~%"
+                                   (rc-fn-name fty "release") (struct-rc-type-p fty) obj fld)
+                           (ind out)
+                           (format out "~a->~a = ~a;~%" obj fld val)
+                           (ind out)
+                           (format out "~a(~:[~;&~]~a->~a);~%"
+                                   (rc-fn-name fty "retain") (struct-rc-type-p fty) obj fld))
+                          (t (format out "~a->~a = ~a;~%" obj fld val)))))
       (:sizeof   (format out "~a ~a = sizeof(~a);~%"
                          ty dst (symbol-name (first (ir-instr-args i)))))
       (:fn-addr  (format out "~a ~a = (void*)&~a;~%"

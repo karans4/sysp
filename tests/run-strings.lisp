@@ -48,4 +48,18 @@
    sysp_str_print(r); sysp_str_release(r); sysp_str_release(n); return 0; }"
             "karan!" :valgrind t)
 
+;; recur carrying a ref-typed (String) accumulator is rejected loudly until
+;; owned-parameter ARC lands (a borrowed param can't be reassigned with
+;; release-old without freeing the caller's value). Previously this silently
+;; miscompiled (copy/set typed :int truncated the String).
+(handler-case
+    (progn
+      (program-c '((defn rep ((n :int) (acc :string)) :string
+                     (if (= n 0) acc (recur (- n 1) (string-concat acc "x"))))))
+      (incf *fail*)
+      (format t "recur-ref-accumulator-rejected: FAIL (no error raised)~%"))
+  (error ()
+    (incf *ok*)
+    (format t "recur-ref-accumulator-rejected: ok (error raised)~%")))
+
 (report-and-exit)
