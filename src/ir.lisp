@@ -1,7 +1,9 @@
 ;;;; IR datatypes.
 (in-package :sysp-ir)
 
-(defstruct ir-fn   name params ret-type blocks (no-inline nil))
+;; owned-params: recur-mutated ref params promoted to owned (SPEC §9.3).
+;; Retained at entry (emit prologue), released/transferred like a local.
+(defstruct ir-fn   name params ret-type blocks (no-inline nil) (owned-params nil))
 
 ;; term ∈ (:ret v) | (:ret-unit) | (:br c then-blk else-blk join-blk t-deaths e-deaths)
 ;;      | (:jump blk args) | (:loop cond body-blk exit-blk)

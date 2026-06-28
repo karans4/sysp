@@ -74,15 +74,20 @@
 (defun ref-filter (vars type-map)
   (remove-if-not (lambda (v) (gethash v type-map)) vars))
 
-(defun block-gen-kill (blk fn-params type-map)
+(defun block-gen-kill (blk fn-params type-map owned)
   "GEN: ref vars used before being defined in this block.
-   KILL: ref vars defined in this block."
+   KILL: ref vars defined in this block.
+   OWNED params (recur-mutated, promoted to owned) are loop-carried: they
+   are NOT killed at entry, and a `:set` to one counts as a use, so they
+   stay live across the recur back-edge and are released only at a genuine
+   non-recur exit."
   (let ((gen nil) (kill nil) (defined nil))
     (when (eq (ir-block-name blk) 'entry)
       (dolist (p fn-params)
         (when (ref-type-p (second p))
-          (push (first p) defined)
-          (push (first p) kill))))
+          (cond
+            ((member (first p) owned) (pushnew (first p) gen)) ; live-through
+            (t (push (first p) defined) (push (first p) kill))))))
     (dolist (p (ir-block-params blk))
       (when (ref-type-p (second p))
         (push (first p) defined)
@@ -91,6 +96,12 @@
       (dolist (u (ref-filter (instr-uses i) type-map))
         (unless (or (member u defined) (member u gen))
           (push u gen)))
+      ;; `:set` of an owned param reads it (release-old) and keeps it live.
+      (when (and (eq (ir-instr-op i) :set)
+                 (member (first (ir-instr-args i)) owned))
+        (let ((tgt (first (ir-instr-args i))))
+          (unless (or (member tgt defined) (member tgt gen))
+            (push tgt gen))))
       (when (and (ir-instr-dst i) (ref-type-p (ir-instr-type i)))
         (push (ir-instr-dst i) defined)
         (pushnew (ir-instr-dst i) kill)))
@@ -99,14 +110,14 @@
         (push u gen)))
     (values gen kill)))
 
-(defun liveness (fn type-map)
+(defun liveness (fn type-map &optional owned)
   "Returns (values live-in live-out), each a hashtable block-name → list of syms."
   (let ((live-in (make-hash-table))
         (live-out (make-hash-table))
         (gen-tab (make-hash-table))
         (kill-tab (make-hash-table)))
     (dolist (b (ir-fn-blocks fn))
-      (multiple-value-bind (g k) (block-gen-kill b (ir-fn-params fn) type-map)
+      (multiple-value-bind (g k) (block-gen-kill b (ir-fn-params fn) type-map owned)
         (setf (gethash (ir-block-name b) gen-tab) g
               (gethash (ir-block-name b) kill-tab) k
               (gethash (ir-block-name b) live-in) nil

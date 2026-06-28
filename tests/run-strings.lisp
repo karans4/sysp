@@ -48,18 +48,24 @@
    sysp_str_print(r); sysp_str_release(r); sysp_str_release(n); return 0; }"
             "karan!" :valgrind t)
 
-;; recur carrying a ref-typed (String) accumulator is rejected loudly until
-;; owned-parameter ARC lands (a borrowed param can't be reassigned with
-;; release-old without freeing the caller's value). Previously this silently
-;; miscompiled (copy/set typed :int truncated the String).
-(handler-case
-    (progn
-      (program-c '((defn rep ((n :int) (acc :string)) :string
-                     (if (= n 0) acc (recur (- n 1) (string-concat acc "x"))))))
-      (incf *fail*)
-      (format t "recur-ref-accumulator-rejected: FAIL (no error raised)~%"))
-  (error ()
-    (incf *ok*)
-    (format t "recur-ref-accumulator-rejected: ok (error raised)~%")))
+;; recur carrying a ref-typed (String) accumulator: owned-parameter ARC
+;; (SPEC §9.3) retains the param at entry, so each iteration's release-old/
+;; retain-new and the owned transfer at return balance. main owns `e` and
+;; releases it (borrow discipline); the gate catches any imbalance.
+(check-prog "recur-string-accumulator"
+            '((defn rep ((n :int) (acc :string)) :string
+                (if (= n 0) acc (recur (- n 1) (string-concat acc "x")))))
+            "int main(){ String e = sysp_str_lit(\"\", 0); String r = rep(3, e);
+   sysp_str_print(r); sysp_str_release(r); sysp_str_release(e); return 0; }"
+            "xxx" :valgrind t)
+
+;; recur where the owned accumulator is NOT returned: it must be released at
+;; its last use in the exit arm, not transferred.
+(check-prog "recur-string-not-returned"
+            '((defn slen ((n :int) (acc :string)) :int
+                (if (= n 0) (string-len acc) (recur (- n 1) (string-concat acc "x")))))
+            "int main(){ String e = sysp_str_lit(\"\", 0); int r = slen(3, e);
+   printf(\"%d\\n\", r); sysp_str_release(e); return 0; }"
+            "3" :valgrind t)
 
 (report-and-exit)

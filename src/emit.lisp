@@ -254,6 +254,14 @@
       (dolist (p (ir-block-params b))
         (unless (eq (second p) :unit)
           (format out "  ~a ~a;~%" (c-type (second p)) (c-name (first p))))))
+    ;; Prologue: retain recur-mutated (owned) params before the loop label,
+    ;; so the function holds a +1 for the binding's lifetime (SPEC §9.3).
+    ;; The per-iteration :set release-old/retain-new and the owned transfer
+    ;; (or last-use release) at exit then balance exactly.
+    (dolist (op (ir-fn-owned-params fn))
+      (let ((ty (second (assoc op (ir-fn-params fn)))))
+        (format out "  ~a(~:[~;&~]~a);~%"
+                (rc-fn-name ty "retain") (struct-rc-type-p ty) (c-name op))))
     ;; If any block ends in :recur, emit label so the goto target exists.
     (when (loop for b in (ir-fn-blocks fn)
                 thereis (eq (first (ir-block-term b)) :recur))

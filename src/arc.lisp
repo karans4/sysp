@@ -8,9 +8,28 @@
 
 (in-package :sysp-ir)
 
+(defun mutated-ref-params (fn)
+  "Ref-typed params reassigned via :set (i.e. recur targets). A borrowed
+   param cannot be reassigned with release-old/retain-new — the first
+   release-old would free the caller's value. Such params are promoted to
+   owned: retained at entry, released/transferred like a local."
+  (let* ((ptypes (loop for p in (ir-fn-params fn)
+                       collect (cons (first p) (second p))))
+         (mutated nil))
+    (dolist (b (ir-fn-blocks fn))
+      (dolist (i (ir-block-instrs b))
+        (let ((cell (and (eq (ir-instr-op i) :set)
+                         (assoc (first (ir-instr-args i)) ptypes))))
+          (when (and cell (ref-type-p (cdr cell)))
+            (pushnew (car cell) mutated)))))
+    mutated))
+
 (defun borrowed-params (fn)
-  (loop for p in (ir-fn-params fn)
-        when (ref-type-p (second p)) collect (first p)))
+  "Ref params the callee only borrows. Excludes recur-mutated (owned) params."
+  (let ((owned (ir-fn-owned-params fn)))
+    (loop for p in (ir-fn-params fn)
+          when (and (ref-type-p (second p)) (not (member (first p) owned)))
+            collect (first p))))
 
 (defun insert-borrow-retains (fn)
   "Insert :retain before any :ret or :jump term that transfers a borrowed
@@ -34,10 +53,11 @@
                   (append (ir-block-instrs b) (nreverse new-instrs)))))))))
 
 (defun insert-releases (fn)
+  (setf (ir-fn-owned-params fn) (mutated-ref-params fn))
   (insert-borrow-retains fn)
   (let* ((type-map (build-type-map fn))
          (borrowed (borrowed-params fn)))
-    (multiple-value-bind (live-in live-out) (liveness fn type-map)
+    (multiple-value-bind (live-in live-out) (liveness fn type-map (ir-fn-owned-params fn))
       (dolist (b (ir-fn-blocks fn))
         (let ((bname (ir-block-name b)))
           (insert-releases-block b type-map

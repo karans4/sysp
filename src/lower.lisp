@@ -579,21 +579,10 @@
   (let ((arg-tmps nil))
     (dolist (a args)
       (multiple-value-bind (n ty) (lower a env)
-        ;; Ref-typed accumulators need owned-parameter support: a recur
-        ;; reassigns the param, but params are borrowed, so release-old on
-        ;; the first iteration would free the caller's value (and the
-        ;; transfer-on-return over-retains). Promoting the param to owned
-        ;; requires the release pass to understand :set redefinitions —
-        ;; that lands with the Perceus owned-param work. Until then, reject
-        ;; it loudly rather than silently miscompiling.
-        (when (ref-type-p ty)
-          (error "recur with a ref-typed accumulator (~A : ~A) is not yet ~
-                  supported — needs owned-parameter ARC. Restructure to ~
-                  carry the value via an explicit loop, or wait for the ~
-                  Perceus owned-param pass." a ty))
         ;; Force a fresh temp so the value can't be inlined-and-reused.
-        ;; Carry the real type so the :copy/:set dispatch ARC correctly
-        ;; once owned params exist (for non-ref types this is just :int).
+        ;; Carry the real type so the :copy/:set dispatch ARC correctly for
+        ;; ref-typed accumulators (owned-parameter ARC handles the lifetime;
+        ;; for non-ref types this is just :int).
         (let ((forced (fresh-tmp)))
           (emit (make-ir-instr :dst forced :type ty :op :copy
                                :args (list n)))
