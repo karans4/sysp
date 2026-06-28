@@ -127,10 +127,25 @@ static void test_round_trip(void) {
     val_release(v);
 }
 
+/* Releasing a long list must be iterative along the cdr spine: a
+ * recursive val_release would overflow the stack here. */
+static void test_long_list_release(void) {
+    enum { N = 2000000 };
+    Value lst = val_nil();
+    for (int i = 0; i < N; i++) {
+        Value n = val_cons(val_int(i), lst);
+        val_release(lst);
+        lst = n;
+    }
+    val_release(lst);   /* must not blow the stack */
+    CHECK("long-list release (iterative spine)", 1);
+}
+
 int main(void) {
     test_basics();
     test_intern();
     test_cons();
+    test_long_list_release();
     test_write();
     test_read_basic();
     test_read_nested();

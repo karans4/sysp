@@ -82,14 +82,24 @@ void val_retain(Value v) {
 
 void val_release(Value v) {
     switch (v.tag) {
-        case VAL_CONS:
-            if (--v.as.cons->rc == 0) {
-                val_release(v.as.cons->car);
-                val_release(v.as.cons->cdr);
+        case VAL_CONS: {
+            /* Iterative along the cdr spine: a list of length N must not
+             * cost N stack frames to release (immutable cons is acyclic by
+             * construction, so a loop is sound). car is released
+             * recursively — nesting depth, not list length. */
+            Value cur = v;
+            for (;;) {
+                if (cur.tag != VAL_CONS) { val_release(cur); break; }
+                if (--cur.as.cons->rc != 0) break;   /* shared tail: stop */
+                Cons* c = cur.as.cons;
+                val_release(c->car);
+                Value next = c->cdr;
                 sysp_audit_dec();
-                free(v.as.cons);
+                free(c);
+                cur = next;
             }
             break;
+        }
         case VAL_FN:
             if (--v.as.fn->rc == 0) {
                 /* If state is a Closure (interp's lambda value), recurse
