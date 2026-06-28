@@ -99,3 +99,9 @@
   "TY obeys mutable value semantics (SPEC §9.1): a struct with a reachable
    `mut` field. The complement of deeply-immutable-p."
   (not (deeply-immutable-p ty)))
+
+(defun struct-field-mut-p (struct-ty field-name)
+  "True if FIELD-NAME of STRUCT-TY is declared `mut`."
+  (let ((fields (gethash (struct-keyword-name struct-ty) *struct-fields*)))
+    (field-mut-p (or (assoc field-name fields)
+                     (error "struct ~A has no field ~A" struct-ty field-name)))))

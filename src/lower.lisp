@@ -526,6 +526,7 @@
     (if (and (consp target) (eq (first target) 'get))
         (multiple-value-bind (obj-name obj-ty) (lower (second target) env)
           (multiple-value-bind (struct-ty is-ptr) (struct-or-ptr-target obj-ty)
+            (assert-mutable-field struct-ty (third target))
             (multiple-value-bind (vn _vt) (lower (second args) env)
               (declare (ignore _vt))
               ;; Carry the field type (not :unit) so emit dispatches ARC for
@@ -751,6 +752,13 @@
             (start-block join-blk (list (list result tty)))
             (values result tty)))))))
 
+(defun assert-mutable-field (struct-ty field-sym)
+  "Immutable-by-default (SPEC §9.2): only `mut` fields may be reassigned."
+  (unless (struct-field-mut-p struct-ty field-sym)
+    (error "cannot mutate immutable field ~A of ~A — declare it ~
+            `(mut ~A ...)` (fields are immutable by default, SPEC §9.2)"
+           field-sym struct-ty field-sym)))
+
 (defun struct-or-ptr-target (ty)
   "If ty is a struct or pointer-to-struct, return (values struct-ty is-ptr-p).
    Else error."
@@ -792,6 +800,7 @@
 (defmethod lower-form ((head (eql 'set-field!)) args env)
   (multiple-value-bind (obj-name obj-ty) (lower (first args) env)
     (multiple-value-bind (struct-ty is-ptr) (struct-or-ptr-target obj-ty)
+      (assert-mutable-field struct-ty (second args))
       (multiple-value-bind (val-name _vt) (lower (third args) env) (declare (ignore _vt))
         (let ((field-sym (second args)))
           ;; Field type (not :unit) so emit dispatches ARC for ref fields.

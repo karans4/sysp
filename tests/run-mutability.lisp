@@ -45,5 +45,20 @@
 (check "mutable-type-p complement" (mutable-type-p :COUNTER) t)
 (check "mutable-type-p immutable"  (mutable-type-p :POINT)   nil)
 
+;;; --- enforcement: mutating a non-mut field is rejected ---
+
+(defun rejects-p (forms)
+  (handler-case (progn (compile-program forms (make-broadcast-stream)) nil)
+    (error () t)))
+
+(check "reject-immutable-field-set"
+       (rejects-p '((defstruct PT ((x :int)))
+                    (defn f ((p :PT)) :unit (set-field! p x 9))))
+       t)
+(check "allow-mut-field-set"
+       (rejects-p '((defstruct PT ((mut x :int)))
+                    (defn f ((p :PT)) :unit (set-field! p x 9))))
+       nil)
+
 (format t "~%~d passed, ~d failed~%" *ok* *fail*)
 (sb-ext:exit :code (if (zerop *fail*) 0 1))

@@ -14,7 +14,7 @@
 
 ;; Mutate via set-field! through a pointer
 (check-prog "mutate-via-ptr"
-            '((defstruct CELL ((v :int)))
+            '((defstruct CELL ((mut v :int)))
               (defn bump ((c :ptr-CELL)) :unit
                 (set-field! c v (+ (get-field c v) 1))))
             "int main(){
@@ -38,7 +38,7 @@
 ;; value, not just store over it. Before the fix the old "aaa" leaked; the
 ;; memory gate (alloc audit) catches it.
 (check-prog "set-field-rc-releases-old"
-            '((defstruct HOLDER ((s :string)))
+            '((defstruct HOLDER ((mut s :string)))
               (defn run () :int
                 (let ((a "aaa") (b "bbb"))
                   (let ((h (HOLDER a)))

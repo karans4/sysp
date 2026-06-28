@@ -5,12 +5,12 @@
 (include "<stdint.h>")
 
 (defstruct CPU
-  ((a      :u8)
-   (x      :u8)
-   (y      :u8)
-   (sp     :u8)
-   (pc     :int)
-   (status :u8)))
+  ((mut a      :u8)
+   (mut x      :u8)
+   (mut y      :u8)
+   (mut sp     :u8)
+   (mut pc     :int)
+   (mut status :u8)))
 
 ;; LDA #imm - load immediate into A. Sets Z and N flags.
 (defn lda-imm ((cpu :ptr-CPU) (val :u8)) :unit

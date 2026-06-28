@@ -53,7 +53,7 @@
             "" 31 :mode :exit)
 
 (check-prog "set-default-field"
-            '((defstruct CELL ((v :int)))
+            '((defstruct CELL ((mut v :int)))
               (defn bump ((c :ptr-CELL)) :unit (set! (get c v) 99))
               (defn main () :int
                 (let ((c (CELL 1)))
@@ -72,7 +72,7 @@
             "" 42 :mode :exit)
 
 (check-prog "settable-override"
-            '((defstruct ACC ((v :int)))
+            '((defstruct ACC ((mut v :int)))
               (impl Settable (ptr-ACC)
                 (defn set ((self :ptr-ACC) (k :int) (val :int)) :unit
                   (set-field! self v (+ val k))))
