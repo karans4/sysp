@@ -19,9 +19,12 @@ sysp is a systems Lisp that compiles to readable C.
 3. **Traits are the spine.** Generic structs + monomorphized trait
    dispatch are the only abstraction mechanism. There is **no bespoke
    codegen for any type** except Cons.
-4. **Deterministic memory.** No GC, no pauses. Linear ownership + scope
-   Drop by default; reference counting only where sharing is explicit
-   (§9). The programmer rarely thinks about it; the model is still
+4. **Deterministic memory.** No GC, no tracing, no pauses. Memory is
+   governed by one axis: **mutability**. Deeply immutable data is shared
+   and reference-counted (acyclic by construction, so RC is complete);
+   mutable data uses value semantics and is borrowed only at call
+   boundaries (§9). No borrow checker, no cycle collector, no lifetime
+   annotations. The programmer rarely thinks about it; the model is still
    exact and predictable.
 5. **Small enough to self-host.** The accepted subset (§16.3) is a
    fixed point: the compiler can be written in it.
@@ -195,6 +198,10 @@ they exit, including on early `return` and condition unwinding (§9.4,
 - Generic structs are **monomorphized** per concrete instantiation:
   one C `struct` per distinct `(Box :int)`, `(Box :f64)`, … A generic
   struct never appears in emitted C un-instantiated.
+- Fields are **immutable by default.** `(mut name :T)` marks a mutable
+  field; a struct with any reachable `mut` is mutable and obeys MVS
+  (§9.2). `(defstruct Name (fields) :move)` marks a move-only type
+  (§9.7), needed only for mutable owners of external resources.
 
 Tuples are sugar: `(tuple a b)` ≡ an anonymous generic struct;
 `(:tuple :A :B)` its type; `(get t 0)` indexed access.
@@ -223,8 +230,9 @@ Tuples are sugar: `(tuple a b)` ≡ an anonymous generic struct;
 - `match` is exhaustive: non-exhaustive match is a compile error listing
   missing constructors. `_` is the wildcard. Patterns bind payload
   fields by position. Nested patterns allowed.
-- Payloads obey ownership (§9): a matched-and-bound payload is moved out
-  of the scrutinee; the un-taken arms' payloads are Dropped.
+- Payloads obey the memory model (§9): a bound payload is moved out of
+  the scrutinee if mutable, or shared (a reference-count bump) if
+  immutable; the un-taken arms' payloads are Dropped.
 
 ---
 
@@ -350,75 +358,115 @@ macros — never at runtime:
 
 ## 9. Memory model
 
-This section resolves the central design question. There is no
-runtime blend of two models; each value has **one statically chosen
-discipline**.
+The central design decision. Memory is governed by a single axis,
+**mutability**, and each value's discipline follows from whether its
+type is deeply immutable or mutable. There is no borrow checker, no
+cycle collector, no lifetime annotations, and no GC.
 
-### 9.1 Ownership & moves (default)
+### 9.1 The rule
 
-Every value has a single owner. The default discipline is **linear /
-affine**:
+- **Deeply immutable data is reference-shared and reference-counted.** A
+  value whose type is transitively immutable (no mutable field anywhere
+  reachable) may be freely stored, aliased, and shared. Aliasing
+  immutable data is unobservable — no write can distinguish a shared
+  reference from a copy — and immutable data is **acyclic by
+  construction** — a value can only reference values that already
+  existed when it was built — so reference counting is **complete**: no
+  cycle can ever form. `String` and `(Cons :T)` are the built-in
+  instances; any immutable struct joins them.
 
-- A binding owns its value. Passing a value to a function **borrows**
-  it by default (callee gets a non-owning view; no rc change; matches
-  the existing "borrow-everywhere" calling convention).
-- Ownership **transfers** (a *move*) only when the value is:
-  1. returned (`return` / tail expr / `(values …)`),
-  2. stored into a field of an aggregate that itself escapes,
-  3. captured by a closure that escapes,
-  4. passed to a parameter explicitly marked `own` (`(p :own T)`).
-- After a move the source binding is dead; using it is a compile error.
+- **Mutable data uses mutable value semantics (MVS).** Every binding
+  owns its value; a reference to a *mutable* value may **never** be
+  stored in a field or a variable. A mutable value is shared only as an
+  `inout` borrow for the duration of a call (§9.3). The forbidden
+  pairing is mutation *and* aliasing together: immutability removes the
+  first, MVS removes the second.
+
+- **Perceus reuse** turns value-semantics and immutable code into
+  in-place mutation when a value is uniquely owned (refcount 1): an
+  operation that logically allocates reuses the dying cells. This gives
+  mutation-grade performance without mutable aliasing.
+
+### 9.2 Mutability as a type property
+
+- Bindings and struct fields are **immutable by default.** `mut` marks a
+  mutable binding (`(let-mut …)`) or a mutable field
+  (`(defstruct … ((mut count :int)))`).
+- A type is **deeply immutable** (shareable) iff it has no `mut` field
+  and every field type is itself deeply immutable. The compiler computes
+  this by SCC over the type-reference graph; recursive immutable types
+  (like `Cons`) are shareable.
+- A type with any reachable `mut` is **mutable** and obeys MVS. This is
+  the precise replacement for the old "struct has rc fields" test:
+  shareable-immutable is rc-managed, mutable is value-semantics.
+
+### 9.3 `inout` — borrowing mutable values
+
+A function that mutates an argument takes it `inout`:
+
+```
+(defn translate ((p inout Point) (dx :int)) :unit
+  (set! (get p x) (+ (get p x) dx)))
+```
+
+- An `inout` parameter is a **second-class reference**: valid only for
+  the call, never stored. It compiles to a `T*` parameter.
+- The caller must own the value for the call's duration; the callee's
+  mutations are reflected in the caller.
+- This is the only way to share a mutable value. There is no first-class
+  mutable reference in the safe language.
+
+### 9.4 Drop & deterministic destruction
+
 - A value not moved out of its owning scope is **Dropped** (§8.6) at
   scope end, bindings in reverse order.
-
-### 9.2 Escape analysis & allocation
-
-A value **escapes** its creating scope iff it is moved per §9.1
-(1)–(4). The compiler computes escape by a standard backward analysis.
-
-- A value that does **not** escape is **stack-allocated**; its Drop is
-  a direct scope-exit call.
-- A value that **escapes** is heap-allocated (or returned by value if
-  it fits and the ABI allows); its Drop obligation transfers to the new
-  owner and runs at *that* owner's scope exit.
-
-Escape analysis is required, not optional: it is what lets the
-programmer "not think about allocation" while keeping it deterministic.
-
-### 9.3 Reference counting (opt-in, for sharing)
-
-Linear ownership cannot express shared/aliased graphs. For those:
-
-- **`(Cons :T)`** is reference-counted intrinsically (Lisp lists alias
-  freely). `cons`/`car`/`cdr` retain/release per the runtime.
-- **`(Rc T)`** is a library type wrapping `T` with a refcount;
-  `(rc-new x)`, `(rc-clone r)` (+1), Drop = release, free at 0. Rc is
-  the *only* sanctioned way to get shared ownership of user data.
-- Refcount fields are **not** atomic. Sharing an `Rc`/Cons across
-  threads (§12) requires `Arc` (atomic variant); the type system
-  forbids sending non-`Arc` shared values across a `spawn` boundary.
-
-A struct "is rc-managed" iff it is `Cons`, `Rc`/`Arc`, or transitively
-contains one. Everything else is linear. This is the precise
-replacement for the old "struct has rc fields" test.
-
-### 9.4 Drop ordering & non-local exit
-
-- Drops run in reverse order of acquisition within a scope.
+- For reference-shared immutable values, Drop is a release; the
+  underlying object's destructor runs when the **last** reference is
+  released.
 - `return`, `match`-arm exit, loop `break`, and **condition unwinding**
-  (§11.3) run all pending Drops for scopes being exited, innermost
+  (§11.3) run all pending Drops for the scopes they exit, innermost
   first, before transferring control.
-- Double-drop is prevented by move-tracking (§9.1); a moved-out value
-  is not Dropped by the source scope.
-- Partial moves (moving one field out of a struct) mark that field
-  dead; the struct's Drop skips dead fields.
+- Release of an immutable recursive value (e.g. a long `Cons` list) is
+  **iterative** along the spine, not recursive, so dropping a large
+  structure cannot overflow the stack.
 
-### 9.5 `new`
+### 9.5 Allocation
 
-`(new T args…)` constructs a `T` whose storage is heap (explicit
-escape). Equivalent to a constructor call the escape analysis treats as
-escaping. Its Drop runs when its owner's scope exits. Plain `(T args…)`
-lets escape analysis decide stack vs heap.
+A value that does **not** escape its creating scope is stack-allocated
+or held inline; a value that **escapes** (returned, or stored into an
+escaping aggregate) is heap-allocated. Escape is computed by backward
+analysis. This keeps allocation deterministic while letting the
+programmer not think about it. `(new T args…)` forces heap allocation
+explicitly; plain `(T args…)` lets escape analysis decide.
+
+### 9.6 Graphs, cycles, and shared mutable structure
+
+Because mutable references cannot be stored, genuinely graph-shaped or
+cyclic mutable structure is expressed with **handles**, not pointers:
+
+- The nodes live in an owned container (a `Vec`, an arena); cross-edges
+  between them are **indices** (`:int`), which are primitives, not
+  managed references. (A slot's generation can be carried alongside the
+  index as plain data for stale-handle detection — still a primitive,
+  not a language-level reference kind.)
+- Indices keep nothing alive and form no cycle in the managed graph, so
+  the structure may be arbitrarily cyclic in index space with no
+  consequence for memory management.
+- This is the same mechanism FFI uses for opaque C pointers (§14): an
+  opaque token the memory model passes through but does not own.
+
+### 9.7 Owned external resources
+
+A struct that owns a C resource (a file handle, a socket) holds it as an
+opaque primitive (§14) and gets an `impl Drop` that releases it.
+
+- If the wrapper is **immutable and reference-shared**, there is one
+  refcounted object and its `Drop` runs exactly once — the natural, safe
+  default.
+- If the wrapper is **mutable** and value-copied, it must be
+  **move-only** (`(defstruct … :move)`): it cannot be duplicated, so the
+  resource has exactly one owner and one `Drop`. Move-only is required
+  only for this case.
 
 ---
 
@@ -462,22 +510,28 @@ system memory-safe by construction.
 ```
 
 - `spawn` starts an OS thread; `await` joins and yields its result.
-- Values crossing a `spawn` boundary must be `Send`: linear values are
-  `Send` (moved in); shared values are `Send` only as `Arc` (atomic
-  refcount). Passing a non-`Arc` `Rc`/Cons into `spawn` is a compile
-  error.
-- This is the type-level resolution of the "TLS-safe refcounting"
-  promise: safety is by the `Send`/`Arc` rule, not by making all
-  refcounts atomic.
+- Values crossing a `spawn` boundary: a **mutable** value is *moved* in
+  (single owner, no aliasing, trivially thread-safe). A **deeply
+  immutable shared** value may cross only if its refcount is atomic; the
+  type system forbids sending a shared value with a non-atomic refcount
+  across `spawn`.
+- Atomicity is a property of the shared object's header, selected per
+  type, not a separate `Arc` type. Safety is by the move-or-atomic rule,
+  not by making all refcounts atomic.
+
+> Concurrency is **deferred** (§17): it is downstream of the mutability
+> model, not parallel to it, and is specified only in outline here.
 
 ---
 
 ## 13. Strings & formatting
 
 - `String` is a **library type** (`lib/string.sysp`): a struct over a
-  byte buffer, owning, linear, with `impl Drop`, `impl Show`,
-  `impl Iterable`, `impl Gettable` (byte/char index). The compiler has
-  **no `:string` type**.
+  byte buffer, **immutable and reference-shared** (§9.1), with
+  `impl Drop`, `impl Show`, `impl Iterable`, `impl Gettable` (byte/char
+  index). Refcounted buffer, copy-on-write under Perceus reuse so a
+  unique string mutates in place. The compiler has **no `:string`
+  type**.
 - `"…"` literal is sugar for a `String` constructed from a static
   buffer. `(cstr "…")` is the raw non-owning `const char*` for FFI.
 - `(fmt "x={} sum={}" x (+ a b))` — compile-time-parsed format string;
@@ -498,8 +552,19 @@ system memory-safe by construction.
 - Pointer types `:ptr-T`, `(cast :T e)`, `:ptr-void`.
 - `(asm! "template" (:out o) (:in i) (:clobber …))` — GCC extended
   inline asm; simple form `(asm! "…")`.
-- FFI values are **unmanaged** (no Drop, no rc) unless wrapped by a
-  library type that implements `Drop`.
+- **C pointers are opaque primitives.** A `:ptr-T`/`:ptr-void` is an
+  address-sized token the memory model does not own, refcount, or reason
+  about for cycles. It may be **stored in fields freely** (it is a
+  primitive, not a managed reference — §9.6), and its lifetime is
+  managed manually via `extern` calls.
+- Lending sysp data to C (passing `(addr-of x)`) is an `inout` borrow
+  (§9.3): valid for the call's duration. If C stores the pointer past
+  the call, that is an unchecked escape and the programmer's
+  responsibility.
+- **Owning a C resource:** wrap the opaque pointer in a struct with an
+  `impl Drop` that calls the C cleanup. Make it immutable + reference-
+  shared (one `Drop` on last release) or `:move` (move-only) if mutable
+  (§9.7). FFI values are otherwise unmanaged (no Drop, no rc).
 
 ---
 
@@ -535,9 +600,11 @@ not a CFG dump. This is testable and is a conformance requirement.
 - Monomorphized names: `name_<typesuffix>` (e.g. `id_int`,
   `show_Point`, `kget_HashMap_int_cstr`). Trait impl methods:
   `<method>_<selftypesuffix>`. Stable across separate compilation.
-- Calling convention: borrowed params by value/pointer as today; moved
-  (`own`/return/escape) values transfer ownership; the callee Drops an
-  `own` parameter.
+- Calling convention: immutable shared params passed by value (a
+  refcounted handle); `inout` params passed as `T*` (a borrow valid for
+  the call); returned/escaping values transfer ownership and their Drop
+  obligation to the caller. Function ownership is **specialized** per
+  call site where it pays (Lobster-style), not chosen globally.
 
 ### 16.3 Runtime & self-hosting
 
@@ -570,35 +637,66 @@ Grounded in the current `karan/stage-16` engine.
 | `if/cond/when/while/for/do` | **Present** (no `elif/else` kw) |
 | Structs, generic structs, monomorphization | **Present** |
 | Tuples | Planned |
-| Tagged unions + `match` | Planned |
+| Tagged unions + `match` (→ `Opt`/`Result`) | Planned |
 | Traits: `deftrait`/`impl`, static dispatch (concrete) | **Present** |
 | `:default` methods, `for-fields`, `impl?` | Planned (keystone) |
 | Trait bounds (`where`) + generic impls end-to-end | Partial (concrete only; bounds Planned) |
 | Coherence/orphan/overlap enforcement | Planned (currently silent-stacks) |
 | Gettable/Settable (default + override) | **Present** |
 | Drop (override of rc release) | **Present** for rc'd types |
-| Linear ownership + moves + escape analysis | Planned (currently borrow+rc only) |
-| `Rc`/`Arc`, `new` | Planned |
+| `set-field!` releases overwritten rc field | **Present** (fixed 2026-06-28) |
+| `recur` over ref-typed accumulator | Rejected loudly; needs Phase 2 owned-param ARC |
+| **Mutability axis: immutable-by-default + `mut`** | Planned (Phase 1, the spine) |
+| **Deep-immutability (`val`) analysis** | Planned (Phase 1) |
+| **Perceus reuse (FBIP) + drop specialization** | Partial (drop present; reuse Planned, Phase 2) |
+| **Iterative `Cons` drop (no stack overflow)** | Planned (Phase 2) |
+| **Owned-param ARC / ownership specialization** | Planned (Phase 2) |
+| **MVS: `inout` borrow, no stored mutable refs** | Planned (Phase 3) |
+| **Move-only (`:move`) types** | Planned (Phase 3) |
 | Macros, quasiquote, gensym | **Present** (interp subprocess) |
 | `defn-ct` | Planned |
-| Condition system | **Present**; Drop-unwind interaction Planned |
-| Concurrency (`spawn`/`await`, `Send`/`Arc`) | Planned |
+| Condition system | **Present** (frozen); Drop-unwind interaction Planned |
+| Concurrency (`spawn`/`await`, move-or-atomic) | Deferred (downstream of §9) |
 | `String` as library type | **Present** (demo); default-`"…"` Planned |
 | `fmt` / `Printable` derive | Planned |
 | FFI extern/extern-struct/cast/include | **Present**; `asm!` Planned |
+| FFI opaque-pointer primitives + RAII wrappers | Planned (Phase 5) |
 | Diagnostics with locations below parser | Partial (parser only) |
 | Readable-C contract | **Present** (paren-strip, coalesce, ARC-aware inlining) |
 | Memory-safety gate (ASan/UBSan + alloc audit) | **Present** |
+| Standalone compiler driver / CLI | **Absent** (all compilation in-process today) |
 | Separate compilation / `--emit-header` | Planned |
 | Self-hosting | Goal; subset frozen by §16.3 |
-| CUDA target | Planned |
+| CUDA target | Deferred |
+
+**Cut** (resolved by the §9 mutability model, no longer roadmap items):
+a borrow checker / linear ownership as a separate system, `weak`
+references, generational references, age/region ordering, a cycle
+collector, and `Rc`/`Arc` as a distinct feature (immutable data is
+reference-counted by default; sharing *is* reference-sharing).
 
 ### 17.1 Critical path
 
-The single highest-leverage unspecified-and-unbuilt item is **§8.7
-(`for-fields` + `impl?`)**: `Drop` defaults, `Printable`/`fmt`, and the
-"libraries implement the magic traits" architecture all derive from it.
-After that, **§8.5 (trait bounds)** unblocks the entire functional /
-collection standard library. **§9 (ownership/escape)** is the largest
-single design delta from the current engine and should be sequenced
-before `Rc`/threads, which depend on it.
+The memory model is now the spine, so the sequencing follows it:
+
+1. **Phase 1 — the mutability axis (§9.1–9.2).** Immutable-by-default
+   plus `mut`, and the deep-immutability (`val`) analysis. *Highest
+   leverage:* what is shareable, where MVS applies, and where `Drop`
+   fires all derive from this split. Reuse the existing `tarjan-sccs`
+   (currently the call graph) on the type-reference graph.
+2. **Phase 2 — Perceus completion (§9.4).** Reuse analysis (FBIP), drop
+   specialization, the iterative `Cons` drop, and owned-parameter ARC
+   via ownership specialization (which fixes `recur` over ref types and
+   makes the managed half correct and fast).
+3. **Phase 3 — MVS for the mutable half (§9.3, §9.7).** `inout`
+   borrows, the no-stored-mutable-references rule, and `:move` types.
+4. **Phase 4 — features the model unblocks.** Tagged unions + `match`
+   (§7), `for-fields`/`impl?` (§8.7) → `fmt`/`Printable`, trait bounds
+   (§8.5), and tightening HM to require signatures at boundaries.
+5. **Phase 5 — FFI hardening (§14).** RAII resource wrappers, the
+   opaque-pointer-as-primitive story.
+6. **Phase 6 — shipping.** A standalone compiler driver/CLI (still
+   absent), separate compilation, then the self-hosting subset.
+
+Everything hangs off Phases 1–2. Concurrency (§12) and CUDA (§16.4) are
+deferred until the model is solid.
